@@ -1,0 +1,21 @@
+[package]
+name = "medusa-tui"
+version = "0.1.0"
+edition = "2024"
+description = "Medusa terminal UI coding harness"
+license = "MIT"
+
+[[bin]]
+name = "medusa"
+path = "src/main.rs"
+
+[dependencies]
+color-eyre = "0.6.5"
+arboard = "3.6.1"
+crossterm = "0.29.0"
+image = { version = "0.25.8", default-features = false, features = ["png", "jpeg"] }
+medusa-core = { path = "../medusa-core" }
+ratatui = "0.30.2"
+ratatui-image = { version = "11.0.5", default-features = false, features = ["crossterm"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.147"

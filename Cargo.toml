@@ -1,0 +1,7 @@
+[workspace]
+members = [
+    "crates/medusa-core",
+    "crates/medusa-tui",
+]
+default-members = ["crates/medusa-tui"]
+resolver = "3"
