@@ -1,8 +1,10 @@
 pub mod auth;
+pub mod context;
 pub mod harness;
 pub mod hooks;
 pub mod model;
 pub mod permissions;
+pub mod project;
 pub mod session;
 pub mod skills;
 pub mod tools;

@@ -25,20 +25,16 @@ impl HarnessPolicy {
         }
     }
 
-    pub fn allows_patch(self) -> bool {
-        self.mode == TurnMode::Goal
-    }
-
     pub fn instructions(self) -> &'static str {
         match self.mode {
             TurnMode::Chat => {
-                "Current turn mode: chat. Answer directly and naturally. Use tools only when the answer depends on the live workspace state. Do not edit files or run broad inspection commands unless the user asked for workspace work."
+                "Current turn mode hint: chat. Answer directly and naturally. Use tools when the answer depends on the live workspace state. The full toolset stays available; if the request turns out to need workspace changes, make them."
             }
             TurnMode::Goal => {
-                "Current turn mode: goal. Treat the user request as implementation work. Use the default Medusa loop: observe the live state, make targeted changes with file_patch, verify with focused commands, then repeat until the request is done or you are genuinely blocked. Verification is part of the task."
+                "Current turn mode hint: goal. Treat the user request as implementation work. Use the default Medusa loop: observe the live state, make targeted changes with file_edit or file_patch, verify with focused commands, then repeat until the request is done or you are genuinely blocked. Verification is part of the task."
             }
             TurnMode::PlanFirst => {
-                "Current turn mode: plan. Explore and reason before changing files. Prefer concise architecture, tradeoff, or workflow guidance. If the user explicitly asks to implement after planning, switch into the goal loop."
+                "Current turn mode hint: plan. Explore and reason before changing files. Prefer concise architecture, tradeoff, or workflow guidance. The full toolset stays available; implement once the plan is settled or the user asks."
             }
         }
     }
@@ -155,10 +151,12 @@ mod tests {
     }
 
     #[test]
-    fn only_goal_turns_allow_patches() {
-        assert!(!HarnessPolicy::for_user_prompt("hi").allows_patch());
-        assert!(!HarnessPolicy::for_user_prompt("design the architecture").allows_patch());
-        assert!(HarnessPolicy::for_user_prompt("implement this").allows_patch());
+    fn mode_is_advisory_and_never_forbids_edits() {
+        for prompt in ["hi", "design the architecture", "implement this"] {
+            let instructions = HarnessPolicy::for_user_prompt(prompt).instructions();
+            assert!(instructions.contains("mode hint"));
+            assert!(!instructions.contains("Do not edit"));
+        }
     }
 
     #[test]

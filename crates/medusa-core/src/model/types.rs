@@ -4,7 +4,6 @@ const CODEX_BACKEND_URL: &str = "https://chatgpt.com/backend-api/codex";
 const DEEPSEEK_BASE_URL: &str = "https://api.deepseek.com";
 const DEFAULT_MODEL: &str = "gpt-5.5";
 const DEFAULT_DEEPSEEK_MODEL: &str = "deepseek-v4-flash";
-pub(crate) const DEFAULT_CONTEXT_MAX_CHARS: usize = 120_000;
 
 #[derive(Debug, Clone)]
 pub struct DirectCodexBackend {
@@ -157,8 +156,17 @@ pub struct ModelChatResult {
 pub enum ModelStreamEvent {
     Delta(String),
     ReasoningDelta(String),
-    ToolStart { name: String, summary: String },
-    ToolResult { name: String, output: String },
+    ToolStart {
+        call_id: String,
+        name: String,
+        summary: String,
+    },
+    ToolResult {
+        call_id: String,
+        name: String,
+        output: String,
+    },
+    Workflow(crate::workflow::WorkflowEvent),
     Done { event_count: usize },
     Error(String),
 }
@@ -190,22 +198,41 @@ pub(crate) struct ToolLoopState {
 }
 
 #[derive(Debug, Clone, Copy)]
-pub(crate) enum ToolLoopPolicy {
-    MutationAllowed,
-    ReadOnly,
+pub(crate) struct ToolLoopPolicy {
+    mutation: bool,
+    workflows: bool,
 }
 
 impl ToolLoopPolicy {
     pub(crate) fn mutation_allowed() -> Self {
-        Self::MutationAllowed
+        Self {
+            mutation: true,
+            workflows: true,
+        }
     }
 
     pub(crate) fn read_only() -> Self {
-        Self::ReadOnly
+        Self {
+            mutation: false,
+            workflows: false,
+        }
+    }
+
+    /// Workflow subagents never get the workflow tool themselves: one level
+    /// of orchestration only, so a script cannot recursively spawn scripts.
+    pub(crate) fn subagent(mutation: bool) -> Self {
+        Self {
+            mutation,
+            workflows: false,
+        }
     }
 
     pub(crate) fn allow_mutation(self) -> bool {
-        matches!(self, Self::MutationAllowed)
+        self.mutation
+    }
+
+    pub(crate) fn allow_workflows(self) -> bool {
+        self.workflows
     }
 }
 

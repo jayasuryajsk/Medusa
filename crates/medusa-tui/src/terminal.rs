@@ -7,15 +7,26 @@ use std::{
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use color_eyre::eyre::{Result, WrapErr, bail};
 use crossterm::{
-    event::{DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture},
+    event::{
+        DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+        KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    },
     execute,
-    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
+    terminal::{
+        BeginSynchronizedUpdate, EndSynchronizedUpdate, EnterAlternateScreen,
+        LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+        supports_keyboard_enhancement,
+    },
 };
 use ratatui::{Terminal, backend::CrosstermBackend};
 
 pub(crate) type Tui = Terminal<CrosstermBackend<io::Stdout>>;
+
+static KEYBOARD_ENHANCED: AtomicBool = AtomicBool::new(false);
 
 pub(crate) fn init_terminal() -> Result<Tui> {
     enable_raw_mode()?;
@@ -26,12 +37,27 @@ pub(crate) fn init_terminal() -> Result<Tui> {
         EnableBracketedPaste,
         EnableMouseCapture
     )?;
+
+    // Kitty keyboard protocol (Ghostty, Kitty, WezTerm, foot): disambiguates
+    // modified keys so Shift+Enter / Alt+Enter reach the composer instead of
+    // collapsing to plain Enter.
+    if matches!(supports_keyboard_enhancement(), Ok(true)) {
+        execute!(
+            stdout,
+            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+        )?;
+        KEYBOARD_ENHANCED.store(true, Ordering::Relaxed);
+    }
+
     let backend = CrosstermBackend::new(stdout);
     Ok(Terminal::new(backend)?)
 }
 
 pub(crate) fn restore_terminal(terminal: &mut Tui) -> Result<()> {
     disable_raw_mode()?;
+    if KEYBOARD_ENHANCED.swap(false, Ordering::Relaxed) {
+        execute!(terminal.backend_mut(), PopKeyboardEnhancementFlags)?;
+    }
     execute!(
         terminal.backend_mut(),
         DisableMouseCapture,
@@ -40,6 +66,21 @@ pub(crate) fn restore_terminal(terminal: &mut Tui) -> Result<()> {
     )?;
     terminal.show_cursor()?;
     Ok(())
+}
+
+/// Run `draw` inside a synchronized-output block (DEC mode 2026). Terminals
+/// that support it (Ghostty, Kitty, WezTerm, iTerm2) commit the frame
+/// atomically — no mid-frame tearing; others ignore the markers.
+pub(crate) fn draw_synchronized(
+    terminal: &mut Tui,
+    draw: impl FnOnce(&mut Tui) -> io::Result<()>,
+) -> io::Result<()> {
+    execute!(terminal.backend_mut(), BeginSynchronizedUpdate)?;
+    let result = draw(terminal);
+    // Always release the sync guard, even if the draw failed — a stuck
+    // BeginSynchronizedUpdate freezes the terminal's screen updates.
+    let end = execute!(terminal.backend_mut(), EndSynchronizedUpdate);
+    result.and(end)
 }
 
 pub(crate) fn maybe_rebuild_before_reload(executable: &Path) -> Result<()> {

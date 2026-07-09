@@ -5,3 +5,8 @@ members = [
 ]
 default-members = ["crates/medusa-tui"]
 resolver = "3"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "debuginfo"

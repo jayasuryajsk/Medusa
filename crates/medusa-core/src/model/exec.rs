@@ -7,10 +7,20 @@ use crate::hooks::HookEvent;
 use crate::model::types::*;
 use crate::tools::{
     DecisionQuestionRequest, DecisionRequest, DecisionResult, ExploreBatchRequest,
-    ExploreBatchResult, ExploreProbe, ExploreProbeKind, FileEditRequest, FilePatchRequest,
-    FileReadRequest, FileSearchRequest, FsListRequest, PlanUpdateItem, PlanUpdateRequest,
-    PlanUpdateResult, QuestionRequest, TaskUpdateRequest, TerminalExecRequest, ToolRuntime,
+    ExploreBatchResult, ExploreProbe, ExploreProbeKind, FileEditRequest, FileGlobRequest,
+    FilePatchRequest, FileReadRequest, FileSearchRequest, FsListRequest, PlanUpdateItem,
+    PlanUpdateRequest, PlanUpdateResult, QuestionRequest, TaskUpdateRequest, TerminalExecRequest,
+    ToolRuntime,
 };
+
+/// Tools that neither mutate the workspace nor consult [`ToolLoopState`] —
+/// safe to execute concurrently within one turn.
+pub(crate) fn tool_call_is_read_only(name: &str) -> bool {
+    matches!(
+        name,
+        "file_read" | "file_search" | "file_glob" | "fs_list" | "explore_batch"
+    )
+}
 
 pub(crate) fn execute_tool_call_with_hooks(
     tools: &ToolRuntime,
@@ -58,6 +68,125 @@ pub(crate) fn execute_tool_call_with_hooks(
     execution
 }
 
+pub(crate) fn execute_workflow_run_with_hooks<F>(
+    tools: &ToolRuntime,
+    call: &ToolCall,
+    policy: HarnessPolicy,
+    tool_policy: ToolLoopPolicy,
+    backend: &crate::model::types::DirectCodexBackend,
+    on_event: &mut F,
+) -> ToolExecution
+where
+    F: FnMut(ModelStreamEvent) -> color_eyre::eyre::Result<()>,
+{
+    let summary = summarize_tool_call(call);
+    let tool_name = display_tool_name(&call.name);
+    let turn_mode = policy.mode_label();
+
+    if let Some(error) = tools
+        .hooks()
+        .run(HookEvent::pre_tool(turn_mode, tool_name, &summary))
+        .blocking_failure_summary()
+    {
+        return ToolExecution {
+            failed: true,
+            output: format!("error: pre_tool hook blocked {tool_name}: {error}"),
+        };
+    }
+
+    let mut execution = execute_workflow_run(tools, call, tool_policy, backend, on_event);
+    let status = if execution.failed {
+        "failed"
+    } else {
+        "succeeded"
+    };
+
+    if let Some(error) = tools
+        .hooks()
+        .run(HookEvent::post_tool(turn_mode, tool_name, &summary, status))
+        .blocking_failure_summary()
+    {
+        if !execution.output.ends_with('\n') && !execution.output.is_empty() {
+            execution.output.push('\n');
+        }
+        execution.output.push_str(&format!(
+            "error: post_tool hook failed for {tool_name}: {error}"
+        ));
+        execution.failed = true;
+    }
+
+    execution
+}
+
+fn execute_workflow_run<F>(
+    tools: &ToolRuntime,
+    call: &ToolCall,
+    tool_policy: ToolLoopPolicy,
+    backend: &crate::model::types::DirectCodexBackend,
+    on_event: &mut F,
+) -> ToolExecution
+where
+    F: FnMut(ModelStreamEvent) -> color_eyre::eyre::Result<()>,
+{
+    if !tool_policy.allow_workflows() {
+        return ToolExecution {
+            failed: true,
+            output: "error: workflow_run is unavailable here: workflow subagents cannot launch nested workflows".to_string(),
+        };
+    }
+
+    let args = match serde_json::from_str::<Value>(&call.arguments) {
+        Ok(args) => args,
+        Err(error) => {
+            return ToolExecution {
+                failed: true,
+                output: format!("error: invalid tool arguments: {error}"),
+            };
+        }
+    };
+
+    let Some(script_source) = args.get("script").and_then(Value::as_str) else {
+        return ToolExecution {
+            failed: true,
+            output: "error: workflow_run.script is required".to_string(),
+        };
+    };
+    if script_source.trim().is_empty() {
+        return ToolExecution {
+            failed: true,
+            output: "error: workflow_run.script cannot be empty".to_string(),
+        };
+    }
+
+    let goal = args
+        .get("goal")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|goal| !goal.is_empty())
+        .unwrap_or("model-workflow");
+    let workflow_args = args.get("args").filter(|value| !value.is_null()).cloned();
+
+    let script = crate::workflow::WorkflowScript::new(goal, script_source);
+    let runtime = crate::workflow::WorkflowRuntime::new(tools.workspace().to_path_buf());
+
+    match runtime.run_script(
+        &script,
+        workflow_args,
+        backend.clone(),
+        tools.clone(),
+        |event| on_event(ModelStreamEvent::Workflow(event)),
+    ) {
+        Ok(report) => ToolExecution {
+            failed: report.status == crate::workflow::WorkflowStatus::Failed,
+            output: report.summary,
+        },
+        Err(error) => ToolExecution {
+            failed: true,
+            output: format!("error: workflow failed to run: {error}"),
+        },
+    }
+}
+
 pub(crate) fn execute_tool_call(
     tools: &ToolRuntime,
     call: &ToolCall,
@@ -94,6 +223,7 @@ pub(crate) fn execute_tool_call(
     match call.name.as_str() {
         "file_read" => execute_file_read(tools, &args),
         "file_search" => execute_file_search(tools, &args),
+        "file_glob" => execute_file_glob(tools, &args),
         "fs_list" => execute_fs_list(tools, &args),
         "explore_batch" => execute_explore_batch(tools, &args),
         "terminal_exec" => execute_terminal_exec(tools, &args),
@@ -150,12 +280,43 @@ fn execute_file_search(tools: &ToolRuntime, args: &Value) -> ToolExecution {
         depth: optional_usize(args, "depth"),
         max_results: optional_usize(args, "max_results"),
         case_sensitive: optional_bool(args, "case_sensitive"),
+        include: args
+            .get("include")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .map(str::to_string),
     };
 
     match tools.file_search(request) {
         Ok(result) => ToolExecution {
             failed: false,
             output: format_file_search_result(&result),
+        },
+        Err(error) => ToolExecution {
+            failed: true,
+            output: format!("error: {error}"),
+        },
+    }
+}
+
+fn execute_file_glob(tools: &ToolRuntime, args: &Value) -> ToolExecution {
+    let Some(pattern) = args.get("pattern").and_then(Value::as_str) else {
+        return ToolExecution {
+            failed: true,
+            output: "error: file_glob.pattern is required".to_string(),
+        };
+    };
+
+    let request = FileGlobRequest {
+        pattern: pattern.to_string(),
+        path: optional_path(args, "path"),
+        max_results: optional_usize(args, "max_results"),
+    };
+
+    match tools.file_glob(request) {
+        Ok(result) => ToolExecution {
+            failed: false,
+            output: format_file_glob_result(&result),
         },
         Err(error) => ToolExecution {
             failed: true,
@@ -595,14 +756,30 @@ fn format_file_read_result(result: &crate::tools::FileReadResult) -> String {
 
 fn format_file_search_result(result: &crate::tools::FileSearchResult) -> String {
     let mut output = format!(
-        "query: {}\nsearched files: {}\nmatches: {}{}\n",
+        "query: {}\nmode: {}\nsearched files: {}\nmatches: {}{}\n",
         result.query,
+        if result.regex { "regex" } else { "literal" },
         result.searched_files,
         result.matches.len(),
         if result.truncated { " (truncated)" } else { "" }
     );
     for hit in &result.matches {
         output.push_str(&format!("{}:{}: {}\n", hit.path, hit.line, hit.text));
+    }
+    output
+}
+
+fn format_file_glob_result(result: &crate::tools::FileGlobResult) -> String {
+    let mut output = format!(
+        "pattern: {}\nroot: {}\nmatches: {}{}\n",
+        result.pattern,
+        result.root,
+        result.paths.len(),
+        if result.truncated { " (truncated)" } else { "" }
+    );
+    for path in &result.paths {
+        output.push_str(path);
+        output.push('\n');
     }
     output
 }
@@ -707,7 +884,8 @@ pub(crate) fn update_tool_loop_state(
         "file_edit" | "file_patch" => {
             state.patch_requires_context = false;
         }
-        "file_read" | "file_search" | "fs_list" | "explore_batch" | "terminal_exec" => {
+        "file_read" | "file_search" | "file_glob" | "fs_list" | "explore_batch"
+        | "terminal_exec" | "workflow_run" => {
             state.patch_requires_context = false;
         }
         _ => {}
@@ -777,6 +955,11 @@ pub(crate) fn summarize_tool_call(call: &ToolCall) -> String {
             .and_then(Value::as_str)
             .map(|query| format!("search {query:?}"))
             .unwrap_or_else(|| "search files".to_string()),
+        "file_glob" => args
+            .get("pattern")
+            .and_then(Value::as_str)
+            .map(|pattern| format!("glob {pattern}"))
+            .unwrap_or_else(|| "glob files".to_string()),
         "fs_list" => args
             .get("path")
             .and_then(Value::as_str)
@@ -799,6 +982,11 @@ pub(crate) fn summarize_tool_call(call: &ToolCall) -> String {
             .and_then(Value::as_str)
             .map(|command| format!("$ {command}"))
             .unwrap_or_else(|| "run command".to_string()),
+        "workflow_run" => args
+            .get("goal")
+            .and_then(Value::as_str)
+            .map(|goal| format!("workflow: {}", compact(goal, 80)))
+            .unwrap_or_else(|| "run workflow script".to_string()),
         "file_edit" => args
             .get("path")
             .and_then(Value::as_str)
@@ -897,12 +1085,15 @@ pub(crate) fn compact_tool_context_output(call: &ToolCall, execution: &ToolExecu
     }
 
     match call.name.as_str() {
-        "file_read" | "file_search" | "fs_list" | "explore_batch" => {
+        "file_read" | "file_search" | "file_glob" | "fs_list" | "explore_batch" => {
             compact(&execution.output, 20_000)
         }
         "terminal_exec" => compact_terminal_context_output(&execution.output, 6000),
-        "file_edit" => summarize_tool_result(call, execution),
-        "file_patch" => summarize_tool_result(call, execution),
+        "workflow_run" => compact(&execution.output, 8000),
+        // Short confirmations only: the model already produced the edit content,
+        // so echoing a diff back would just duplicate tokens in context.
+        "file_edit" => summarize_file_edit_output(&execution.output),
+        "file_patch" => summarize_file_patch_output(&execution.output),
         "task_update" => execution.output.clone(),
         "plan_update" => execution.output.clone(),
         "decision_request" => execution.output.clone(),
@@ -919,35 +1110,130 @@ pub(crate) fn summarize_tool_result(call: &ToolCall, execution: &ToolExecution) 
     match call.name.as_str() {
         "file_read" => summarize_file_read_output(&execution.output),
         "file_search" => summarize_file_search_output(&execution.output),
+        "file_glob" => summarize_file_glob_output(&execution.output),
         "fs_list" => summarize_fs_list_output(&execution.output),
         "explore_batch" => summarize_explore_batch_output(&execution.output),
         "terminal_exec" => summarize_terminal_output(&execution.output),
-        "file_edit" => execution
+        "file_edit" => {
+            let mut summary = summarize_file_edit_output(&execution.output);
+            if let Some(diff) = file_edit_display_diff(call) {
+                summary.push('\n');
+                summary.push_str(&diff);
+            }
+            summary
+        }
+        "file_patch" => {
+            let mut summary = summarize_file_patch_output(&execution.output);
+            if let Some(diff) = file_patch_display_diff(call) {
+                summary.push('\n');
+                summary.push_str(&diff);
+            }
+            summary
+        }
+        "workflow_run" => execution
             .output
-            .strip_prefix("edited files:\n")
-            .map(|rest| {
-                let path = rest.lines().next().unwrap_or("file");
-                let replacements = rest
-                    .lines()
-                    .find_map(|line| line.strip_prefix("replacements: "))
-                    .unwrap_or("1");
-                format!(
-                    "edited {path} ({replacements} replacement{})",
-                    if replacements == "1" { "" } else { "s" }
-                )
-            })
-            .unwrap_or_else(|| compact(&execution.output, 500)),
-        "file_patch" => execution
-            .output
-            .strip_prefix("patched files:\n")
-            .map(|files| format!("patched {}", files.lines().collect::<Vec<_>>().join(", ")))
-            .unwrap_or_else(|| compact(&execution.output, 500)),
+            .lines()
+            .next()
+            .unwrap_or("workflow completed")
+            .to_string(),
         "task_update" => execution.output.clone(),
         "plan_update" => execution.output.clone(),
         "decision_request" => execution.output.clone(),
         "question" => execution.output.clone(),
         _ => compact(&execution.output, 500),
     }
+}
+
+fn summarize_file_edit_output(output: &str) -> String {
+    output
+        .strip_prefix("edited files:\n")
+        .map(|rest| {
+            let path = rest.lines().next().unwrap_or("file");
+            let replacements = rest
+                .lines()
+                .find_map(|line| line.strip_prefix("replacements: "))
+                .unwrap_or("1");
+            format!(
+                "edited {path} ({replacements} replacement{})",
+                if replacements == "1" { "" } else { "s" }
+            )
+        })
+        .unwrap_or_else(|| compact(output, 500))
+}
+
+fn summarize_file_patch_output(output: &str) -> String {
+    output
+        .strip_prefix("patched files:\n")
+        .map(|files| format!("patched {}", files.lines().collect::<Vec<_>>().join(", ")))
+        .unwrap_or_else(|| compact(output, 500))
+}
+
+/// Maximum diff lines shown in the transcript before folding the rest.
+const DISPLAY_DIFF_MAX_LINES: usize = 60;
+
+/// Unified diff of a file_edit's old/new strings, for the transcript only —
+/// never sent back to the model.
+fn file_edit_display_diff(call: &ToolCall) -> Option<String> {
+    let args: Value = serde_json::from_str(&call.arguments).ok()?;
+    let old = string_arg(&args, "oldString", "old_string").unwrap_or_default();
+    let new = string_arg(&args, "newString", "new_string")?;
+    let diff = similar::TextDiff::from_lines(old, new);
+
+    let mut lines = Vec::new();
+    for hunk in diff.unified_diff().context_radius(2).iter_hunks() {
+        for change in hunk.iter_changes() {
+            let sign = match change.tag() {
+                similar::ChangeTag::Insert => '+',
+                similar::ChangeTag::Delete => '-',
+                similar::ChangeTag::Equal => ' ',
+            };
+            lines.push(format!(
+                "{sign} {}",
+                change.value().trim_end_matches('\n')
+            ));
+        }
+    }
+    if lines.is_empty() {
+        return None;
+    }
+    Some(cap_display_diff(lines))
+}
+
+/// The patch body a file_patch call applied, cleaned up for the transcript.
+fn file_patch_display_diff(call: &ToolCall) -> Option<String> {
+    let args: Value = serde_json::from_str(&call.arguments).ok()?;
+    let diff = args.get("diff").and_then(Value::as_str)?;
+    let lines: Vec<String> = diff
+        .lines()
+        .filter(|line| {
+            let trimmed = line.trim_start();
+            !trimmed.is_empty()
+                && !trimmed.starts_with("```")
+                && !trimmed.starts_with("diff --git")
+                && !trimmed.starts_with("index ")
+        })
+        .map(|line| {
+            // Match file_edit diff formatting: a space after the sign column.
+            match line.as_bytes().first() {
+                Some(b'+') if !line.starts_with("+++") => format!("+ {}", &line[1..]),
+                Some(b'-') if !line.starts_with("---") => format!("- {}", &line[1..]),
+                _ => line.to_string(),
+            }
+        })
+        .collect();
+    if lines.is_empty() {
+        return None;
+    }
+    Some(cap_display_diff(lines))
+}
+
+fn cap_display_diff(mut lines: Vec<String>) -> String {
+    if lines.len() > DISPLAY_DIFF_MAX_LINES {
+        let hidden = lines.len() - DISPLAY_DIFF_MAX_LINES;
+        lines.truncate(DISPLAY_DIFF_MAX_LINES);
+        lines.push(format!("… +{hidden} more diff lines"));
+    }
+    lines.join("\n")
 }
 
 fn summarize_file_read_output(output: &str) -> String {
@@ -977,6 +1263,22 @@ fn summarize_file_search_output(output: &str) -> String {
         format!("matches {matches}")
     } else {
         format!("matches {matches} • {query:?}")
+    }
+}
+
+fn summarize_file_glob_output(output: &str) -> String {
+    let pattern = output
+        .lines()
+        .find_map(|line| line.strip_prefix("pattern: "))
+        .unwrap_or("");
+    let matches = output
+        .lines()
+        .find_map(|line| line.strip_prefix("matches: "))
+        .unwrap_or("0");
+    if pattern.is_empty() {
+        format!("matched {matches}")
+    } else {
+        format!("matched {matches} • {pattern}")
     }
 }
 
@@ -1018,8 +1320,45 @@ fn summarize_terminal_output(output: &str) -> String {
         &stderr
     };
 
-    let preview = summarize_command_text(combined).unwrap_or_else(|| "no output".to_string());
-    format!("{exit} • {}", compact(&preview, 240))
+    let preview = summarize_command_text(&strip_ansi(combined))
+        .unwrap_or_else(|| "no output".to_string());
+    let mut result = format!("{exit} • {}", compact(&preview, 240));
+
+    // Tail of the raw output for the transcript's expanded view. ANSI codes
+    // stay intact here — the UI renders them as colors; the model context
+    // path strips them instead.
+    let tail = terminal_tail_lines(combined, 40);
+    if tail.len() > 1 || tail.first().map(String::as_str) != Some(preview.as_str()) {
+        for line in tail {
+            result.push('\n');
+            result.push_str(&line);
+        }
+    }
+    result
+}
+
+/// The last `limit` non-empty output lines, preserving indentation.
+fn terminal_tail_lines(text: &str, limit: usize) -> Vec<String> {
+    let lines: Vec<&str> = text
+        .lines()
+        .map(str::trim_end)
+        .filter(|line| !line.trim().is_empty() && *line != "<empty>")
+        .collect();
+    lines
+        .iter()
+        .skip(lines.len().saturating_sub(limit))
+        .map(ToString::to_string)
+        .collect()
+}
+
+/// Remove ANSI escape sequences (colors, cursor movement, OSC titles).
+pub(crate) fn strip_ansi(text: &str) -> String {
+    static ANSI: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let re = ANSI.get_or_init(|| {
+        regex::Regex::new(r"\x1b(?:\[[0-9;?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\)|[@-Z\\-_])")
+            .expect("ANSI regex compiles")
+    });
+    re.replace_all(text, "").into_owned()
 }
 
 fn compact_terminal_context_output(output: &str, max_chars: usize) -> String {
@@ -1045,7 +1384,8 @@ fn compact_terminal_context_output(output: &str, max_chars: usize) -> String {
         result.push_str(&important.join("\n"));
     }
 
-    compact(&result, max_chars)
+    // Escape codes are pure token waste in model context.
+    compact(&strip_ansi(&result), max_chars)
 }
 
 fn section_after(output: &str, marker: &str, until: Option<&str>) -> Option<String> {
@@ -1130,11 +1470,13 @@ pub(crate) fn display_tool_name(name: &str) -> &str {
     match name {
         "file_read" => "file.read",
         "file_search" => "file.search",
+        "file_glob" => "file.glob",
         "fs_list" => "fs.list",
         "explore_batch" => "explore.batch",
         "terminal_exec" => "terminal.exec",
         "file_edit" => "file.edit",
         "file_patch" => "file.patch",
+        "workflow_run" => "workflow.run",
         "task_update" => "task.update",
         "plan_update" => "plan.update",
         "decision_request" => "decision.request",

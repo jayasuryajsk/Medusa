@@ -8,14 +8,15 @@ pub(crate) fn medusa_instructions(
     workspace: &Path,
     state: &ToolLoopState,
     policy: HarnessPolicy,
-    skill_context: Option<&str>,
+    extra_context: Option<&str>,
 ) -> String {
     let mut instructions = format!(
         "You are Medusa, a terminal-native autonomous coding agent. \
 You help the user inspect, edit, test, debug, and evolve the current workspace through Medusa's tool loop. \
 Current workspace: {}. \
-Use fs_list to discover the workspace tree, file_search to find text, and file_read to read exact files or line ranges. \
+Use fs_list to discover the workspace tree, file_search to find text with regular expressions, file_glob to find files by name pattern, and file_read to read exact files or line ranges. \
 For nontrivial code tasks, prefer explore_batch first: fan out read-only list/search/read/safe terminal probes in parallel, then synthesize the evidence before editing. \
+Independent read-only calls (file_read, file_search, file_glob, fs_list) issued together in one turn execute concurrently — emit them as one batch of tool calls instead of one per turn when they do not depend on each other. \
 Use terminal_exec for tests, builds, formatters, git, project scripts, and uncommon shell work. \
 Do not write Python/shell just to list, search, or read files when a native Medusa file tool can do it. \
 Prefer targeted tool calls that produce compact output; avoid dumping entire large files unless necessary. \
@@ -47,15 +48,15 @@ Turn mode: {}. \
         );
     }
 
-    if let Some(skill_context) = skill_context {
+    if let Some(extra_context) = extra_context {
         instructions.push_str("\n\n");
-        instructions.push_str(skill_context);
+        instructions.push_str(extra_context);
     }
 
     instructions
 }
 
-pub(crate) fn medusa_tools(allow_patch: bool) -> Vec<Value> {
+pub(crate) fn medusa_tools(allow_patch: bool, allow_workflows: bool) -> Vec<Value> {
     let mut tools = vec![
         json!({
             "type": "function",
@@ -85,13 +86,13 @@ pub(crate) fn medusa_tools(allow_patch: bool) -> Vec<Value> {
         json!({
             "type": "function",
             "name": "file_search",
-            "description": "Search text in workspace files. Prefer this over grep/rg when you only need matches.",
+            "description": "Search workspace file contents with a regular expression. Prefer this over grep/rg when you only need matches.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "query": {
                         "type": "string",
-                        "description": "Text to search for."
+                        "description": "Regular expression to search for (Rust regex syntax). Escape special characters for literal text; invalid patterns fall back to literal substring search."
                     },
                     "path": {
                         "type": "string",
@@ -108,9 +109,37 @@ pub(crate) fn medusa_tools(allow_patch: bool) -> Vec<Value> {
                     "case_sensitive": {
                         "type": "boolean",
                         "description": "Whether the search is case-sensitive. Defaults to true."
+                    },
+                    "include": {
+                        "type": "string",
+                        "description": "Optional glob filter for which files to search, such as *.rs or src/**/*.ts."
                     }
                 },
                 "required": ["query"],
+                "additionalProperties": false
+            }
+        }),
+        json!({
+            "type": "function",
+            "name": "file_glob",
+            "description": "Find workspace files by glob pattern, such as *.rs, src/**/*.ts, or **/Cargo.toml. Results are sorted by modification time, newest first. Prefer this over shell find/ls for locating files by name.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "pattern": {
+                        "type": "string",
+                        "description": "Glob pattern to match against workspace-relative paths."
+                    },
+                    "path": {
+                        "type": "string",
+                        "description": "Optional workspace-relative directory to scope the match."
+                    },
+                    "max_results": {
+                        "type": "integer",
+                        "description": "Optional maximum number of returned paths."
+                    }
+                },
+                "required": ["pattern"],
                 "additionalProperties": false
             }
         }),
@@ -383,7 +412,7 @@ pub(crate) fn medusa_tools(allow_patch: bool) -> Vec<Value> {
 
     if allow_patch {
         tools.insert(
-            3,
+            4,
             json!({
                 "type": "function",
                 "name": "file_edit",
@@ -414,7 +443,7 @@ pub(crate) fn medusa_tools(allow_patch: bool) -> Vec<Value> {
             }),
         );
         tools.insert(
-            4,
+            5,
             json!({
                 "type": "function",
                 "name": "file_patch",
@@ -442,11 +471,37 @@ pub(crate) fn medusa_tools(allow_patch: bool) -> Vec<Value> {
         );
     }
 
+    if allow_workflows {
+        tools.push(json!({
+            "type": "function",
+            "name": "workflow_run",
+            "description": "Author and run a deterministic multi-agent workflow: a JavaScript script whose control flow (loops, branching, fan-out) is plain code and whose work steps are fresh subagents. Use for work that benefits from many parallel agents or verification loops — sweeping reviews, adversarial bug hunts, migrations over many files — not for simple tasks you can do directly. Subagent results stay inside the script; only the script's return value comes back to you. Script API: agent(spec) runs one subagent and blocks until done; spec is a prompt string or {prompt, label?, tools?: 'read'|'shell'|'edit'|'verify', schema?: <JSON Schema>}. With schema, agent() returns parsed JSON matching it, otherwise the agent's final text. parallel([spec, ...]) runs specs concurrently, returning results in order with null for failed agents. phase('title') groups subsequent agents in the progress UI. log('msg') reports progress. args holds the value you pass in the tool call. Scripts must use `return` for the final result. Subagents cannot launch nested workflows. Default tool policy is 'shell' (read + safe commands); use 'edit' only for agents that must change files, and keep edit agents sequential (one at a time), never inside parallel() with overlapping files.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "script": {
+                        "type": "string",
+                        "description": "JavaScript workflow source. Example: phase('scan'); const findings = parallel(files.map(f => ({prompt: `Review ${f}`, schema: {type: 'array'}}))); return findings.flat();"
+                    },
+                    "goal": {
+                        "type": "string",
+                        "description": "Short label for the run, shown in the workflow tree."
+                    },
+                    "args": {
+                        "description": "Optional JSON value exposed to the script as the global `args`."
+                    }
+                },
+                "required": ["script"],
+                "additionalProperties": false
+            }
+        }));
+    }
+
     tools
 }
 
-pub(crate) fn chat_completion_tools(allow_patch: bool) -> Vec<Value> {
-    medusa_tools(allow_patch)
+pub(crate) fn chat_completion_tools(allow_patch: bool, allow_workflows: bool) -> Vec<Value> {
+    medusa_tools(allow_patch, allow_workflows)
         .into_iter()
         .filter_map(|tool| {
             Some(json!({

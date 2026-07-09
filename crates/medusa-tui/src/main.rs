@@ -5,6 +5,7 @@ use std::{
     path::{Path, PathBuf},
     process::Command,
     sync::{
+        Arc, OnceLock,
         atomic::{AtomicU8, Ordering},
         mpsc::{self, Receiver, Sender, TryRecvError},
     },
@@ -25,8 +26,8 @@ use ratatui::{
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{
-        Block, BorderType, Borders, Cell, Clear, Gauge, List, ListItem, ListState, Padding,
-        Paragraph, Row, Scrollbar, ScrollbarOrientation, ScrollbarState, Table, Tabs, Wrap,
+        Block, BorderType, Borders, Cell, Clear, LineGauge, List, ListItem, ListState, Padding,
+        Paragraph, Row, Scrollbar, ScrollbarOrientation, ScrollbarState, Table, Wrap,
     },
 };
 use ratatui_image::{
@@ -37,6 +38,7 @@ use ratatui_image::{
 use serde::{Deserialize, Serialize};
 
 use medusa_core::auth::probe_codex_auth;
+use medusa_core::context::ContextEngine;
 use medusa_core::model::{
     ConversationAttachment, ConversationMessage, DirectCodexBackend, ModelStreamEvent,
 };
@@ -45,11 +47,12 @@ use medusa_core::session::{
     SessionOpenMode, SessionStore as CoreSessionStore, compact_session_id, human_bytes,
 };
 use medusa_core::tools::{
-    BackgroundJobEvent, FilePatchRequest, TaskUpdateRequest, TerminalExecRequest,
-    TerminalExecResult, ToolRuntime,
+    ApprovalDecision, ApprovalRequest, ApprovalTool, BackgroundJobEvent, FilePatchRequest,
+    TerminalExecRequest, TerminalExecResult, ToolRuntime,
 };
 use medusa_core::workflow::{
-    SubagentToolPolicy, WorkflowEvent, WorkflowPhasePlan, WorkflowRuntime, WorkflowStatus,
+    SubagentToolPolicy, WorkflowEvent, WorkflowPhasePlan, WorkflowRuntime, WorkflowScript,
+    WorkflowStatus,
 };
 
 mod animation;
@@ -415,7 +418,7 @@ fn handle_headless_event(
                 eprintln!("reasoning: {}", compact_one_line(&delta, 160));
             }
         }
-        ModelStreamEvent::ToolStart { name, summary } => {
+        ModelStreamEvent::ToolStart { name, summary, .. } => {
             if !options.json {
                 eprintln!("tool start: {name} · {}", compact_one_line(&summary, 180));
             }
@@ -425,7 +428,7 @@ fn handle_headless_event(
                 failed: None,
             });
         }
-        ModelStreamEvent::ToolResult { name, output } => {
+        ModelStreamEvent::ToolResult { name, output, .. } => {
             let failed = tool_output_failed(&output);
             let detail = compact_tool_detail(&output);
             if !options.json {
@@ -437,6 +440,28 @@ fn handle_headless_event(
                 summary: detail,
                 failed: Some(failed),
             });
+        }
+        ModelStreamEvent::Workflow(event) => {
+            if !options.json {
+                match &event {
+                    WorkflowEvent::RunStarted { title, .. } => {
+                        eprintln!("workflow started: {title}");
+                    }
+                    WorkflowEvent::PhaseStarted { name, .. } => {
+                        eprintln!("workflow phase: {name}");
+                    }
+                    WorkflowEvent::AgentFinished { name, status, .. } => {
+                        eprintln!("workflow agent {name}: {status:?}");
+                    }
+                    WorkflowEvent::Log { message, .. } => {
+                        eprintln!("workflow log: {message}");
+                    }
+                    WorkflowEvent::RunFinished { status, .. } => {
+                        eprintln!("workflow finished: {status:?}");
+                    }
+                    WorkflowEvent::AgentStarted { .. } | WorkflowEvent::PhaseFinished { .. } => {}
+                }
+            }
         }
         ModelStreamEvent::Done { .. } | ModelStreamEvent::Error(_) => {}
     }
@@ -529,7 +554,6 @@ fn event_requests_immediate_draw(event: &Event) -> bool {
     )
 }
 
-#[derive(Debug)]
 struct App {
     input: String,
     input_cursor: usize,
@@ -541,7 +565,7 @@ struct App {
     transcript_rows_cache: Option<TranscriptRowsCache>,
     status_line: String,
     last_chat_viewport: Option<Rect>,
-    last_transcript_rows: Vec<TranscriptRow>,
+    last_transcript_rows: Arc<Vec<TranscriptRow>>,
     should_quit: bool,
     restart_requested: bool,
     cwd_display: String,
@@ -550,10 +574,20 @@ struct App {
     permission_mode: PermissionMode,
     tools: ToolRuntime,
     model: DirectCodexBackend,
+    context_engine: ContextEngine,
+    plan_mode: bool,
     model_enabled: bool,
     model_events: Option<Receiver<ModelStreamEvent>>,
     workflow_events: Vec<Receiver<WorkflowEvent>>,
     background_job_sender: Sender<BackgroundJobEvent>,
+    approval_handler: medusa_core::tools::ApprovalHandler,
+    approval_events: Receiver<PendingApproval>,
+    approval_queue: VecDeque<PendingApproval>,
+    session_terminal_grants: Vec<String>,
+    session_edit_grants: Vec<String>,
+    denied_this_turn: Vec<String>,
+    approval_shown_at: Option<Instant>,
+    denied_edits_this_turn: Vec<String>,
     background_job_events: Receiver<BackgroundJobEvent>,
     background_jobs: BTreeMap<String, BackgroundJobView>,
     streaming_message: Option<usize>,
@@ -562,22 +596,12 @@ struct App {
     chat_scroll: usize,
     chat_scroll_target: usize,
     selected_tool: Option<usize>,
-    activity_tools: Vec<ToolRun>,
-    activity_phase: ToolActivityPhase,
-    activity_selected: Option<usize>,
-    activity_detail_tab: ToolDetailTab,
-    activity_detail_scroll: usize,
-    plan_tab: PlanTab,
-    plan_scroll: usize,
     decision_selection: usize,
     workflows: Vec<WorkflowRunView>,
-    sidebar_width: u16,
-    resizing_sidebar: bool,
-    workspace_area: Option<Rect>,
-    sidebar_divider_x: Option<u16>,
     animation_tick: u64,
     started_at: Instant,
     turn_started_at: Option<Instant>,
+    last_escape_at: Option<Instant>,
     session: Option<SessionStore>,
     active_modal: Option<Modal>,
     slash_selection: usize,
@@ -591,10 +615,6 @@ struct App {
     toast: Option<Toast>,
 }
 
-const DEFAULT_SIDEBAR_WIDTH: u16 = 38;
-const MIN_SIDEBAR_WIDTH: u16 = 24;
-const MAX_SIDEBAR_WIDTH: u16 = 72;
-const MIN_CHAT_WIDTH_WITH_SIDEBAR: u16 = 44;
 const COMPOSER_IMAGE_PREVIEW_WIDTH: u16 = 18;
 const COMPOSER_IMAGE_PREVIEW_HEIGHT: u16 = 5;
 const CHAT_IMAGE_PREVIEW_WIDTH: u16 = 52;
@@ -611,14 +631,28 @@ const DEFAULT_MODEL_CHOICES: &[&str] = &[
     "gpt-5.1-codex",
     "deepseek-v4-flash",
 ];
-const CONTEXT_RECENT_MESSAGES: usize = 24;
-const CONTEXT_RECENT_MAX_CHARS: usize = 48_000;
 const SESSION_STATE_MAX_INTENTS: usize = 8;
 const SESSION_STATE_MAX_OUTCOMES: usize = 8;
 const SESSION_STATE_MAX_SYSTEM_NOTES: usize = 6;
 const SESSION_STATE_MAX_TOOLS: usize = 12;
 const SESSION_STATE_MAX_FILES: usize = 16;
 const SESSION_MEMORY_MAX_PER_KIND: usize = 5;
+
+const DOUBLE_ESCAPE_WINDOW: Duration = Duration::from_millis(1_500);
+/// Decision keys are ignored for this long after an approval prompt first
+/// appears, so a keystroke already in flight can't blindly approve or deny.
+const APPROVAL_KEY_GRACE: Duration = Duration::from_millis(350);
+
+const PLAN_MODE_DIRECTIVE: &str = "Plan mode is active. Explore the workspace read-only to understand the task, \
+then present a concise implementation plan: publish it with plan_update, raise decisions that materially change \
+the approach with decision_request, and finish by asking the user to approve. Do not edit files, apply patches, \
+or run mutating commands while plan mode is on; the user turns plan mode off to approve implementation.";
+
+/// A tool call paused in a worker thread, waiting for the user's decision.
+struct PendingApproval {
+    request: ApprovalRequest,
+    respond: Sender<ApprovalDecision>,
+}
 
 static ACTIVE_THEME: AtomicU8 = AtomicU8::new(0);
 
@@ -638,9 +672,13 @@ enum ThemeKind {
     MaterialAmber = 10,
     MaterialIndigo = 11,
     MaterialRose = 12,
+    RosePine = 13,
+    AyuMirage = 14,
+    Everforest = 15,
+    Vesper = 16,
 }
 
-const THEME_KINDS: [ThemeKind; 13] = [
+const THEME_KINDS: [ThemeKind; 17] = [
     ThemeKind::Medusa,
     ThemeKind::OpenCode,
     ThemeKind::TokyoNight,
@@ -654,6 +692,10 @@ const THEME_KINDS: [ThemeKind; 13] = [
     ThemeKind::MaterialAmber,
     ThemeKind::MaterialIndigo,
     ThemeKind::MaterialRose,
+    ThemeKind::RosePine,
+    ThemeKind::AyuMirage,
+    ThemeKind::Everforest,
+    ThemeKind::Vesper,
 ];
 
 #[derive(Debug, Clone, Copy)]
@@ -756,6 +798,10 @@ impl ThemeKind {
             "material-amber" | "material-yellow" => Some(Self::MaterialAmber),
             "material-indigo" | "material-purple" => Some(Self::MaterialIndigo),
             "material-rose" | "material-pink" => Some(Self::MaterialRose),
+            "rose-pine" | "rosepine" => Some(Self::RosePine),
+            "ayu" | "ayu-mirage" => Some(Self::AyuMirage),
+            "everforest" | "everforest-dark" => Some(Self::Everforest),
+            "vesper" => Some(Self::Vesper),
             _ => None,
         }
     }
@@ -779,6 +825,10 @@ impl ThemeKind {
             Self::MaterialAmber => "material-amber",
             Self::MaterialIndigo => "material-indigo",
             Self::MaterialRose => "material-rose",
+            Self::RosePine => "rose-pine",
+            Self::AyuMirage => "ayu-mirage",
+            Self::Everforest => "everforest",
+            Self::Vesper => "vesper",
         }
     }
 
@@ -797,6 +847,10 @@ impl ThemeKind {
             Self::MaterialAmber => "Material Amber",
             Self::MaterialIndigo => "Material Indigo",
             Self::MaterialRose => "Material Rose",
+            Self::RosePine => "Rosé Pine",
+            Self::AyuMirage => "Ayu Mirage",
+            Self::Everforest => "Everforest",
+            Self::Vesper => "Vesper",
         }
     }
 
@@ -815,6 +869,10 @@ impl ThemeKind {
             Self::MaterialAmber => "Material amber selection with teal prompts",
             Self::MaterialIndigo => "Material indigo focus with light-blue tooling",
             Self::MaterialRose => "Material rose accents with teal supporting signals",
+            Self::RosePine => "muted rose and gold over a soho-night violet base",
+            Self::AyuMirage => "dusky slate with warm orange and sky-blue accents",
+            Self::Everforest => "soft forest greens with warm bark and sage tones",
+            Self::Vesper => "near-black minimalism with a single peach accent",
         }
     }
 
@@ -1010,6 +1068,86 @@ impl ThemeKind {
                 MATERIAL_TEAL_200,
                 MATERIAL_PINK_200,
             ),
+            Self::RosePine => ThemePalette {
+                text: Color::Rgb(224, 222, 244),
+                muted: Color::Rgb(144, 140, 170),
+                accent: Color::Rgb(235, 188, 186),
+                prompt: Color::Rgb(246, 193, 119),
+                separator: Color::Rgb(38, 35, 58),
+                selected_fg: Color::Rgb(25, 23, 36),
+                selected_bg: Color::Rgb(235, 188, 186),
+                activity_bg: Color::Rgb(31, 29, 46),
+                user_bg: Color::Rgb(42, 33, 24),
+                success: Color::Rgb(156, 207, 216),
+                error: Color::Rgb(235, 111, 146),
+                info: Color::Rgb(196, 167, 231),
+                tool: Color::Rgb(156, 207, 216),
+                quote: Color::Rgb(184, 179, 209),
+                code_fg: Color::Rgb(224, 222, 244),
+                code_bg: Color::Rgb(31, 29, 46),
+                inline_code_fg: Color::Rgb(196, 167, 231),
+                inline_code_bg: Color::Rgb(38, 35, 58),
+            },
+            Self::AyuMirage => ThemePalette {
+                text: Color::Rgb(203, 204, 198),
+                muted: Color::Rgb(112, 122, 140),
+                accent: Color::Rgb(115, 208, 255),
+                prompt: Color::Rgb(255, 167, 89),
+                separator: Color::Rgb(51, 65, 94),
+                selected_fg: Color::Rgb(31, 36, 48),
+                selected_bg: Color::Rgb(115, 208, 255),
+                activity_bg: Color::Rgb(35, 40, 52),
+                user_bg: Color::Rgb(48, 38, 24),
+                success: Color::Rgb(186, 230, 126),
+                error: Color::Rgb(255, 102, 102),
+                info: Color::Rgb(92, 207, 230),
+                tool: Color::Rgb(92, 207, 230),
+                quote: Color::Rgb(166, 172, 205),
+                code_fg: Color::Rgb(203, 204, 198),
+                code_bg: Color::Rgb(36, 41, 54),
+                inline_code_fg: Color::Rgb(149, 230, 203),
+                inline_code_bg: Color::Rgb(42, 48, 62),
+            },
+            Self::Everforest => ThemePalette {
+                text: Color::Rgb(211, 198, 170),
+                muted: Color::Rgb(133, 146, 137),
+                accent: Color::Rgb(167, 192, 128),
+                prompt: Color::Rgb(230, 152, 117),
+                separator: Color::Rgb(71, 82, 88),
+                selected_fg: Color::Rgb(45, 53, 59),
+                selected_bg: Color::Rgb(167, 192, 128),
+                activity_bg: Color::Rgb(52, 63, 68),
+                user_bg: Color::Rgb(58, 49, 37),
+                success: Color::Rgb(167, 192, 128),
+                error: Color::Rgb(230, 126, 128),
+                info: Color::Rgb(127, 187, 179),
+                tool: Color::Rgb(127, 187, 179),
+                quote: Color::Rgb(157, 169, 160),
+                code_fg: Color::Rgb(211, 198, 170),
+                code_bg: Color::Rgb(39, 46, 51),
+                inline_code_fg: Color::Rgb(131, 192, 146),
+                inline_code_bg: Color::Rgb(47, 56, 62),
+            },
+            Self::Vesper => ThemePalette {
+                text: Color::Rgb(209, 209, 209),
+                muted: Color::Rgb(118, 118, 118),
+                accent: Color::Rgb(255, 199, 153),
+                prompt: Color::Rgb(255, 199, 153),
+                separator: Color::Rgb(40, 40, 40),
+                selected_fg: Color::Rgb(16, 16, 16),
+                selected_bg: Color::Rgb(255, 199, 153),
+                activity_bg: Color::Rgb(24, 24, 24),
+                user_bg: Color::Rgb(38, 30, 22),
+                success: Color::Rgb(153, 255, 228),
+                error: Color::Rgb(255, 128, 128),
+                info: Color::Rgb(153, 255, 228),
+                tool: Color::Rgb(172, 172, 172),
+                quote: Color::Rgb(160, 160, 160),
+                code_fg: Color::Rgb(209, 209, 209),
+                code_bg: Color::Rgb(20, 20, 20),
+                inline_code_fg: Color::Rgb(255, 199, 153),
+                inline_code_bg: Color::Rgb(30, 30, 30),
+            },
         }
     }
 }
@@ -1071,6 +1209,10 @@ fn active_theme() -> ThemeKind {
         10 => ThemeKind::MaterialAmber,
         11 => ThemeKind::MaterialIndigo,
         12 => ThemeKind::MaterialRose,
+        13 => ThemeKind::RosePine,
+        14 => ThemeKind::AyuMirage,
+        15 => ThemeKind::Everforest,
+        16 => ThemeKind::Vesper,
         _ => ThemeKind::Medusa,
     }
 }
@@ -1094,8 +1236,6 @@ enum Modal {
     Commands,
     Settings,
     Help,
-    Activity,
-    Plan,
     ImagePreview,
     Workflows,
     Jobs,
@@ -1104,77 +1244,6 @@ enum Modal {
     Models,
     Permissions,
     Themes,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ToolActivityPhase {
-    Idle,
-    CurrentTurn,
-    LastTurn,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ToolDetailTab {
-    Summary,
-    Output,
-    Timeline,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PlanTab {
-    Plan,
-    History,
-    Blockers,
-    Evidence,
-}
-
-impl PlanTab {
-    fn all() -> &'static [Self] {
-        &[Self::Plan, Self::History, Self::Blockers, Self::Evidence]
-    }
-
-    fn label(self) -> &'static str {
-        match self {
-            Self::Plan => "Plan",
-            Self::History => "History",
-            Self::Blockers => "Blockers",
-            Self::Evidence => "Evidence",
-        }
-    }
-
-    fn index(self) -> usize {
-        Self::all().iter().position(|tab| *tab == self).unwrap_or(0)
-    }
-
-    fn at_offset(self, offset: isize) -> Self {
-        let tabs = Self::all();
-        let next = (self.index() as isize + offset).rem_euclid(tabs.len() as isize) as usize;
-        tabs[next]
-    }
-}
-
-impl ToolDetailTab {
-    fn all() -> &'static [Self] {
-        &[Self::Summary, Self::Output, Self::Timeline]
-    }
-
-    fn label(self) -> &'static str {
-        match self {
-            Self::Summary => "Summary",
-            Self::Output => "Output",
-            Self::Timeline => "Timeline",
-        }
-    }
-
-    fn index(self) -> usize {
-        Self::all().iter().position(|tab| *tab == self).unwrap_or(0)
-    }
-
-    fn at_offset(self, offset: isize) -> Self {
-        let tabs = Self::all();
-        let next = (self.index() as isize + offset).rem_euclid(tabs.len() as isize) as usize;
-        tabs[next]
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -1238,15 +1307,17 @@ impl TranscriptRow {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 struct RenderContext {
     animation_tick: u64,
+    /// Index of the keyboard-selected question in the pending decision.
+    decision_selection: usize,
 }
 
 impl RenderContext {
     #[cfg(test)]
     fn static_view() -> Self {
-        Self { animation_tick: 0 }
+        Self::default()
     }
 }
 
@@ -1388,6 +1459,9 @@ struct ToolRun {
     detail: String,
     #[serde(default)]
     expanded: bool,
+    /// Set on the first tool of a finished group to re-open a collapsed group.
+    #[serde(default)]
+    group_expanded: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -1397,7 +1471,9 @@ struct TranscriptRowsCache {
     streaming_message: Option<usize>,
     selected_tool: Option<usize>,
     animation_tick: Option<u64>,
-    rows: Vec<TranscriptRow>,
+    decision_selection: usize,
+    /// Shared so cache hits are an Arc bump, not a deep clone of every row.
+    rows: Arc<Vec<TranscriptRow>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1604,7 +1680,17 @@ impl App {
 
     #[cfg(test)]
     fn with_model_backend(model_enabled: bool) -> Self {
-        Self::build(model_enabled, None)
+        // Each test app gets its own workspace: parallel tests sharing the
+        // real cwd raced on .medusa/permissions.json and flaked.
+        use std::sync::atomic::AtomicU64;
+        static NEXT_TEST_WORKSPACE: AtomicU64 = AtomicU64::new(0);
+        let dir = env::temp_dir().join(format!(
+            "medusa-test-{}-{}",
+            std::process::id(),
+            NEXT_TEST_WORKSPACE.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&dir).expect("test workspace should be creatable");
+        Self::build_in(model_enabled, None, Some(dir))
     }
 
     fn with_model_backend_and_session(
@@ -1626,7 +1712,17 @@ impl App {
     }
 
     fn build(model_enabled: bool, session: Option<SessionStore>) -> Self {
-        let cwd = env::current_dir().unwrap_or_else(|_| Path::new(".").to_path_buf());
+        Self::build_in(model_enabled, session, None)
+    }
+
+    fn build_in(
+        model_enabled: bool,
+        session: Option<SessionStore>,
+        workspace: Option<PathBuf>,
+    ) -> Self {
+        let cwd = workspace
+            .or_else(|| env::current_dir().ok())
+            .unwrap_or_else(|| Path::new(".").to_path_buf());
         let tools = ToolRuntime::new(&cwd).expect("current directory should be usable");
         let app_settings = load_app_settings(tools.workspace()).unwrap_or_default();
         let mut model =
@@ -1642,6 +1738,18 @@ impl App {
         let permission_mode = app_settings.permission_mode();
         set_active_theme(theme);
         let (background_job_sender, background_job_events) = mpsc::channel();
+        let (approval_sender, approval_events) = mpsc::channel::<PendingApproval>();
+        let approval_handler: medusa_core::tools::ApprovalHandler =
+            Arc::new(move |request: ApprovalRequest| {
+                let (respond, decision) = mpsc::channel();
+                if approval_sender
+                    .send(PendingApproval { request, respond })
+                    .is_err()
+                {
+                    return ApprovalDecision::Deny;
+                }
+                decision.recv().unwrap_or(ApprovalDecision::Deny)
+            });
 
         Self {
             input: String::new(),
@@ -1654,7 +1762,7 @@ impl App {
             transcript_rows_cache: None,
             status_line: "Ready.".to_string(),
             last_chat_viewport: None,
-            last_transcript_rows: Vec::new(),
+            last_transcript_rows: Arc::new(Vec::new()),
             should_quit: false,
             restart_requested: false,
             cwd_display,
@@ -1662,11 +1770,22 @@ impl App {
             theme,
             permission_mode,
             tools,
+            context_engine: ContextEngine::new(),
+            plan_mode: false,
+            last_escape_at: None,
             model,
             model_enabled,
             model_events: None,
             workflow_events: Vec::new(),
             background_job_sender,
+            approval_handler,
+            approval_events,
+            approval_queue: VecDeque::new(),
+            session_terminal_grants: Vec::new(),
+            session_edit_grants: Vec::new(),
+            denied_this_turn: Vec::new(),
+            approval_shown_at: None,
+            denied_edits_this_turn: Vec::new(),
             background_job_events,
             background_jobs: BTreeMap::new(),
             streaming_message: None,
@@ -1675,19 +1794,8 @@ impl App {
             chat_scroll: 0,
             chat_scroll_target: 0,
             selected_tool: None,
-            activity_tools: Vec::new(),
-            activity_phase: ToolActivityPhase::Idle,
-            activity_selected: None,
-            activity_detail_tab: ToolDetailTab::Summary,
-            activity_detail_scroll: 0,
-            plan_tab: PlanTab::Plan,
-            plan_scroll: 0,
             decision_selection: 0,
             workflows: Vec::new(),
-            sidebar_width: DEFAULT_SIDEBAR_WIDTH,
-            resizing_sidebar: false,
-            workspace_area: None,
-            sidebar_divider_x: None,
             animation_tick: 0,
             started_at: Instant::now(),
             turn_started_at: None,
@@ -1724,6 +1832,7 @@ impl App {
             let model_changed = self.drain_model_events();
             let workflow_changed = self.drain_workflow_events();
             let background_changed = self.drain_background_job_events();
+            let approval_changed = self.drain_approval_requests();
             let pending_tool_changed = self.drain_pending_tool_results();
 
             needs_draw |= terminal_changed
@@ -1731,6 +1840,7 @@ impl App {
                 || model_changed
                 || workflow_changed
                 || background_changed
+                || approval_changed
                 || pending_tool_changed
                 || animation_changed;
 
@@ -1741,7 +1851,9 @@ impl App {
             };
 
             if needs_draw && (terminal_changed || last_draw.elapsed() >= frame_cadence) {
-                terminal.draw(|frame| self.draw(frame))?;
+                terminal::draw_synchronized(terminal, |terminal| {
+                    terminal.draw(|frame| self.draw(frame)).map(|_| ())
+                })?;
                 last_draw = Instant::now();
                 needs_draw = false;
                 terminal_changed = false;
@@ -1807,6 +1919,45 @@ impl App {
             return;
         }
 
+        // Approval prompts take priority over every other surface: a worker
+        // thread is blocked waiting on this answer.
+        if !self.approval_queue.is_empty() {
+            // Ignore (but consume) keystrokes for a brief window after the
+            // prompt appears so an in-flight keypress can't blindly decide.
+            if self
+                .approval_shown_at
+                .is_none_or(|shown| shown.elapsed() < APPROVAL_KEY_GRACE)
+            {
+                if self.approval_shown_at.is_none() {
+                    self.approval_shown_at = Some(Instant::now());
+                }
+                return;
+            }
+            if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+                self.should_quit = true;
+                return;
+            }
+            // Decision keys must be unmodified: Ctrl+A (readline home) and the
+            // like must never approve or persist a grant.
+            let plain = key.modifiers.difference(KeyModifiers::SHIFT).is_empty();
+            if plain {
+                match key.code {
+                    KeyCode::Char('y') | KeyCode::Char('Y') => {
+                        self.resolve_pending_approval(ApprovalDecision::AllowOnce);
+                    }
+                    KeyCode::Char('a') | KeyCode::Char('A') => {
+                        self.resolve_pending_approval(ApprovalDecision::AlwaysAllow);
+                    }
+                    KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                        self.last_escape_at = None;
+                        self.resolve_pending_approval(ApprovalDecision::Deny);
+                    }
+                    _ => {}
+                }
+            }
+            return;
+        }
+
         if self.active_modal.is_some() {
             if self.active_modal == Some(Modal::ImagePreview) {
                 match key.code {
@@ -1830,55 +1981,6 @@ impl App {
                     KeyCode::Char('d') | KeyCode::Delete | KeyCode::Backspace => {
                         self.detach_current_preview_image();
                     }
-                    _ => {}
-                }
-                return;
-            }
-
-            if self.active_modal == Some(Modal::Activity) {
-                match key.code {
-                    KeyCode::Esc => {
-                        self.active_modal = None;
-                        self.status_line = "closed".to_string();
-                    }
-                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        self.should_quit = true;
-                    }
-                    KeyCode::Char('j') | KeyCode::Down => self.select_next_activity_tool(),
-                    KeyCode::Char('k') | KeyCode::Up => self.select_previous_activity_tool(),
-                    KeyCode::Char('l') | KeyCode::Right | KeyCode::Tab => {
-                        self.next_activity_detail_tab()
-                    }
-                    KeyCode::Char('h') | KeyCode::Left | KeyCode::BackTab => {
-                        self.previous_activity_detail_tab()
-                    }
-                    KeyCode::PageDown => self.scroll_activity_detail_by(8),
-                    KeyCode::PageUp => self.scroll_activity_detail_by(-8),
-                    KeyCode::Home => self.scroll_activity_detail_home(),
-                    KeyCode::End => self.scroll_activity_detail_end(),
-                    KeyCode::Enter => self.toggle_activity_tool_detail(),
-                    KeyCode::Char('x') => self.close_activity_tool_detail(),
-                    _ => {}
-                }
-                return;
-            }
-
-            if self.active_modal == Some(Modal::Plan) {
-                match key.code {
-                    KeyCode::Esc => self.close_modal(),
-                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        self.should_quit = true;
-                    }
-                    KeyCode::Char('l') | KeyCode::Right | KeyCode::Tab => self.next_plan_tab(),
-                    KeyCode::Char('h') | KeyCode::Left | KeyCode::BackTab => {
-                        self.previous_plan_tab()
-                    }
-                    KeyCode::PageDown | KeyCode::Char('j') | KeyCode::Down => {
-                        self.scroll_plan_by(6)
-                    }
-                    KeyCode::PageUp | KeyCode::Char('k') | KeyCode::Up => self.scroll_plan_by(-6),
-                    KeyCode::Home => self.scroll_plan_home(),
-                    KeyCode::End => self.scroll_plan_end(),
                     _ => {}
                 }
                 return;
@@ -1985,12 +2087,9 @@ impl App {
 
         match key.code {
             KeyCode::Esc if self.slash_suggestions_active() => self.close_command_palette(),
-            KeyCode::Esc => self.should_quit = true,
+            KeyCode::Esc => self.handle_escape(),
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.should_quit = true;
-            }
-            KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.open_activity_modal();
             }
             KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.open_command_palette();
@@ -2003,12 +2102,6 @@ impl App {
             }
             KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.detach_latest_pending_attachment();
-            }
-            KeyCode::Left if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.resize_sidebar_wider(2);
-            }
-            KeyCode::Right if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.resize_sidebar_narrower(2);
             }
             KeyCode::PageUp if self.slash_suggestions_active() => self.page_slash_selection_up(),
             KeyCode::PageDown if self.slash_suggestions_active() => {
@@ -2031,6 +2124,7 @@ impl App {
             KeyCode::Down if self.slash_suggestions_active() => self.move_slash_selection_down(),
             KeyCode::Tab if self.slash_suggestions_active() => self.move_slash_selection_down(),
             KeyCode::BackTab if self.slash_suggestions_active() => self.move_slash_selection_up(),
+            KeyCode::BackTab => self.toggle_plan_mode(),
             KeyCode::Home if key.modifiers.is_empty() && self.slash_suggestions_active() => {
                 self.move_slash_selection_first();
             }
@@ -2049,7 +2143,11 @@ impl App {
             KeyCode::Enter if self.input.is_empty() && self.selected_tool.is_some() => {
                 self.toggle_selected_tool();
             }
-            KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {
+            KeyCode::Enter
+                if key
+                    .modifiers
+                    .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) =>
+            {
                 self.insert_input_char('\n');
             }
             KeyCode::Enter | KeyCode::Char('\n') | KeyCode::Char('\r')
@@ -2066,8 +2164,18 @@ impl App {
             }
             KeyCode::Left => self.move_input_cursor_left(),
             KeyCode::Right => self.move_input_cursor_right(),
-            KeyCode::Home if key.modifiers.is_empty() => self.input_cursor = 0,
-            KeyCode::End if key.modifiers.is_empty() => self.input_cursor = self.input_len(),
+            KeyCode::Up if !self.input.is_empty() && self.input.contains('\n') => {
+                self.move_input_cursor_vertical(-1);
+            }
+            KeyCode::Down if !self.input.is_empty() && self.input.contains('\n') => {
+                self.move_input_cursor_vertical(1);
+            }
+            KeyCode::Home if key.modifiers.is_empty() => {
+                self.input_cursor = self.input_current_line_bounds().0;
+            }
+            KeyCode::End if key.modifiers.is_empty() => {
+                self.input_cursor = self.input_current_line_bounds().1;
+            }
             KeyCode::Delete => self.delete_input_char(),
             KeyCode::Char(_)
                 if key
@@ -2084,6 +2192,54 @@ impl App {
 
     fn input_len(&self) -> usize {
         self.input.chars().count()
+    }
+
+    /// Char-index bounds (start, end) of the line the cursor is on,
+    /// excluding the trailing newline.
+    fn input_current_line_bounds(&self) -> (usize, usize) {
+        let mut start = 0;
+        let mut index = 0;
+        for ch in self.input.chars() {
+            if ch == '\n' {
+                if index >= self.input_cursor {
+                    return (start, index);
+                }
+                start = index + 1;
+            }
+            index += 1;
+        }
+        (start, index)
+    }
+
+    /// Move the cursor up/down one visual input line, keeping the column
+    /// where possible (clamped to the target line's length).
+    fn move_input_cursor_vertical(&mut self, delta: isize) {
+        let lines: Vec<&str> = self.input.split('\n').collect();
+        // Locate the cursor's (line, column).
+        let mut remaining = self.input_cursor;
+        let mut line_index = 0;
+        for (index, line) in lines.iter().enumerate() {
+            let len = line.chars().count();
+            if remaining <= len {
+                line_index = index;
+                break;
+            }
+            remaining -= len + 1;
+            line_index = index;
+        }
+        let column = remaining;
+
+        let target = line_index.saturating_add_signed(delta);
+        if target >= lines.len() || target == line_index {
+            return;
+        }
+
+        let target_column = column.min(lines[target].chars().count());
+        let mut cursor = 0;
+        for line in lines.iter().take(target) {
+            cursor += line.chars().count() + 1;
+        }
+        self.input_cursor = cursor + target_column;
     }
 
     fn input_byte_index(&self, char_index: usize) -> usize {
@@ -2486,6 +2642,51 @@ impl App {
         self.status_line = "command palette closed".to_string();
     }
 
+    /// Contextual Esc: clear what's in the way first; only a second quick
+    /// Esc on an idle composer quits, so a stray keypress can't kill the
+    /// session.
+    fn handle_escape(&mut self) {
+        if self.selected_tool.is_some() {
+            self.close_selected_tool();
+            return;
+        }
+        if !self.input.is_empty() {
+            self.input.clear();
+            self.input_cursor = 0;
+            self.last_escape_at = None;
+            self.status_line = "input cleared".to_string();
+            return;
+        }
+        if self.plan_mode {
+            self.toggle_plan_mode();
+            self.last_escape_at = None;
+            return;
+        }
+        if self
+            .last_escape_at
+            .is_some_and(|at| at.elapsed() <= DOUBLE_ESCAPE_WINDOW)
+        {
+            self.should_quit = true;
+            return;
+        }
+        self.last_escape_at = Some(Instant::now());
+        self.status_line = "press esc again to quit".to_string();
+    }
+
+    fn toggle_plan_mode(&mut self) {
+        self.plan_mode = !self.plan_mode;
+        if self.plan_mode {
+            self.status_line = "plan mode on · read-only exploration".to_string();
+            self.toast(
+                "Plan mode on — model will plan before editing",
+                ToastKind::Info,
+            );
+        } else {
+            self.status_line = "plan mode off".to_string();
+            self.toast("Plan mode off — edits allowed", ToastKind::Info);
+        }
+    }
+
     fn close_modal(&mut self) {
         if self.active_modal == Some(Modal::Themes) {
             self.cancel_theme_preview();
@@ -2500,7 +2701,7 @@ impl App {
             && (!input.contains(char::is_whitespace) || input.starts_with("/theme "))
     }
 
-    fn slash_matches(&self) -> Vec<&'static SlashCommand> {
+    fn slash_matches(&self) -> Vec<(&'static SlashCommand, Vec<usize>)> {
         if !self.slash_suggestions_active() {
             return Vec::new();
         }
@@ -2521,11 +2722,15 @@ impl App {
             .iter()
             .enumerate()
             .filter_map(|(index, command)| {
-                slash_match_score(command, &query).map(|score| (score, index, command))
+                slash_match(command, &query)
+                    .map(|(score, positions)| (score, index, command, positions))
             })
             .collect::<Vec<_>>();
-        matches.sort_by_key(|(score, index, _)| (*score, *index));
-        matches.into_iter().map(|(_, _, command)| command).collect()
+        matches.sort_by_key(|(score, index, _, _)| (*score, *index));
+        matches
+            .into_iter()
+            .map(|(_, _, command, positions)| (command, positions))
+            .collect()
     }
 
     fn clamp_slash_selection(&mut self) {
@@ -2595,10 +2800,23 @@ impl App {
     }
 
     fn accept_slash_suggestion(&mut self) {
-        let Some(command) = self.slash_matches().get(self.slash_selection).copied() else {
+        let Some(command) = self
+            .slash_matches()
+            .get(self.slash_selection)
+            .map(|(command, _)| *command)
+        else {
             self.submit_input();
             return;
         };
+
+        // Typing a command out in full and hitting Enter runs it as typed
+        // instead of re-completing it into the composer.
+        if self.input.trim() == command.name
+            && !matches!(command.name, "/theme" | "/model" | "/permissions")
+        {
+            self.submit_input();
+            return;
+        }
 
         if command.name == "/theme" {
             self.input.clear();
@@ -2802,22 +3020,9 @@ impl App {
         }
 
         match mouse.kind {
-            MouseEventKind::Down(MouseButton::Left) if self.mouse_on_sidebar_divider(mouse) => {
-                self.resizing_sidebar = true;
-                self.resize_sidebar_to_column(mouse.column);
-            }
             MouseEventKind::Down(MouseButton::Left) => {
                 if let Some(attachment) = self.image_attachment_at_mouse(mouse) {
                     self.open_image_preview_for_attachment(&attachment);
-                }
-            }
-            MouseEventKind::Drag(MouseButton::Left) if self.resizing_sidebar => {
-                self.resize_sidebar_to_column(mouse.column);
-            }
-            MouseEventKind::Up(MouseButton::Left) => {
-                if self.resizing_sidebar {
-                    self.resizing_sidebar = false;
-                    self.status_line = format!("tool sidebar width: {}", self.sidebar_width);
                 }
             }
             MouseEventKind::ScrollUp => self.scroll_chat_up(self.mouse_scroll_amount(mouse)),
@@ -2834,17 +3039,6 @@ impl App {
         } else {
             6
         }
-    }
-
-    fn mouse_on_sidebar_divider(&self, mouse: MouseEvent) -> bool {
-        let Some(workspace) = self.workspace_area else {
-            return false;
-        };
-        if mouse.row < workspace.y || mouse.row >= workspace.y.saturating_add(workspace.height) {
-            return false;
-        }
-        self.sidebar_divider_x
-            .is_some_and(|x| mouse.column.abs_diff(x) <= 1)
     }
 
     fn image_attachment_at_mouse(&self, mouse: MouseEvent) -> Option<ImageAttachment> {
@@ -2892,53 +3086,6 @@ impl App {
         }
 
         None
-    }
-
-    fn resize_sidebar_to_column(&mut self, column: u16) {
-        let Some(workspace) = self.workspace_area else {
-            return;
-        };
-        if workspace.width < 100 {
-            return;
-        }
-        let right_edge = workspace.x.saturating_add(workspace.width);
-        let raw_width = right_edge.saturating_sub(column);
-        self.sidebar_width = self.clamp_sidebar_width(raw_width, workspace.width);
-        self.status_line = format!("resizing tools: {}", self.sidebar_width);
-    }
-
-    fn resize_sidebar_wider(&mut self, amount: u16) {
-        let workspace_width = self.workspace_area.map_or(120, |area| area.width);
-        self.sidebar_width =
-            self.clamp_sidebar_width(self.sidebar_width.saturating_add(amount), workspace_width);
-        self.status_line = format!("tool sidebar width: {}", self.sidebar_width);
-    }
-
-    fn resize_sidebar_narrower(&mut self, amount: u16) {
-        let workspace_width = self.workspace_area.map_or(120, |area| area.width);
-        self.sidebar_width =
-            self.clamp_sidebar_width(self.sidebar_width.saturating_sub(amount), workspace_width);
-        self.status_line = format!("tool sidebar width: {}", self.sidebar_width);
-    }
-
-    fn clamp_sidebar_width(&self, width: u16, workspace_width: u16) -> u16 {
-        let max_for_workspace = workspace_width.saturating_sub(MIN_CHAT_WIDTH_WITH_SIDEBAR);
-        let max_width = MAX_SIDEBAR_WIDTH
-            .min(max_for_workspace)
-            .max(MIN_SIDEBAR_WIDTH);
-        width.clamp(MIN_SIDEBAR_WIDTH, max_width)
-    }
-
-    fn sidebar_width_for_area(&self, area: Rect) -> u16 {
-        self.clamp_sidebar_width(self.sidebar_width, area.width)
-    }
-
-    fn update_sidebar_geometry(&mut self, workspace: Rect, sidebar: Option<Rect>) {
-        self.workspace_area = Some(workspace);
-        self.sidebar_divider_x = sidebar.map(|area| area.x.saturating_sub(1));
-        if workspace.width >= 100 {
-            self.sidebar_width = self.sidebar_width_for_area(workspace);
-        }
     }
 
     fn scroll_chat_up(&mut self, amount: usize) {
@@ -3048,7 +3195,7 @@ impl App {
     fn select_previous_tool(&mut self) {
         let tools = self.tool_group_indices();
         if tools.is_empty() {
-            self.status_line = "no activity cards".to_string();
+            self.status_line = "no tool calls yet".to_string();
             return;
         }
 
@@ -3061,7 +3208,7 @@ impl App {
                 .unwrap_or_else(|| *tools.last().unwrap()),
             None => *tools.last().unwrap(),
         });
-        self.status_line = "activity card selected".to_string();
+        self.status_line = "tool selected".to_string();
     }
 
     fn toggle_selected_tool(&mut self) {
@@ -3085,9 +3232,27 @@ impl App {
 
         let Some((start, end)) = self.tool_group_range_containing(index) else {
             self.selected_tool = None;
-            self.status_line = "no activity card selected".to_string();
+            self.status_line = "no tool selected".to_string();
             return;
         };
+
+        let coalescible = tool_group_has_coalesced_runs(&self.transcript, start, end);
+        if coalescible && !tool_group_is_open(&self.transcript, start, end) {
+            if let Some(run) = self.transcript[start..end]
+                .iter_mut()
+                .find_map(|item| match item {
+                    TranscriptItem::Tool(run) => Some(run),
+                    _ => None,
+                })
+            {
+                run.group_expanded = true;
+            }
+            self.touch_transcript();
+            self.selected_tool = Some(start);
+            self.status_line = "tool group expanded".to_string();
+            self.persist_session();
+            return;
+        }
 
         let next_expanded = !self.transcript[start..end]
             .iter()
@@ -3096,6 +3261,9 @@ impl App {
         for item in &mut self.transcript[start..end] {
             if let TranscriptItem::Tool(run) = item {
                 run.expanded = false;
+                if !next_expanded {
+                    run.group_expanded = false;
+                }
             }
         }
 
@@ -3114,6 +3282,8 @@ impl App {
         self.selected_tool = Some(start);
         self.status_line = if next_expanded {
             "tool details open".to_string()
+        } else if coalescible {
+            "tool group collapsed".to_string()
         } else {
             "tool details closed".to_string()
         };
@@ -3122,20 +3292,6 @@ impl App {
 
     fn attach_or_push_background_tool_start(&mut self, id: &str, command: &str) {
         let summary = format!("$ {command}");
-        if let Some(run) = self.activity_tools.iter_mut().rev().find(|run| {
-            run.id.is_none()
-                && run.name == "terminal.exec"
-                && run.summary == summary
-                && run.state == ToolRunState::Running
-        }) {
-            run.id = Some(id.to_string());
-        } else {
-            self.push_tool_start_with_id(
-                Some(id.to_string()),
-                "terminal.exec".to_string(),
-                summary.clone(),
-            );
-        }
         if let Some(run) = self
             .transcript
             .iter_mut()
@@ -3154,20 +3310,17 @@ impl App {
         {
             run.id = Some(id.to_string());
             self.touch_transcript();
+        } else {
+            self.push_tool_start_with_id(
+                Some(id.to_string()),
+                "terminal.exec".to_string(),
+                summary,
+            );
         }
     }
 
     fn update_tool_result_by_id(&mut self, id: &str, state: ToolRunState, detail: &str) {
         let detail = compact_tool_detail(detail);
-        for run in self
-            .activity_tools
-            .iter_mut()
-            .rev()
-            .filter(|run| run.id.as_deref() == Some(id))
-            .take(1)
-        {
-            queue_or_apply_tool_result(run, state, detail.clone(), state == ToolRunState::Failed);
-        }
         if let Some(run) = self
             .transcript
             .iter_mut()
@@ -3199,6 +3352,7 @@ impl App {
             for item in &mut self.transcript[start..end] {
                 if let TranscriptItem::Tool(run) = item {
                     run.expanded = false;
+                    run.group_expanded = false;
                     changed = true;
                 }
             }
@@ -3208,67 +3362,8 @@ impl App {
             self.touch_transcript();
         }
         self.selected_tool = None;
-        self.status_line = "activity card closed".to_string();
+        self.status_line = "tool closed".to_string();
         self.persist_session();
-    }
-
-    fn open_activity_modal(&mut self) {
-        if !self.activity_tools.is_empty() && self.activity_selected.is_none() {
-            self.activity_selected = Some(0);
-        }
-        self.active_modal = Some(Modal::Activity);
-        self.status_line = "activity opened".to_string();
-    }
-
-    fn open_plan_modal(&mut self) {
-        self.active_modal = Some(Modal::Plan);
-        self.plan_scroll = 0;
-        self.status_line = if let Some(plan) = self.current_plan() {
-            let progress = plan_progress(plan);
-            format!(
-                "plan opened · {} steps · {} done",
-                plan.items.len(),
-                progress.done
-            )
-        } else {
-            "plan opened · no plan yet".to_string()
-        };
-    }
-
-    fn next_plan_tab(&mut self) {
-        self.plan_tab = self.plan_tab.at_offset(1);
-        self.plan_scroll = 0;
-        self.status_line = format!("plan {}", self.plan_tab.label().to_ascii_lowercase());
-    }
-
-    fn previous_plan_tab(&mut self) {
-        self.plan_tab = self.plan_tab.at_offset(-1);
-        self.plan_scroll = 0;
-        self.status_line = format!("plan {}", self.plan_tab.label().to_ascii_lowercase());
-    }
-
-    fn scroll_plan_by(&mut self, amount: isize) {
-        let max = self.plan_modal_max_scroll();
-        if amount.is_negative() {
-            self.plan_scroll = self.plan_scroll.saturating_sub(amount.unsigned_abs());
-        } else {
-            self.plan_scroll = self.plan_scroll.saturating_add(amount as usize).min(max);
-        }
-        self.status_line = "plan scroll".to_string();
-    }
-
-    fn scroll_plan_home(&mut self) {
-        self.plan_scroll = 0;
-        self.status_line = "plan top".to_string();
-    }
-
-    fn scroll_plan_end(&mut self) {
-        self.plan_scroll = self.plan_modal_max_scroll();
-        self.status_line = "plan bottom".to_string();
-    }
-
-    fn plan_modal_max_scroll(&self) -> usize {
-        plan_modal_lines(self).len().saturating_sub(8)
     }
 
     fn current_plan(&self) -> Option<&PlanView> {
@@ -3276,16 +3371,6 @@ impl App {
             TranscriptItem::Plan(plan) => Some(plan),
             _ => None,
         })
-    }
-
-    fn plan_history(&self) -> Vec<&PlanView> {
-        self.transcript
-            .iter()
-            .filter_map(|item| match item {
-                TranscriptItem::Plan(plan) => Some(plan),
-                _ => None,
-            })
-            .collect()
     }
 
     fn apply_plan_update_output(&mut self, output: &str) -> std::result::Result<(), String> {
@@ -3304,6 +3389,7 @@ impl App {
         Ok(())
     }
 
+    #[cfg(test)]
     fn current_decision(&self) -> Option<&DecisionView> {
         self.transcript.iter().rev().find_map(|item| match item {
             TranscriptItem::Decision(decision) => Some(decision),
@@ -3322,10 +3408,6 @@ impl App {
         self.transcript.iter().rposition(
             |item| matches!(item, TranscriptItem::Decision(decision) if !decision.answered),
         )
-    }
-
-    fn planning_rail_visible(&self, area: Rect) -> bool {
-        area.width >= 96 && (self.current_plan().is_some() || self.current_decision().is_some())
     }
 
     fn apply_decision_request_output(&mut self, output: &str) -> std::result::Result<(), String> {
@@ -3654,105 +3736,6 @@ impl App {
         self.start_model_turn(&answer);
     }
 
-    fn select_next_activity_tool(&mut self) {
-        if self.activity_tools.is_empty() {
-            self.status_line = "no tool activity".to_string();
-            return;
-        }
-
-        let next = self
-            .activity_selected
-            .map(|index| (index + 1) % self.activity_tools.len())
-            .unwrap_or(0);
-        self.activity_selected = Some(next);
-        self.activity_detail_scroll = 0;
-        self.status_line = format!("selected {}", self.activity_tools[next].name);
-    }
-
-    fn select_previous_activity_tool(&mut self) {
-        if self.activity_tools.is_empty() {
-            self.status_line = "no tool activity".to_string();
-            return;
-        }
-
-        let next = self
-            .activity_selected
-            .map(|index| {
-                if index == 0 {
-                    self.activity_tools.len() - 1
-                } else {
-                    index - 1
-                }
-            })
-            .unwrap_or_else(|| self.activity_tools.len() - 1);
-        self.activity_selected = Some(next);
-        self.activity_detail_scroll = 0;
-        self.status_line = format!("selected {}", self.activity_tools[next].name);
-    }
-
-    fn next_activity_detail_tab(&mut self) {
-        self.activity_detail_tab = self.activity_detail_tab.at_offset(1);
-        self.activity_detail_scroll = 0;
-        self.status_line = format!("activity tab: {}", self.activity_detail_tab.label());
-    }
-
-    fn previous_activity_detail_tab(&mut self) {
-        self.activity_detail_tab = self.activity_detail_tab.at_offset(-1);
-        self.activity_detail_scroll = 0;
-        self.status_line = format!("activity tab: {}", self.activity_detail_tab.label());
-    }
-
-    fn scroll_activity_detail_by(&mut self, amount: isize) {
-        if amount.is_negative() {
-            self.activity_detail_scroll = self
-                .activity_detail_scroll
-                .saturating_sub(amount.unsigned_abs());
-        } else {
-            self.activity_detail_scroll =
-                self.activity_detail_scroll.saturating_add(amount as usize);
-        }
-        self.status_line = "activity detail scroll".to_string();
-    }
-
-    fn scroll_activity_detail_home(&mut self) {
-        self.activity_detail_scroll = 0;
-        self.status_line = "activity detail top".to_string();
-    }
-
-    fn scroll_activity_detail_end(&mut self) {
-        self.activity_detail_scroll = usize::MAX / 2;
-        self.status_line = "activity detail bottom".to_string();
-    }
-
-    fn toggle_activity_tool_detail(&mut self) {
-        let Some(index) = self.activity_selected else {
-            self.status_line = "no tool selected".to_string();
-            return;
-        };
-
-        if let Some(run) = self.activity_tools.get_mut(index) {
-            run.expanded = !run.expanded;
-            self.status_line = if run.expanded {
-                "tool details open".to_string()
-            } else {
-                "tool details closed".to_string()
-            };
-            self.activity_detail_scroll = 0;
-        }
-    }
-
-    fn close_activity_tool_detail(&mut self) {
-        let Some(index) = self.activity_selected else {
-            self.status_line = "no tool selected".to_string();
-            return;
-        };
-
-        if let Some(run) = self.activity_tools.get_mut(index) {
-            run.expanded = false;
-        }
-        self.status_line = "tool details closed".to_string();
-    }
-
     fn tool_group_indices(&self) -> Vec<usize> {
         let mut groups = Vec::new();
         let mut index = 0;
@@ -3862,10 +3845,6 @@ impl App {
             return;
         }
 
-        self.activity_tools.clear();
-        self.activity_phase = ToolActivityPhase::CurrentTurn;
-        self.activity_selected = None;
-
         self.transcript
             .push(TranscriptItem::Message(ChatMessage::user_with_attachments(
                 task.clone(),
@@ -3913,34 +3892,8 @@ impl App {
             return true;
         }
 
-        if task == "/recap" {
-            self.transcript
-                .push(TranscriptItem::Message(ChatMessage::system(
-                    self.recap_text(),
-                )));
-            self.touch_transcript();
-            self.status_line = "recap added".to_string();
-            self.toast("Session recap added", ToastKind::Info);
-            return true;
-        }
-
-        if task == "/demo" {
-            self.run_demo();
-            return true;
-        }
-
-        if task == "/activity" {
-            self.open_activity_modal();
-            return true;
-        }
-
         if task == "/plan" {
-            self.open_plan_modal();
-            return true;
-        }
-
-        if task == "/images" || task == "/image" {
-            self.open_latest_image_preview();
+            self.toggle_plan_mode();
             return true;
         }
 
@@ -3956,18 +3909,41 @@ impl App {
         }
 
         if task == "/workflow" {
+            let scripts = WorkflowScript::list(self.tools.workspace());
+            let script_lines = if scripts.is_empty() {
+                "No saved scripts yet. Add JavaScript workflows under .medusa/workflows/<name>.js"
+                    .to_string()
+            } else {
+                format!(
+                    "Saved scripts:\n{}",
+                    scripts
+                        .iter()
+                        .map(|name| format!("  {name}"))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                )
+            };
             self.transcript
-                .push(TranscriptItem::Message(ChatMessage::system(
-                    "usage: /workflow <task>\n\nUse workflows for larger tasks that benefit from mapper, implementer, and verifier subagents.",
-                )));
+                .push(TranscriptItem::Message(ChatMessage::system(format!(
+                    "usage: /workflow <script-name> [args]  — run a saved JS workflow script\n       /workflow <task>               — run the built-in recon/implement/verify pipeline\n\n{script_lines}",
+                ))));
             self.touch_transcript();
-            self.status_line = "workflow needs a task".to_string();
+            self.status_line = "workflow needs a task or script".to_string();
             self.toast("Workflow task required", ToastKind::Warning);
             return true;
         }
 
         if let Some(workflow_task) = task.strip_prefix("/workflow ") {
-            self.start_workflow(workflow_task.trim());
+            let workflow_task = workflow_task.trim();
+            let (first, rest) = match workflow_task.split_once(char::is_whitespace) {
+                Some((first, rest)) => (first, rest.trim()),
+                None => (workflow_task, ""),
+            };
+            if WorkflowScript::list(self.tools.workspace()).contains(&first.to_string()) {
+                self.start_workflow_script(first, rest);
+            } else {
+                self.start_workflow(workflow_task);
+            }
             return true;
         }
 
@@ -4007,6 +3983,7 @@ impl App {
             self.transcript.clear();
             self.touch_transcript();
             self.selected_tool = None;
+            self.context_engine.reset();
             self.toast("Session cleared", ToastKind::Warning);
             self.status_line = "cleared".to_string();
             return true;
@@ -4055,7 +4032,7 @@ impl App {
             return true;
         }
 
-        if task == "/themes" || task == "/theme" {
+        if task == "/theme" {
             self.open_themes_modal();
             return true;
         }
@@ -4141,7 +4118,7 @@ impl App {
                             }
                         ))));
                     self.touch_transcript();
-                    self.tools.file_patch(FilePatchRequest::new(diff))
+                    self.user_tools().file_patch(FilePatchRequest::new(diff))
                 }
                 Err(error) => Err(error),
             };
@@ -4157,26 +4134,6 @@ impl App {
                     self.push_tool_result("file.patch", format!("error: {error}"));
                     self.status_line = "file.patch failed".to_string();
                     self.toast("Patch failed", ToastKind::Error);
-                }
-            }
-            return true;
-        }
-
-        if let Some(status) = task.strip_prefix("/status ") {
-            match self
-                .tools
-                .task_update(TaskUpdateRequest::new(status.to_string()))
-            {
-                Ok(result) => {
-                    self.status_line = result.status;
-                }
-                Err(error) => {
-                    self.transcript
-                        .push(TranscriptItem::Message(ChatMessage::system(format!(
-                            "error: {error}"
-                        ))));
-                    self.touch_transcript();
-                    self.status_line = "task.update failed".to_string();
                 }
             }
             return true;
@@ -4262,6 +4219,7 @@ impl App {
         match self.permission_mode {
             PermissionMode::Open => None,
             PermissionMode::Guarded => Some("guarded"),
+            PermissionMode::Ask => Some("ask"),
             PermissionMode::Readonly => Some("readonly"),
         }
     }
@@ -4298,11 +4256,9 @@ impl App {
             Ok(transcript) => {
                 let name = session.current_id();
                 self.transcript = transcript;
+                self.context_engine.reset();
                 self.touch_transcript();
                 self.selected_tool = None;
-                self.activity_tools.clear();
-                self.activity_selected = None;
-                self.activity_phase = ToolActivityPhase::Idle;
                 self.streaming_message = None;
                 self.scroll_chat_to_bottom();
                 self.status_line = format!("resumed {name}");
@@ -4331,7 +4287,6 @@ impl App {
         match session.fork(&self.transcript) {
             Ok(name) => {
                 self.selected_tool = None;
-                self.activity_selected = None;
                 self.status_line = format!("forked {name}");
                 self.toast("Session forked", ToastKind::Success);
             }
@@ -4358,10 +4313,6 @@ impl App {
             return;
         }
 
-        self.activity_tools.clear();
-        self.activity_phase = ToolActivityPhase::CurrentTurn;
-        self.activity_selected = None;
-
         let assistant_index = self.transcript.len();
         self.transcript
             .push(TranscriptItem::Message(ChatMessage::assistant("")));
@@ -4372,18 +4323,26 @@ impl App {
         self.status_line = self.scoped_status("streaming");
         self.turn_started_at = Some(Instant::now());
 
+        self.denied_this_turn.clear();
+        self.denied_edits_this_turn.clear();
         let backend = self.model.clone();
         let permission_mode = self.permission_mode;
         let tools = self
             .tools
             .clone()
-            .with_background_events(self.background_job_sender.clone());
-        let prompt = self.conversation_history();
+            .with_background_events(self.background_job_sender.clone())
+            .with_approval_handler(self.approval_handler.clone());
+        let history = self.conversation_history();
+        let context_engine = self.context_engine.clone();
+        let plan_mode = self.plan_mode;
         let (sender, receiver) = mpsc::channel();
         self.model_events = Some(receiver);
 
         thread::spawn(move || {
-            let result = if permission_mode == PermissionMode::Readonly {
+            // Compaction may call the model to summarize old history, so it
+            // runs here on the worker thread, never on the UI thread.
+            let prompt = context_engine.prepare(&history, &backend);
+            let result = if permission_mode == PermissionMode::Readonly || plan_mode {
                 backend.chat_stream_messages_read_only(&prompt, tools, |event| {
                     sender.send(event).map_err(|error| {
                         color_eyre::eyre::eyre!("failed to send stream event: {error}")
@@ -4420,17 +4379,6 @@ impl App {
 
     fn drain_pending_tool_results(&mut self) -> bool {
         let mut changed = false;
-        for run in &mut self.activity_tools {
-            if run.state == ToolRunState::Running
-                && run.started_at.elapsed() >= MIN_TOOL_PULSE_VISIBLE
-                && let Some(pending) = run.pending_result.take()
-            {
-                let expand = pending.state == ToolRunState::Failed;
-                apply_tool_result_now(run, pending.state, pending.detail, expand);
-                changed = true;
-            }
-        }
-
         for item in &mut self.transcript {
             if let TranscriptItem::Tool(run) = item
                 && run.state == ToolRunState::Running
@@ -4485,12 +4433,12 @@ impl App {
     fn touch_transcript(&mut self) {
         self.transcript_version = self.transcript_version.wrapping_add(1);
         self.transcript_rows_cache = None;
-        self.last_transcript_rows.clear();
+        self.last_transcript_rows = Arc::new(Vec::new());
     }
 
     fn invalidate_render_cache(&mut self) {
         self.transcript_rows_cache = None;
-        self.last_transcript_rows.clear();
+        self.last_transcript_rows = Arc::new(Vec::new());
         self.attachment_previews.clear();
     }
 
@@ -4564,8 +4512,13 @@ impl App {
 
         let runtime = WorkflowRuntime::new(self.tools.workspace().to_path_buf())
             .with_memory_context(self.session_state_context_text());
+        self.denied_this_turn.clear();
+        self.denied_edits_this_turn.clear();
         let backend = self.model.clone();
-        let tools = self.tools.clone();
+        let tools = self
+            .tools
+            .clone()
+            .with_approval_handler(self.approval_handler.clone());
         let task = task.trim().to_string();
         let (sender, receiver) = mpsc::channel();
         self.workflow_events.push(receiver);
@@ -4587,6 +4540,85 @@ impl App {
                     run_id: "workflow-error".to_string(),
                     status: WorkflowStatus::Failed,
                     summary: format!("workflow failed: {error}"),
+                });
+            }
+        });
+    }
+
+    fn start_workflow_script(&mut self, name: &str, raw_args: &str) {
+        if !self.model_enabled {
+            self.status_line = "workflow queued".to_string();
+            return;
+        }
+
+        if self.is_working() {
+            let queued = if raw_args.is_empty() {
+                format!("/workflow {name}")
+            } else {
+                format!("/workflow {name} {raw_args}")
+            };
+            self.queued_turns.push_back(queued);
+            self.status_line = format!(
+                "queued workflow script: {name}{}",
+                queue_count_suffix(self.queued_turns.len())
+            );
+            return;
+        }
+
+        let script = match WorkflowScript::load(self.tools.workspace(), name) {
+            Ok(script) => script,
+            Err(error) => {
+                self.status_line = "workflow script failed to load".to_string();
+                self.toast(format!("Workflow script error: {error}"), ToastKind::Error);
+                return;
+            }
+        };
+
+        let args = if raw_args.is_empty() {
+            None
+        } else {
+            Some(
+                serde_json::from_str(raw_args)
+                    .unwrap_or_else(|_| serde_json::Value::String(raw_args.to_string())),
+            )
+        };
+
+        self.transcript
+            .push(TranscriptItem::Message(ChatMessage::user(format!(
+                "/workflow {name}{}{raw_args}",
+                if raw_args.is_empty() { "" } else { " " }
+            ))));
+        self.touch_transcript();
+        self.persist_session();
+        self.scroll_chat_to_bottom();
+
+        let runtime = WorkflowRuntime::new(self.tools.workspace().to_path_buf())
+            .with_memory_context(self.session_state_context_text());
+        self.denied_this_turn.clear();
+        self.denied_edits_this_turn.clear();
+        let backend = self.model.clone();
+        let tools = self
+            .tools
+            .clone()
+            .with_approval_handler(self.approval_handler.clone());
+        let (sender, receiver) = mpsc::channel();
+        self.workflow_events.push(receiver);
+        self.status_line = format!("workflow script starting: {name}");
+        self.toast("Workflow script started", ToastKind::Info);
+
+        thread::spawn(move || {
+            let result = runtime.run_script(&script, args, backend, tools, |event| {
+                sender.send(event).map_err(|error| {
+                    color_eyre::eyre::eyre!("failed to send workflow event: {error}")
+                })?;
+                Ok(())
+            });
+
+            if let Err(error) = result {
+                let _ = sender.send(WorkflowEvent::RunFinished {
+                    run_id: "workflow-error".to_string(),
+                    status: WorkflowStatus::Failed,
+                    summary: format!("workflow script failed: {error}"),
                 });
             }
         });
@@ -4616,7 +4648,11 @@ impl App {
                     self.flush_stream_delta(&mut delta_buffer);
                     self.stick_chat_to_bottom_if_needed();
                 }
-                Ok(ModelStreamEvent::ToolStart { name, summary }) => {
+                Ok(ModelStreamEvent::ToolStart {
+                    call_id,
+                    name,
+                    summary,
+                }) => {
                     changed = true;
                     self.flush_stream_delta(&mut delta_buffer);
                     self.stick_chat_to_bottom_if_needed();
@@ -4628,12 +4664,16 @@ impl App {
                     } else if name == "decision.request" {
                         self.status_line = self.scoped_status("waiting on planning decision");
                     } else {
-                        self.push_tool_start(name.clone(), summary);
+                        self.push_tool_start_with_id(Some(call_id), name.clone(), summary);
                         self.status_line = self.scoped_status(format!("running {name}"));
                     }
                     self.stick_chat_to_bottom_if_needed();
                 }
-                Ok(ModelStreamEvent::ToolResult { name, output }) => {
+                Ok(ModelStreamEvent::ToolResult {
+                    call_id,
+                    name,
+                    output,
+                }) => {
                     changed = true;
                     self.flush_stream_delta(&mut delta_buffer);
                     if name == "task.update" {
@@ -4659,9 +4699,17 @@ impl App {
                             }
                         }
                     } else {
-                        self.push_tool_result(&name, output);
+                        // Parallel calls complete out of order; call_id pins
+                        // the result to the right transcript block.
+                        self.push_tool_result_for_call(&call_id, &name, output);
                         self.status_line = self.scoped_status(format!("{name} complete"));
                     }
+                    self.stick_chat_to_bottom_if_needed();
+                }
+                Ok(ModelStreamEvent::Workflow(event)) => {
+                    changed = true;
+                    self.flush_stream_delta(&mut delta_buffer);
+                    self.apply_workflow_event_from_model(event);
                     self.stick_chat_to_bottom_if_needed();
                 }
                 Ok(ModelStreamEvent::Done { event_count }) => {
@@ -4671,7 +4719,6 @@ impl App {
                         self.scoped_status(format!("complete ({event_count} events)"));
                     self.stick_chat_to_bottom_if_needed();
                     self.streaming_message = None;
-                    self.finish_tool_activity_turn();
                     self.turn_started_at.take();
                     keep_receiver = false;
                     turn_finished = true;
@@ -4702,7 +4749,6 @@ impl App {
                     self.status_line = model_error_status(&clean_error).to_string();
                     self.toast(clean_error, ToastKind::Error);
                     self.streaming_message = None;
-                    self.finish_tool_activity_turn();
                     keep_receiver = false;
                     turn_finished = true;
                     break;
@@ -4715,7 +4761,6 @@ impl App {
                         self.status_line = self.scoped_status("stream ended");
                     }
                     self.streaming_message = None;
-                    self.finish_tool_activity_turn();
                     keep_receiver = false;
                     turn_finished = true;
                     break;
@@ -4816,6 +4861,160 @@ impl App {
         changed
     }
 
+    fn drain_approval_requests(&mut self) -> bool {
+        let mut changed = false;
+        let mut processed = 0usize;
+        while processed < 128 {
+            match self.approval_events.try_recv() {
+                Ok(pending) => {
+                    changed = true;
+                    processed += 1;
+                    if let Some(decision) = self.auto_approval_decision(&pending.request) {
+                        let _ = pending.respond.send(decision);
+                    } else {
+                        self.approval_queue.push_back(pending);
+                    }
+                }
+                Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => break,
+            }
+        }
+
+        if changed && !self.approval_queue.is_empty() {
+            if self.approval_shown_at.is_none() {
+                self.approval_shown_at = Some(Instant::now());
+            }
+            let front = &self.approval_queue[0].request;
+            self.status_line = format!("approval required: {}", front.tool.label());
+        }
+        changed
+    }
+
+    /// Session memory: grants approved with "always allow" this session and
+    /// exact commands already denied this turn resolve without prompting.
+    fn auto_approval_decision(&self, request: &ApprovalRequest) -> Option<ApprovalDecision> {
+        match request.tool {
+            ApprovalTool::TerminalExec => {
+                let command = request.command.as_deref().unwrap_or("").trim();
+                if self.denied_this_turn.iter().any(|denied| denied == command) {
+                    return Some(ApprovalDecision::Deny);
+                }
+                // Match grants against the command with leading env
+                // assignments stripped, so a grant on `cargo build` still
+                // settles `FOO=bar cargo build`.
+                let effective = strip_env_assignments(command);
+                if !command_has_shell_tokens(command)
+                    && self
+                        .session_terminal_grants
+                        .iter()
+                        .any(|prefix| command_matches_grant(effective, prefix))
+                {
+                    return Some(ApprovalDecision::AllowOnce);
+                }
+                None
+            }
+            ApprovalTool::FileEdit | ApprovalTool::FilePatch => {
+                if !request.paths.is_empty()
+                    && request
+                        .paths
+                        .iter()
+                        .all(|path| self.denied_edits_this_turn.iter().any(|p| p == path))
+                {
+                    return Some(ApprovalDecision::Deny);
+                }
+                let all_granted = !request.paths.is_empty()
+                    && request
+                        .paths
+                        .iter()
+                        .all(|path| edit_grant_matches(&self.session_edit_grants, path));
+                all_granted.then_some(ApprovalDecision::AllowOnce)
+            }
+        }
+    }
+
+    fn resolve_pending_approval(&mut self, decision: ApprovalDecision) {
+        let Some(pending) = self.approval_queue.pop_front() else {
+            return;
+        };
+        // The next queued request must serve its own grace window.
+        self.approval_shown_at = None;
+
+        match decision {
+            ApprovalDecision::AlwaysAllow => self.record_always_allow(&pending.request),
+            ApprovalDecision::Deny => {
+                if let Some(command) = pending.request.command.as_deref() {
+                    self.denied_this_turn.push(command.trim().to_string());
+                }
+                for path in &pending.request.paths {
+                    self.denied_edits_this_turn.push(path.clone());
+                }
+            }
+            ApprovalDecision::AllowOnce => {}
+        }
+
+        let _ = pending.respond.send(decision);
+        self.status_line = match decision {
+            ApprovalDecision::AllowOnce => "approved once".to_string(),
+            ApprovalDecision::AlwaysAllow => "always allowed".to_string(),
+            ApprovalDecision::Deny => "denied".to_string(),
+        };
+
+        // A grant can settle other queued requests immediately (bursts from
+        // parallel subagents asking for the same thing).
+        let mut remaining = std::mem::take(&mut self.approval_queue);
+        while let Some(pending) = remaining.pop_front() {
+            if let Some(auto) = self.auto_approval_decision(&pending.request) {
+                let _ = pending.respond.send(auto);
+            } else {
+                self.approval_queue.push_back(pending);
+            }
+        }
+    }
+
+    fn record_always_allow(&mut self, request: &ApprovalRequest) {
+        match request.tool {
+            ApprovalTool::TerminalExec => {
+                let Some(command) = request.command.as_deref() else {
+                    return;
+                };
+                let Some(prefix) = derive_terminal_grant_prefix(command) else {
+                    // Complex commands only get allow-once semantics.
+                    return;
+                };
+                self.session_terminal_grants.push(prefix.clone());
+                match medusa_core::permissions::PermissionPolicy::append_terminal_allow_prefix(
+                    self.tools.workspace(),
+                    &prefix,
+                ) {
+                    Ok(()) => {
+                        // Reload so future turns see the persisted grant.
+                        if let Ok(reloaded) = ToolRuntime::new(self.tools.workspace()) {
+                            self.tools = reloaded;
+                        }
+                        self.toast(format!("Always allowing `{prefix}`"), ToastKind::Success);
+                    }
+                    Err(error) => {
+                        self.toast(format!("Grant not persisted: {error}"), ToastKind::Warning);
+                    }
+                }
+            }
+            ApprovalTool::FileEdit | ApprovalTool::FilePatch => {
+                for path in &request.paths {
+                    let prefix = path
+                        .rsplit_once('/')
+                        .map(|(dir, _)| format!("{dir}/"))
+                        .unwrap_or_else(|| path.clone());
+                    if !self.session_edit_grants.contains(&prefix) {
+                        self.session_edit_grants.push(prefix);
+                    }
+                }
+                self.toast(
+                    "Always allowing edits there this session",
+                    ToastKind::Success,
+                );
+            }
+        }
+    }
+
     fn apply_background_job_event(&mut self, event: BackgroundJobEvent) {
         match event {
             BackgroundJobEvent::Started {
@@ -4908,6 +5107,17 @@ impl App {
     }
 
     fn apply_workflow_event(&mut self, event: WorkflowEvent) -> bool {
+        self.apply_workflow_event_inner(event, true)
+    }
+
+    /// Workflow events from a model-launched `workflow_run` tool call: update
+    /// the tree but skip the final assistant summary message — the model
+    /// receives the result as a tool output and reports it in its own words.
+    fn apply_workflow_event_from_model(&mut self, event: WorkflowEvent) {
+        self.apply_workflow_event_inner(event, false);
+    }
+
+    fn apply_workflow_event_inner(&mut self, event: WorkflowEvent, announce_summary: bool) -> bool {
         match event {
             WorkflowEvent::RunStarted {
                 run_id,
@@ -4932,7 +5142,18 @@ impl App {
             } => {
                 self.update_workflow(&run_id, |workflow| {
                     workflow.status = WorkflowViewState::Running;
+                    // Script workflows create phases dynamically, so unseen
+                    // indexes are appended rather than ignored.
+                    while workflow.phases.len() <= phase_index {
+                        workflow.phases.push(WorkflowPhaseView {
+                            name: name.clone(),
+                            objective: String::new(),
+                            status: WorkflowViewState::Pending,
+                            agents: Vec::new(),
+                        });
+                    }
                     if let Some(phase) = workflow.phases.get_mut(phase_index) {
+                        phase.name = name.clone();
                         phase.status = WorkflowViewState::Running;
                     }
                 });
@@ -4945,16 +5166,28 @@ impl App {
                 phase_index,
                 agent_index,
                 name,
-                ..
+                role,
+                tool_policy,
             } => {
                 self.update_workflow(&run_id, |workflow| {
                     workflow.status = WorkflowViewState::Running;
-                    if let Some(agent) = workflow
-                        .phases
-                        .get_mut(phase_index)
-                        .and_then(|phase| phase.agents.get_mut(agent_index))
-                    {
-                        agent.status = WorkflowViewState::Running;
+                    if let Some(phase) = workflow.phases.get_mut(phase_index) {
+                        while phase.agents.len() <= agent_index {
+                            phase.agents.push(WorkflowAgentView {
+                                name: name.clone(),
+                                role: role.clone(),
+                                tool_policy,
+                                status: WorkflowViewState::Pending,
+                                output: String::new(),
+                                tool_counts: BTreeMap::new(),
+                            });
+                        }
+                        if let Some(agent) = phase.agents.get_mut(agent_index) {
+                            agent.name = name.clone();
+                            agent.role = role.clone();
+                            agent.tool_policy = tool_policy;
+                            agent.status = WorkflowViewState::Running;
+                        }
                     }
                 });
                 self.set_workflow_status_line(format!("subagent: {name}"));
@@ -5002,6 +5235,11 @@ impl App {
                 self.stick_chat_to_bottom_if_needed();
                 false
             }
+            WorkflowEvent::Log { run_id, message } => {
+                let _ = run_id;
+                self.set_workflow_status_line(format!("workflow: {message}"));
+                false
+            }
             WorkflowEvent::RunFinished {
                 run_id,
                 status,
@@ -5012,11 +5250,13 @@ impl App {
                     workflow.status = state;
                     workflow.summary = summary.clone();
                 });
-                self.transcript
-                    .push(TranscriptItem::Message(ChatMessage::assistant(
-                        summary.clone(),
-                    )));
-                self.touch_transcript();
+                if announce_summary {
+                    self.transcript
+                        .push(TranscriptItem::Message(ChatMessage::assistant(
+                            summary.clone(),
+                        )));
+                    self.touch_transcript();
+                }
                 let status_line = match status {
                     WorkflowStatus::Succeeded => "workflow complete".to_string(),
                     WorkflowStatus::PartiallySucceeded => "workflow partially complete".to_string(),
@@ -5073,10 +5313,6 @@ impl App {
             return;
         }
 
-        self.activity_tools.clear();
-        self.activity_phase = ToolActivityPhase::CurrentTurn;
-        self.activity_selected = None;
-
         self.transcript
             .push(TranscriptItem::Message(ChatMessage::user(task.clone())));
         self.touch_transcript();
@@ -5088,16 +5324,6 @@ impl App {
             format!("starting queued turn · {} waiting", self.queued_turns.len())
         };
         self.start_model_turn(&task);
-    }
-
-    fn finish_tool_activity_turn(&mut self) {
-        if self.activity_tools.is_empty() {
-            self.activity_phase = ToolActivityPhase::Idle;
-            self.activity_selected = None;
-        } else {
-            self.activity_phase = ToolActivityPhase::LastTurn;
-            self.activity_selected = self.activity_selected.or(Some(0));
-        }
     }
 
     fn flush_stream_delta(&mut self, delta_buffer: &mut String) {
@@ -5131,9 +5357,6 @@ impl App {
     }
 
     fn push_tool_start_with_id(&mut self, id: Option<String>, name: String, summary: String) {
-        if self.activity_phase == ToolActivityPhase::Idle {
-            self.activity_phase = ToolActivityPhase::CurrentTurn;
-        }
         let run = ToolRun {
             id,
             started_at: Instant::now(),
@@ -5143,11 +5366,10 @@ impl App {
             state: ToolRunState::Running,
             detail: String::new(),
             expanded: false,
+            group_expanded: false,
         };
-        self.transcript.push(TranscriptItem::Tool(run.clone()));
+        self.transcript.push(TranscriptItem::Tool(run));
         self.touch_transcript();
-        self.activity_tools.push(run);
-        self.activity_selected = Some(self.activity_tools.len().saturating_sub(1));
         self.persist_session();
     }
 
@@ -5158,26 +5380,43 @@ impl App {
             ToolRunState::Succeeded
         };
         let detail = compact_tool_detail(&output);
+        self.update_transcript_tool_result(name, state, &detail);
+        self.persist_session();
+    }
+
+    /// Resolve a tool result to its transcript block by call id — required for
+    /// parallel calls, where two same-named runs can be in flight at once and
+    /// "most recent running with this name" would misattribute results.
+    fn push_tool_result_for_call(&mut self, call_id: &str, name: &str, output: String) {
+        let state = if tool_output_failed(&output) {
+            ToolRunState::Failed
+        } else {
+            ToolRunState::Succeeded
+        };
+        let detail = compact_tool_detail(&output);
 
         if let Some(run) = self
-            .activity_tools
+            .transcript
             .iter_mut()
             .rev()
-            .find(|run| run.name == name && run.state == ToolRunState::Running)
+            .find_map(|item| match item {
+                TranscriptItem::Tool(run)
+                    if run.id.as_deref() == Some(call_id)
+                        && run.state == ToolRunState::Running =>
+                {
+                    Some(run)
+                }
+                _ => None,
+            })
         {
-            queue_or_apply_tool_result(run, state, detail.clone(), false);
-        } else {
-            self.activity_tools.push(ToolRun {
-                id: None,
-                started_at: Instant::now(),
-                pending_result: None,
-                name: name.to_string(),
-                summary: String::new(),
-                state,
-                detail: detail.clone(),
-                expanded: false,
-            });
+            queue_or_apply_tool_result(run, state, detail, state == ToolRunState::Failed);
+            self.touch_transcript();
+            self.persist_session();
+            return;
         }
+
+        // No started block carries this id (e.g. restored session) — fall
+        // back to the name-based path, which also creates a block if needed.
         self.update_transcript_tool_result(name, state, &detail);
         self.persist_session();
     }
@@ -5210,6 +5449,7 @@ impl App {
             state,
             detail: detail.to_string(),
             expanded: false,
+            group_expanded: false,
         }));
         self.touch_transcript();
     }
@@ -5226,32 +5466,25 @@ impl App {
             content: self.session_state_context_text(),
             attachments: Vec::new(),
         });
+        if self.plan_mode {
+            messages.push(ConversationMessage {
+                role: "system".to_string(),
+                content: PLAN_MODE_DIRECTIVE.to_string(),
+                attachments: Vec::new(),
+            });
+        }
 
         messages.extend(self.recent_conversation_messages());
         messages
     }
 
+    /// Full conversation history; token budgeting and compaction happen in
+    /// the ContextEngine at turn start, not by windowing here.
     fn recent_conversation_messages(&self) -> Vec<ConversationMessage> {
-        let mut recent = Vec::new();
-        let mut used = 0usize;
-
-        for item in self.transcript.iter().rev() {
-            let Some(message) = transcript_conversation_message(item) else {
-                continue;
-            };
-            let cost = conversation_message_cost(&message);
-            if !recent.is_empty()
-                && (recent.len() >= CONTEXT_RECENT_MESSAGES
-                    || used.saturating_add(cost) > CONTEXT_RECENT_MAX_CHARS)
-            {
-                break;
-            }
-            used = used.saturating_add(cost);
-            recent.push(message);
-        }
-
-        recent.reverse();
-        recent
+        self.transcript
+            .iter()
+            .filter_map(transcript_conversation_message)
+            .collect()
     }
 
     fn session_state_context_text(&self) -> String {
@@ -5318,11 +5551,13 @@ impl App {
             vertical: 0,
         });
         let input_height = self.input_height(area.height);
+        let plan_height = self.plan_strip_height(area.height);
         let sections = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Length(2),
                 Constraint::Min(5),
+                Constraint::Length(plan_height),
                 Constraint::Length(input_height),
                 Constraint::Length(1),
             ])
@@ -5330,18 +5565,18 @@ impl App {
 
         self.draw_header(frame, sections[0]);
         self.draw_workspace(frame, sections[1]);
-        self.draw_input(frame, sections[2]);
-        self.draw_status(frame, sections[3]);
+        self.draw_plan_strip(frame, sections[2]);
+        self.draw_input(frame, sections[3]);
+        self.draw_status(frame, sections[4]);
         if self.active_modal.is_none() {
             self.draw_slash_suggestions(frame, shell_area);
         }
         self.draw_modal(frame, shell_area);
+        self.draw_approval_prompt(frame, shell_area);
     }
 
     fn focus(&self) -> UiFocus {
-        if self.active_modal == Some(Modal::Activity) {
-            UiFocus::Activity
-        } else if self.active_modal.is_some() {
+        if self.active_modal.is_some() {
             UiFocus::Modal
         } else if self.selected_tool.is_some() {
             UiFocus::Activity
@@ -5353,48 +5588,7 @@ impl App {
     }
 
     fn draw_workspace(&mut self, frame: &mut Frame<'_>, area: Rect) {
-        if self.planning_rail_visible(area) {
-            let rail_width = self.sidebar_width_for_area(area).min(46);
-            let chunks = Layout::default()
-                .direction(Direction::Horizontal)
-                .constraints([Constraint::Min(48), Constraint::Length(rail_width)])
-                .split(area);
-            self.update_sidebar_geometry(area, Some(chunks[1]));
-            self.draw_messages(frame, chunks[0]);
-            self.draw_planning_rail(frame, chunks[1]);
-        } else {
-            self.update_sidebar_geometry(area, None);
-            self.draw_messages(frame, area);
-        }
-    }
-
-    fn draw_planning_rail(&self, frame: &mut Frame<'_>, area: Rect) {
-        if area.width < 8 || area.height == 0 {
-            return;
-        }
-
-        let separator = Rect::new(area.x, area.y, 1, area.height);
-        frame.render_widget(
-            Paragraph::new(
-                std::iter::repeat_n("│", area.height as usize)
-                    .collect::<Vec<_>>()
-                    .join("\n"),
-            )
-            .style(Style::default().fg(palette().separator).bg(surface())),
-            separator,
-        );
-
-        let inner = Rect::new(
-            area.x.saturating_add(2),
-            area.y,
-            area.width.saturating_sub(3),
-            area.height,
-        );
-        let lines = planning_rail_lines(self, inner.width, inner.height as usize);
-        let rail = Paragraph::new(lines)
-            .style(Style::default().bg(surface()).fg(text()))
-            .wrap(Wrap { trim: true });
-        frame.render_widget(rail, inner);
+        self.draw_messages(frame, area);
     }
 
     fn draw_header(&self, frame: &mut Frame<'_>, area: Rect) {
@@ -5484,258 +5678,6 @@ impl App {
         }
     }
 
-    fn draw_tool_activity_sidebar(&self, frame: &mut Frame<'_>, area: Rect) {
-        let title = match self.activity_phase {
-            ToolActivityPhase::Idle => " Activity ",
-            ToolActivityPhase::CurrentTurn => " Activity: working ",
-            ToolActivityPhase::LastTurn => " Activity: last turn ",
-        };
-        let border_style = if self
-            .activity_tools
-            .iter()
-            .any(|run| run.state == ToolRunState::Failed)
-        {
-            error_style()
-        } else if self
-            .activity_tools
-            .iter()
-            .any(|run| run.state == ToolRunState::Running)
-        {
-            tool_label_style()
-        } else if self.activity_tools.is_empty() {
-            separator_style()
-        } else {
-            success_style()
-        };
-        let block = panel_block(title, self.focus() == UiFocus::Activity)
-            .title(title)
-            .border_style(border_style)
-            .border_type(BorderType::Rounded)
-            .padding(Padding::new(1, 1, 0, 0))
-            .style(Style::default().bg(surface()).fg(text()));
-
-        if self.activity_tools.is_empty() {
-            frame.render_widget(block, area);
-            let inner = area.inner(Margin {
-                vertical: 1,
-                horizontal: 2,
-            });
-            let message = match self.activity_phase {
-                ToolActivityPhase::CurrentTurn => {
-                    "Thinking… tool activity appears here when needed."
-                }
-                ToolActivityPhase::LastTurn => "No tools used last turn.",
-                ToolActivityPhase::Idle => "Ask me to change or inspect code.",
-            };
-            let empty = Paragraph::new(vec![
-                Line::from(Span::styled(message, muted())),
-                Line::from(""),
-                Line::from(Span::styled(
-                    "drag edge resize · j/k select · enter details",
-                    muted(),
-                )),
-            ])
-            .wrap(Wrap { trim: true });
-            frame.render_widget(empty, inner);
-            return;
-        }
-
-        let selected = self
-            .activity_selected
-            .unwrap_or(0)
-            .min(self.activity_tools.len().saturating_sub(1));
-        let selected_expanded = self
-            .activity_tools
-            .get(selected)
-            .is_some_and(|run| run.expanded);
-
-        if selected_expanded && area.height >= 13 {
-            let list_height = tool_activity_list_height(&self.activity_tools, area.width)
-                .min(area.height / 2)
-                .max(4);
-            let chunks = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([Constraint::Length(list_height), Constraint::Min(5)])
-                .split(area);
-            self.draw_tool_activity_list(frame, chunks[0], Some(block));
-            self.draw_tool_activity_detail(frame, chunks[1], selected);
-        } else {
-            self.draw_tool_activity_list(frame, area, Some(block));
-        }
-    }
-
-    fn draw_tool_activity_list(
-        &self,
-        frame: &mut Frame<'_>,
-        area: Rect,
-        block: Option<Block<'static>>,
-    ) {
-        let selected = self
-            .activity_selected
-            .map(|index| index.min(self.activity_tools.len().saturating_sub(1)));
-        let inner = if block.is_some() {
-            area.inner(Margin {
-                vertical: 1,
-                horizontal: 1,
-            })
-        } else {
-            area
-        };
-        if let Some(block) = block {
-            frame.render_widget(block, area);
-        }
-
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Length(2), Constraint::Min(1)])
-            .split(inner);
-
-        let header = Paragraph::new(vec![
-            tool_activity_header_line(self.activity_phase, &self.activity_tools),
-            Line::from(Span::styled("", separator_style())),
-        ])
-        .style(Style::default().bg(surface()).fg(text()));
-        frame.render_widget(header, chunks[0]);
-
-        let items = self
-            .activity_tools
-            .iter()
-            .enumerate()
-            .map(|(index, run)| {
-                tool_activity_item(
-                    run,
-                    selected == Some(index),
-                    self.animation_tick,
-                    chunks[1].width,
-                )
-            })
-            .collect::<Vec<_>>();
-        let mut state = ListState::default().with_selected(selected);
-        let list = List::new(items)
-            .style(Style::default().bg(surface()).fg(text()))
-            .highlight_style(activity_selected_style())
-            .highlight_symbol("▌ ");
-        frame.render_stateful_widget(list, chunks[1], &mut state);
-
-        if self.activity_tools.len() as u16 > chunks[1].height && chunks[1].width > 4 {
-            let mut scrollbar_state =
-                ScrollbarState::new(self.activity_tools.len()).position(selected.unwrap_or(0));
-            frame.render_stateful_widget(activity_scrollbar(), chunks[1], &mut scrollbar_state);
-        }
-    }
-
-    fn draw_tool_activity_detail(&self, frame: &mut Frame<'_>, area: Rect, index: usize) {
-        let Some(run) = self.activity_tools.get(index) else {
-            return;
-        };
-        let block = panel_block(" Tool details ", true)
-            .title(" Tool details ")
-            .border_style(tool_output_border_style())
-            .border_type(BorderType::Rounded)
-            .padding(Padding::new(1, 1, 0, 0))
-            .style(Style::default().bg(surface()).fg(text()));
-        let inner = block.inner(area);
-        frame.render_widget(block, area);
-
-        if inner.height < 3 {
-            return;
-        }
-
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(1),
-                Constraint::Length(1),
-                Constraint::Min(1),
-            ])
-            .split(inner);
-
-        let tab_titles = ToolDetailTab::all()
-            .iter()
-            .map(|tab| Line::from(Span::styled(tab.label(), muted())))
-            .collect::<Vec<_>>();
-        let tabs = Tabs::new(tab_titles)
-            .select(self.activity_detail_tab.index())
-            .highlight_style(tool_label_style().add_modifier(Modifier::BOLD))
-            .style(Style::default().bg(surface()));
-        frame.render_widget(tabs, chunks[0]);
-
-        let hint = Paragraph::new(Line::from(vec![
-            Span::styled("h/l", prompt_style()),
-            Span::styled(" tab  ", muted()),
-            Span::styled("pg", prompt_style()),
-            Span::styled(" scroll  ", muted()),
-            Span::styled("enter", prompt_style()),
-            Span::styled(" collapse", muted()),
-        ]))
-        .style(Style::default().bg(surface()));
-        frame.render_widget(hint, chunks[1]);
-
-        match self.activity_detail_tab {
-            ToolDetailTab::Summary => self.draw_tool_activity_summary(frame, chunks[2], run),
-            ToolDetailTab::Output => self.draw_tool_activity_output(frame, chunks[2], run),
-            ToolDetailTab::Timeline => self.draw_tool_activity_timeline(frame, chunks[2], run),
-        }
-    }
-
-    fn draw_tool_activity_summary(&self, frame: &mut Frame<'_>, area: Rect, run: &ToolRun) {
-        let card = tool_activity_card(run);
-        let elapsed = run.started_at.elapsed();
-        let output_lines = meaningful_tool_output_lines(run).len();
-        let rows = [
-            ("status", tool_state_label(run.state).to_string()),
-            ("tool", run.name.clone()),
-            ("action", card.action),
-            ("target", card.target),
-            ("elapsed", format!("{}s", elapsed.as_secs())),
-            ("output", output_count_label(output_lines)),
-        ]
-        .into_iter()
-        .map(|(key, value)| {
-            let style = if key == "status" {
-                tool_state_style(run.state)
-            } else {
-                value_style()
-            };
-            Row::new(vec![
-                Cell::from(key).style(muted()),
-                Cell::from(value).style(style),
-            ])
-        });
-
-        let table = Table::new(rows, [Constraint::Length(10), Constraint::Min(20)])
-            .style(Style::default().bg(surface()))
-            .column_spacing(2);
-        frame.render_widget(table, area);
-    }
-
-    fn draw_tool_activity_output(&self, frame: &mut Frame<'_>, area: Rect, run: &ToolRun) {
-        let lines = tool_activity_output_lines(run, area.width);
-        let max_scroll = lines.len().saturating_sub(area.height as usize);
-        let scroll = self.activity_detail_scroll.min(max_scroll);
-        let output = Paragraph::new(lines.clone())
-            .style(Style::default().bg(surface()).fg(text()))
-            .wrap(Wrap { trim: false })
-            .scroll((scroll as u16, 0));
-        frame.render_widget(output, area);
-
-        if lines.len() > area.height as usize && area.width > 4 {
-            let mut scrollbar_state = ScrollbarState::new(lines.len()).position(scroll);
-            frame.render_stateful_widget(activity_scrollbar(), area, &mut scrollbar_state);
-        }
-    }
-
-    fn draw_tool_activity_timeline(&self, frame: &mut Frame<'_>, area: Rect, run: &ToolRun) {
-        let lines = tool_activity_timeline_lines(run);
-        let max_scroll = lines.len().saturating_sub(area.height as usize);
-        let scroll = self.activity_detail_scroll.min(max_scroll);
-        let timeline = Paragraph::new(lines)
-            .style(Style::default().bg(surface()).fg(text()))
-            .wrap(Wrap { trim: false })
-            .scroll((scroll as u16, 0));
-        frame.render_widget(timeline, area);
-    }
-
     fn draw_messages(&mut self, frame: &mut Frame<'_>, area: Rect) {
         self.last_chat_viewport = Some(area);
         let rows = self.visible_transcript_rows_cached();
@@ -5769,29 +5711,16 @@ impl App {
             return;
         }
 
-        let height = area.height as usize;
-        let total = metrics.total_visual_lines.max(1);
-        let thumb_height = (height.saturating_mul(height) / total).clamp(1, height.min(5));
-        let available = height.saturating_sub(thumb_height);
-        let thumb_top = if metrics.max_scroll == 0 {
-            0
-        } else {
-            metrics.top_offset.saturating_mul(available) / metrics.max_scroll
-        };
-        let lines = (0..height)
-            .map(|row| {
-                if row >= thumb_top && row < thumb_top.saturating_add(thumb_height) {
-                    Line::from(Span::styled("▌", accent()))
-                } else {
-                    Line::from(" ")
-                }
-            })
-            .collect::<Vec<_>>();
-        let thumb_area = Rect::new(area.right().saturating_sub(1), area.y, 1, area.height);
-        frame.render_widget(
-            Paragraph::new(lines).style(Style::default().bg(surface())),
-            thumb_area,
-        );
+        let mut state =
+            ScrollbarState::new(metrics.max_scroll.max(1)).position(metrics.top_offset);
+        let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+            .begin_symbol(None)
+            .end_symbol(None)
+            .track_symbol(Some(" "))
+            .thumb_symbol("▌")
+            .track_style(Style::default().bg(surface()))
+            .thumb_style(accent().bg(surface()));
+        frame.render_stateful_widget(scrollbar, area, &mut state);
     }
 
     fn visible_transcript_rows(&self) -> Vec<TranscriptRow> {
@@ -5801,11 +5730,12 @@ impl App {
             self.selected_tool,
             RenderContext {
                 animation_tick: self.animation_tick,
+                decision_selection: self.decision_selection,
             },
         )
     }
 
-    fn visible_transcript_rows_cached(&mut self) -> Vec<TranscriptRow> {
+    fn visible_transcript_rows_cached(&mut self) -> Arc<Vec<TranscriptRow>> {
         let animation_tick = if self.has_running_tool_rows() || self.has_running_workflow_rows() {
             Some(self.animation_tick)
         } else {
@@ -5817,18 +5747,20 @@ impl App {
             && cache.streaming_message == self.streaming_message
             && cache.selected_tool == self.selected_tool
             && cache.animation_tick == animation_tick
+            && cache.decision_selection == self.decision_selection
         {
-            return cache.rows.clone();
+            return Arc::clone(&cache.rows);
         }
 
-        let rows = self.visible_transcript_rows();
+        let rows = Arc::new(self.visible_transcript_rows());
         self.transcript_rows_cache = Some(TranscriptRowsCache {
             version: self.transcript_version,
             theme: self.theme,
             streaming_message: self.streaming_message,
             selected_tool: self.selected_tool,
             animation_tick,
-            rows: rows.clone(),
+            decision_selection: self.decision_selection,
+            rows: Arc::clone(&rows),
         });
         rows
     }
@@ -5894,6 +5826,47 @@ impl App {
         frame.render_widget(input, area);
     }
 
+    /// The plan shown in the strip above the composer: the latest plan while
+    /// it still has unfinished work. Completed plans leave the screen.
+    fn plan_strip(&self) -> Option<&PlanView> {
+        let plan = self.current_plan()?;
+        if plan.items.is_empty()
+            || plan
+                .items
+                .iter()
+                .all(|item| item.status == PlanItemStatus::Done)
+        {
+            return None;
+        }
+        Some(plan)
+    }
+
+    fn plan_strip_height(&self, terminal_height: u16) -> u16 {
+        // On short terminals the transcript and composer win.
+        if terminal_height < 20 {
+            return 0;
+        }
+        match self.plan_strip() {
+            Some(plan) => (plan_strip_lines(plan).len() as u16).min(9),
+            None => 0,
+        }
+    }
+
+    fn draw_plan_strip(&self, frame: &mut Frame<'_>, area: Rect) {
+        if area.height == 0 {
+            return;
+        }
+        let Some(plan) = self.plan_strip() else {
+            return;
+        };
+        let mut lines = plan_strip_lines(plan);
+        lines.truncate(area.height as usize);
+        frame.render_widget(
+            Paragraph::new(lines).style(Style::default().bg(app_bg()).fg(text())),
+            area,
+        );
+    }
+
     fn input_height(&self, terminal_height: u16) -> u16 {
         let attachment_lines = if self.pending_attachments.is_empty() {
             0
@@ -5932,6 +5905,10 @@ impl App {
             .iter()
             .filter_map(|item| match item {
                 TranscriptItem::Message(msg) => Some(msg.content.len()),
+                // Tool results are function_call_outputs in model context; they
+                // usually dominate usage, so count them too.
+                TranscriptItem::Tool(run) => Some(run.summary.len() + run.detail.len()),
+                TranscriptItem::Reasoning(trace) => Some(trace.content.len()),
                 TranscriptItem::Plan(plan) => Some(
                     plan.summary.len()
                         + plan
@@ -5970,25 +5947,29 @@ impl App {
         if area.width < 4 {
             return;
         }
-        const MAX_CHARS: usize = 120_000;
-        let used = self.context_usage_chars();
-        let ratio = (used as f64 / MAX_CHARS as f64).clamp(0.0, 1.0);
-        let pct = (ratio * 100.0) as u16;
+        // ~4 chars per token, matching medusa_core::context::estimate_tokens.
+        let used = self.context_usage_chars().div_ceil(4);
+        let max = medusa_core::context::context_max_tokens().max(1);
+        let ratio = (used as f64 / max as f64).clamp(0.0, 1.0);
         let color = if ratio < 0.5 {
             palette().success
-        } else if ratio < 0.75 {
-            Color::Yellow
+        } else if ratio < 0.8 {
+            accent_color()
         } else {
-            Color::Red
+            palette().error
         };
-        let gauge = Gauge::default()
-            .gauge_style(Style::default().fg(color).bg(surface()))
-            .percent(pct)
-            .label(if area.width >= 8 {
-                format!("{}%", pct)
-            } else {
-                String::new()
-            })
+        let gauge = LineGauge::default()
+            .filled_style(Style::default().fg(color).bg(surface()))
+            .unfilled_style(Style::default().fg(palette().separator).bg(surface()))
+            .ratio(ratio)
+            .label(Span::styled(
+                if area.width >= 8 {
+                    format!("{:>3.0}%", ratio * 100.0)
+                } else {
+                    String::new()
+                },
+                muted(),
+            ))
             .style(Style::default().bg(surface()));
         frame.render_widget(gauge, area);
     }
@@ -6003,11 +5984,12 @@ impl App {
             .turn_started_at
             .map(|t| format!("turn {}s", t.elapsed().as_secs()))
             .unwrap_or_else(|| self.scroll_footer_label());
-        let text = format!(
-            "tools {} · jobs {} · {activity}",
-            self.activity_tools.len(),
-            running
-        );
+        let tool_count = self
+            .transcript
+            .iter()
+            .filter(|item| matches!(item, TranscriptItem::Tool(_)))
+            .count();
+        let text = format!("tools {tool_count} · jobs {running} · {activity}");
         let widget = Paragraph::new(Line::from(Span::styled(text, muted())))
             .alignment(Alignment::Left)
             .style(Style::default().bg(surface()));
@@ -6089,13 +6071,121 @@ impl App {
             ]);
         }
 
-        Line::from(vec![
+        let mut spans = vec![
             Span::styled(" Message ", muted().add_modifier(Modifier::BOLD)),
             Span::styled(
                 format!(" {} ", self.model.model_name()),
                 accent().add_modifier(Modifier::BOLD),
             ),
-        ])
+        ];
+        if self.plan_mode {
+            spans.push(Span::styled(
+                " plan ",
+                Style::default()
+                    .fg(palette().selected_fg)
+                    .bg(palette().prompt)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
+        Line::from(spans)
+    }
+
+    /// Always-on-top approval prompt for the front of the queue. Drawn last
+    /// so it overlays modals and streaming output alike.
+    fn draw_approval_prompt(&self, frame: &mut Frame<'_>, area: Rect) {
+        let Some(pending) = self.approval_queue.front() else {
+            return;
+        };
+        let request = &pending.request;
+
+        // Wrap width chosen to match the popup body so the full command shows
+        // and a destructive tail can never hide past a truncation point.
+        let wrap_width = area.width.saturating_sub(12).clamp(28, 72) as usize;
+        let mut body: Vec<Line<'static>> = Vec::new();
+        if let Some(command) = request.command.as_deref() {
+            for (index, chunk) in wrap_str(command.trim(), wrap_width).into_iter().enumerate() {
+                let prefix = if index == 0 { "  $ " } else { "    " };
+                body.push(Line::from(vec![
+                    Span::styled(prefix, prompt_style()),
+                    Span::styled(chunk, value_style().add_modifier(Modifier::BOLD)),
+                ]));
+            }
+            if request.background {
+                body.push(Line::from(Span::styled(
+                    "    runs as a background job",
+                    muted(),
+                )));
+            }
+        }
+        for path in request.paths.iter().take(6) {
+            body.push(Line::from(vec![
+                Span::styled("  → ", separator_style()),
+                Span::styled(truncate(path, wrap_width).to_string(), value_style()),
+            ]));
+        }
+        if request.paths.len() > 6 {
+            body.push(Line::from(Span::styled(
+                format!("    … +{} more files", request.paths.len() - 6),
+                muted(),
+            )));
+        }
+        body.push(Line::from(""));
+        body.push(Line::from(vec![
+            Span::styled("  y", success_style().add_modifier(Modifier::BOLD)),
+            Span::styled(" allow once   ", muted()),
+            Span::styled("a", prompt_style().add_modifier(Modifier::BOLD)),
+            Span::styled(" always allow   ", muted()),
+            Span::styled("n", error_style().add_modifier(Modifier::BOLD)),
+            Span::styled("/", muted()),
+            Span::styled("esc", error_style().add_modifier(Modifier::BOLD)),
+            Span::styled(" deny", muted()),
+        ]));
+
+        let height = (body.len() as u16)
+            .saturating_add(2)
+            .min(area.height.saturating_sub(2).max(4));
+        let width = area
+            .width
+            .saturating_sub(8)
+            .min(78)
+            .min(area.width.saturating_sub(2))
+            .max(area.width.min(30));
+        let x = area.x + (area.width.saturating_sub(width)) / 2;
+        let y = area
+            .y
+            .saturating_add(area.height.saturating_sub(height + 6));
+        let popup = Rect {
+            x,
+            y,
+            width,
+            height,
+        };
+
+        frame.render_widget(Clear, popup);
+        let queued = self.approval_queue.len();
+        let title = if queued > 1 {
+            format!(
+                " Approval required · {} (1/{queued}) ",
+                request.tool.label()
+            )
+        } else {
+            format!(" Approval required · {} ", request.tool.label())
+        };
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(palette().prompt))
+            .style(Style::default().bg(surface()).fg(text()))
+            .title(title);
+        let inner = popup.inner(Margin {
+            horizontal: 1,
+            vertical: 1,
+        });
+        frame.render_widget(block, popup);
+        frame.render_widget(
+            Paragraph::new(body).style(Style::default().bg(surface()).fg(text())),
+            inner,
+        );
     }
 
     fn draw_slash_suggestions(&self, frame: &mut Frame<'_>, shell_area: Rect) {
@@ -6132,12 +6222,11 @@ impl App {
         let end = offset.saturating_add(visible_rows).min(matches.len());
         let items = matches[offset..end]
             .iter()
-            .map(|command| {
-                ListItem::new(Line::from(vec![
-                    Span::styled(format!("{:<11}", command.name), prompt_style()),
-                    Span::styled(format!("{:<9}", command.category), muted()),
-                    Span::styled(command.args, value_style()),
-                ]))
+            .map(|(command, positions)| {
+                let mut spans = highlighted_command_name_spans(command.name, positions, 11);
+                spans.push(Span::styled(format!("{:<9}", command.category), muted()));
+                spans.push(Span::styled(command.args, value_style()));
+                ListItem::new(Line::from(spans))
             })
             .collect::<Vec<_>>();
         let block = Block::default()
@@ -6195,7 +6284,7 @@ impl App {
         .style(Style::default().bg(surface()));
         frame.render_widget(divider, divider_area);
 
-        let command = matches[selected];
+        let command = matches[selected].0;
         let detail = Paragraph::new(command_palette_detail_lines(command))
             .style(Style::default().bg(surface()).fg(text()))
             .wrap(Wrap { trim: true });
@@ -6231,15 +6320,12 @@ impl App {
             Modal::ImagePreview => area.width.saturating_sub(4).min(128),
             Modal::Settings | Modal::Themes => area.width.saturating_sub(8).min(94),
             Modal::Models | Modal::Permissions => area.width.saturating_sub(8).min(88),
-            Modal::Plan => area.width.saturating_sub(8).min(104),
             _ => area.width.saturating_sub(8).min(78),
         };
         let popup_height = area.height.saturating_sub(4).min(match modal {
             Modal::Commands => 18,
             Modal::Settings => 18,
             Modal::Help => 17,
-            Modal::Activity => 14,
-            Modal::Plan => 20,
             Modal::ImagePreview => 36,
             Modal::Workflows => 18,
             Modal::Jobs => 16,
@@ -6255,8 +6341,6 @@ impl App {
             Modal::Commands => self.draw_commands_modal(frame, popup),
             Modal::Settings => self.draw_settings_modal(frame, popup),
             Modal::Help => self.draw_help_modal(frame, popup),
-            Modal::Activity => self.draw_activity_modal(frame, popup),
-            Modal::Plan => self.draw_plan_modal(frame, popup),
             Modal::ImagePreview => self.draw_image_preview_modal(frame, popup),
             Modal::Workflows => self.draw_workflows_modal(frame, popup),
             Modal::Jobs => self.draw_jobs_modal(frame, popup),
@@ -6917,10 +7001,12 @@ impl App {
             Line::from("Ctrl+I attaches an image. Ctrl+O previews. Ctrl+D detaches latest."),
             Line::from(""),
             Line::from(vec![Span::styled("Themes", prompt_style())]),
-            Line::from("Use /themes to inspect themes or /theme opencode to switch."),
+            Line::from("Use /theme to browse themes or /theme opencode to switch directly."),
             Line::from(""),
             Line::from(vec![Span::styled("Modals", prompt_style())]),
-            Line::from("/plan opens the task checklist. /activity opens tool details."),
+            Line::from(
+                "/plan or shift+tab toggles plan mode. Select a tool call with j/k, enter expands it.",
+            ),
             Line::from("Esc or Enter closes simple popups."),
             Line::from(""),
             Line::from("Try /fork before risky work, or /tree to inspect branches."),
@@ -6928,126 +7014,6 @@ impl App {
         .block(modal_block(" Help "))
         .wrap(Wrap { trim: false });
         frame.render_widget(help, area);
-    }
-
-    fn draw_activity_modal(&self, frame: &mut Frame<'_>, area: Rect) {
-        if !self.activity_tools.is_empty() {
-            self.draw_tool_activity_sidebar(frame, area);
-            return;
-        }
-
-        let running_tools = self
-            .transcript
-            .iter()
-            .filter(|item| matches!(item, TranscriptItem::Tool(run) if run.state == ToolRunState::Running))
-            .count();
-        let tool_count = self
-            .transcript
-            .iter()
-            .filter(|item| matches!(item, TranscriptItem::Tool(_)))
-            .count();
-        let message_count = self
-            .transcript
-            .iter()
-            .filter(|item| matches!(item, TranscriptItem::Message(_)))
-            .count();
-
-        let rows = vec![
-            ("model", self.model.model_name().to_string()),
-            (
-                "stream",
-                if self.is_working() { "active" } else { "idle" }.to_string(),
-            ),
-            ("queue", self.queued_turns.len().to_string()),
-            (
-                "tools",
-                format!("{tool_count} total · {running_tools} running"),
-            ),
-            ("messages", message_count.to_string()),
-            (
-                "selected tool",
-                self.selected_tool
-                    .map(|i| i.to_string())
-                    .unwrap_or_else(|| "none".to_string()),
-            ),
-            ("status", self.status_line.clone()),
-        ];
-        let rows = rows.into_iter().map(|(key, value)| {
-            Row::new(vec![
-                Cell::from(key).style(muted()),
-                Cell::from(value).style(value_style()),
-            ])
-        });
-        let table = Table::new(rows, [Constraint::Length(16), Constraint::Min(24)])
-            .block(modal_block(" Activity "))
-            .column_spacing(2);
-        frame.render_widget(table, area);
-    }
-
-    fn draw_plan_modal(&self, frame: &mut Frame<'_>, area: Rect) {
-        frame.render_widget(
-            modal_block(" Plan ")
-                .border_type(BorderType::Rounded)
-                .padding(Padding::new(2, 2, 0, 0)),
-            area,
-        );
-        let inner = area.inner(Margin {
-            horizontal: 3,
-            vertical: 1,
-        });
-        let sections = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(2),
-                Constraint::Min(6),
-                Constraint::Length(1),
-            ])
-            .split(inner);
-
-        let titles = PlanTab::all()
-            .iter()
-            .map(|tab| Line::from(Span::styled(tab.label(), value_style())))
-            .collect::<Vec<_>>();
-        let tabs = Tabs::new(titles)
-            .select(self.plan_tab.index())
-            .divider(Span::styled("  ", muted()))
-            .highlight_style(prompt_style().add_modifier(Modifier::BOLD));
-        frame.render_widget(tabs, sections[0]);
-
-        let lines = plan_modal_lines(self);
-        let line_count = lines.len();
-        let max_scroll = line_count.saturating_sub(sections[1].height as usize);
-        let scroll = self.plan_scroll.min(max_scroll);
-        let body = Paragraph::new(lines)
-            .style(Style::default().bg(surface()).fg(text()))
-            .scroll((scroll.min(u16::MAX as usize) as u16, 0))
-            .wrap(Wrap { trim: false });
-        frame.render_widget(body, sections[1]);
-
-        if max_scroll > 0 {
-            let mut state = ScrollbarState::new(line_count)
-                .position(scroll)
-                .viewport_content_length(sections[1].height as usize);
-            frame.render_stateful_widget(
-                Scrollbar::new(ScrollbarOrientation::VerticalRight)
-                    .thumb_symbol("█")
-                    .track_symbol(Some("│")),
-                sections[1],
-                &mut state,
-            );
-        }
-
-        let footer = Paragraph::new(Line::from(vec![
-            Span::styled("h/l tab", prompt_style()),
-            Span::styled("  ", muted()),
-            Span::styled("j/k scroll", prompt_style()),
-            Span::styled("  ", muted()),
-            Span::styled("esc", prompt_style()),
-            Span::styled(" close", muted()),
-        ]))
-        .alignment(Alignment::Right)
-        .style(Style::default().bg(surface()));
-        frame.render_widget(footer, sections[2]);
     }
 
     fn draw_workflows_modal(&self, frame: &mut Frame<'_>, area: Rect) {
@@ -7362,53 +7328,28 @@ impl App {
         self.start_exec_command(&command, true);
     }
 
-    fn recap_text(&self) -> String {
-        let messages = self
-            .transcript
-            .iter()
-            .filter(|item| matches!(item, TranscriptItem::Message(_)))
-            .count();
-        let tools = self
-            .transcript
-            .iter()
-            .filter(|item| matches!(item, TranscriptItem::Tool(_)))
-            .count();
-        let running_jobs = self
-            .background_jobs
-            .values()
-            .filter(|job| job.state == ToolRunState::Running)
-            .count();
-        format!(
-            "※ recap\nworkspace: {}\nmessages: {messages}\ntool calls: {tools}\nworkflows: {} total · {} active\nbackground jobs: {} total · {running_jobs} running\nstatus: {}",
-            self.cwd_display,
-            self.workflows.len(),
-            self.workflow_events.len(),
-            self.background_jobs.len(),
-            self.status_line,
-        )
-    }
-
-    fn run_demo(&mut self) {
-        self.transcript.push(TranscriptItem::Message(ChatMessage::system("Demo: Medusa can read/search/patch/run tools, show animated tool rows, and manage background jobs. Try `/exec --bg sleep 3 && echo done`, then `/jobs`.".to_string())));
-        self.touch_transcript();
-        self.push_tool_start("fs.list".to_string(), ".".to_string());
-        self.push_tool_result(
-            "fs.list",
-            "root: .\n  Cargo.toml\n  crates/\n  README.md".to_string(),
-        );
-        self.push_tool_start(
-            "terminal.exec".to_string(),
-            "$ cargo check --dry-run".to_string(),
-        );
-        self.push_tool_result(
-            "terminal.exec",
-            "exit: 0\nstdout:\ncheck preview ok".to_string(),
-        );
-        self.status_line = "demo inserted".to_string();
-        self.toast("Demo inserted", ToastKind::Success);
+    /// A runtime for tools the user invokes directly (/exec, /patch). The
+    /// user typing the command IS the approval, so NeedsApproval auto-allows;
+    /// hard denies still block. Uses an immediate closure (no channel) so it
+    /// can run on the UI thread without deadlocking.
+    fn user_tools(&self) -> ToolRuntime {
+        self.tools
+            .clone()
+            .with_approval_handler(Arc::new(|_request| ApprovalDecision::AllowOnce))
     }
 
     fn start_exec_command(&mut self, command: &str, background: bool) {
+        // A foreground /exec blocks the UI thread until the child exits, which
+        // would also stall approval servicing for any running turn/workflow.
+        if !background && (self.is_working() || self.has_active_workflows()) {
+            self.status_line =
+                "finish the current turn before running a foreground /exec".to_string();
+            self.toast(
+                "Busy — use /exec … & for background, or wait",
+                ToastKind::Warning,
+            );
+            return;
+        }
         self.push_tool_start("terminal.exec".to_string(), format!("$ {command}"));
         let request = TerminalExecRequest {
             command: command.to_string(),
@@ -7416,8 +7357,7 @@ impl App {
             background,
         };
         match self
-            .tools
-            .clone()
+            .user_tools()
             .with_background_events(self.background_job_sender.clone())
             .terminal_exec(request)
         {
@@ -7542,22 +7482,10 @@ const SLASH_COMMANDS: &[SlashCommand] = &[
         description: "Restart Medusa and continue the current session",
     },
     SlashCommand {
-        name: "/activity",
-        args: "",
-        category: "view",
-        description: "Show model, tool, and session activity",
-    },
-    SlashCommand {
         name: "/plan",
         args: "",
-        category: "view",
-        description: "Show current checklist, blockers, and evidence",
-    },
-    SlashCommand {
-        name: "/images",
-        args: "",
-        category: "view",
-        description: "Preview attached images",
+        category: "agent",
+        description: "Toggle plan mode: explore read-only and propose a plan before editing",
     },
     SlashCommand {
         name: "/workflows",
@@ -7567,9 +7495,9 @@ const SLASH_COMMANDS: &[SlashCommand] = &[
     },
     SlashCommand {
         name: "/workflow",
-        args: "<task>",
+        args: "<script|task> [args]",
         category: "agent",
-        description: "Run a larger task through workflow subagents",
+        description: "Run a saved JS workflow script or the built-in subagent pipeline",
     },
     SlashCommand {
         name: "/sessions",
@@ -7600,12 +7528,6 @@ const SLASH_COMMANDS: &[SlashCommand] = &[
         args: "",
         category: "session",
         description: "Clear the current transcript",
-    },
-    SlashCommand {
-        name: "/themes",
-        args: "",
-        category: "theme",
-        description: "Browse available UI themes",
     },
     SlashCommand {
         name: "/theme",
@@ -7656,18 +7578,6 @@ const SLASH_COMMANDS: &[SlashCommand] = &[
         description: "Restart a background job command",
     },
     SlashCommand {
-        name: "/recap",
-        args: "",
-        category: "session",
-        description: "Insert a compact session recap",
-    },
-    SlashCommand {
-        name: "/demo",
-        args: "",
-        category: "system",
-        description: "Insert a safe Medusa feature demo",
-    },
-    SlashCommand {
         name: "/exec",
         args: "<command>",
         category: "tools",
@@ -7678,12 +7588,6 @@ const SLASH_COMMANDS: &[SlashCommand] = &[
         args: "<path>",
         category: "tools",
         description: "Apply a unified diff file with git apply",
-    },
-    SlashCommand {
-        name: "/status",
-        args: "<text>",
-        category: "tools",
-        description: "Update the status line",
     },
 ];
 
@@ -7778,35 +7682,110 @@ const THEME_SLASH_COMMANDS: &[SlashCommand] = &[
         category: "theme",
         description: "Material rose accents with teal supporting signals",
     },
+    SlashCommand {
+        name: "/theme rose-pine",
+        args: "",
+        category: "theme",
+        description: "Muted rose and gold over a soho-night violet base",
+    },
+    SlashCommand {
+        name: "/theme ayu-mirage",
+        args: "",
+        category: "theme",
+        description: "Dusky slate with warm orange and sky-blue accents",
+    },
+    SlashCommand {
+        name: "/theme everforest",
+        args: "",
+        category: "theme",
+        description: "Soft forest greens with warm bark and sage tones",
+    },
+    SlashCommand {
+        name: "/theme vesper",
+        args: "",
+        category: "theme",
+        description: "Near-black minimalism with a single peach accent",
+    },
 ];
 
-fn slash_match_score(command: &SlashCommand, query: &str) -> Option<u8> {
+/// Score a command against the palette query. Lower scores rank higher. The
+/// returned positions are byte offsets of matched characters inside the
+/// command name without its leading slash, used for match highlighting.
+fn slash_match(command: &SlashCommand, query: &str) -> Option<(u8, Vec<usize>)> {
     if query.is_empty() {
-        return Some(10);
+        return Some((10, Vec::new()));
     }
 
     let name = command.name.trim_start_matches('/').to_ascii_lowercase();
-    let category = command.category.to_ascii_lowercase();
-    let args = command.args.to_ascii_lowercase();
-    let description = command.description.to_ascii_lowercase();
-
     if name == query {
-        Some(0)
-    } else if name.starts_with(query) {
-        Some(1)
-    } else if name.contains(query) {
-        Some(2)
-    } else if category.starts_with(query) {
-        Some(3)
+        return Some((0, (0..name.len()).collect()));
+    }
+    if let Some(start) = name.find(query) {
+        let score = if start == 0 { 1 } else { 2 };
+        return Some((score, (start..start + query.len()).collect()));
+    }
+    if let Some(positions) = subsequence_positions(&name, query) {
+        return Some((3, positions));
+    }
+
+    let category = command.category.to_ascii_lowercase();
+    let description = command.description.to_ascii_lowercase();
+    let args = command.args.to_ascii_lowercase();
+    if category.starts_with(query) {
+        Some((4, Vec::new()))
     } else if category.contains(query) {
-        Some(4)
+        Some((5, Vec::new()))
     } else if description.contains(query) {
-        Some(5)
+        Some((6, Vec::new()))
     } else if args.contains(query) {
-        Some(6)
+        Some((7, Vec::new()))
     } else {
         None
     }
+}
+
+/// Fuzzy subsequence match: every query character appears in order in the
+/// name (so "wf" matches "workflow"). Returns matched byte positions.
+fn subsequence_positions(name: &str, query: &str) -> Option<Vec<usize>> {
+    if query.chars().count() < 2 {
+        return None;
+    }
+    let mut positions = Vec::new();
+    let mut name_chars = name.char_indices();
+    for query_char in query.chars() {
+        loop {
+            let (index, name_char) = name_chars.next()?;
+            if name_char == query_char {
+                positions.push(index);
+                break;
+            }
+        }
+    }
+    Some(positions)
+}
+
+/// Render a command name with matched characters highlighted, padded to
+/// `width` display columns.
+fn highlighted_command_name_spans(
+    name: &'static str,
+    positions: &[usize],
+    width: usize,
+) -> Vec<Span<'static>> {
+    let body = name.trim_start_matches('/');
+    let mut spans = vec![Span::styled("/", prompt_style())];
+    for (index, ch) in body.char_indices() {
+        let style = if positions.contains(&index) {
+            accent().add_modifier(Modifier::BOLD)
+        } else {
+            prompt_style()
+        };
+        spans.push(Span::styled(ch.to_string(), style));
+    }
+    let used = 1 + body.chars().count();
+    if used < width {
+        spans.push(Span::raw(" ".repeat(width - used)));
+    }
+    spans
 }
 
 fn command_palette_detail_lines(command: &SlashCommand) -> Vec<Line<'static>> {
@@ -7846,7 +7825,8 @@ fn tools_text() -> String {
         "tools",
         "explore.batch  Run parallel read-only probes and return evidence",
         "file.read      Read files by path/range",
-        "file.search    Search text in workspace",
+        "file.search    Search file contents by regex",
+        "file.glob      Find files by name pattern",
         "fs.list        List workspace paths",
         "file.edit      Replace exact old/new strings",
         "file.patch     Apply Codex patches or git diffs",
@@ -7879,21 +7859,21 @@ fn plan_progress(plan: &PlanView) -> PlanProgress {
     progress
 }
 
-fn append_plan_rows(rows: &mut Vec<TranscriptRow>, plan: &PlanView) {
+/// Items shown in the plan strip before folding the tail behind "+N more".
+const PLAN_STRIP_MAX_ITEMS: usize = 6;
+
+fn plan_strip_lines(plan: &PlanView) -> Vec<Line<'static>> {
     let progress = plan_progress(plan);
+    let mut lines = Vec::new();
+
     let mut header = vec![
         Span::styled("plan", tool_label_style().add_modifier(Modifier::BOLD)),
         Span::styled(" · ", muted()),
-        Span::styled(format!("{} steps", plan.items.len()), value_style()),
-        Span::styled(" · ", muted()),
-        Span::styled(format!("{} done", progress.done), success_style()),
+        Span::styled(
+            format!("{}/{}", progress.done, plan.items.len()),
+            success_style(),
+        ),
     ];
-    if progress.active > 0 {
-        header.extend([
-            Span::styled(" · ", muted()),
-            Span::styled("active", prompt_style()),
-        ]);
-    }
     if progress.blocked > 0 {
         header.extend([
             Span::styled(" · ", muted()),
@@ -7906,206 +7886,44 @@ fn append_plan_rows(rows: &mut Vec<TranscriptRow>, plan: &PlanView) {
             Span::styled(truncate(&plan.summary, 72), muted()),
         ]);
     }
-    rows.push(TranscriptRow::text(Line::from(header)));
+    lines.push(Line::from(header));
 
-    let visible_count = if plan.expanded {
-        plan.items.len()
-    } else {
-        plan.items.len().min(5)
-    };
-    for (index, item) in plan.items.iter().take(visible_count).enumerate() {
-        rows.push(TranscriptRow::text(plan_item_line(
-            item,
-            index + 1 == visible_count && visible_count == plan.items.len(),
-        )));
-    }
-    if visible_count < plan.items.len() {
-        rows.push(TranscriptRow::text(Line::from(vec![
-            Span::styled("  └─ ", muted()),
-            Span::styled(
-                format!(
-                    "{} more steps · /plan for details",
-                    plan.items.len() - visible_count
-                ),
-                muted(),
-            ),
-        ])));
-    }
-}
-
-fn plan_item_line(item: &PlanItemView, last: bool) -> Line<'static> {
-    Line::from(vec![
-        Span::styled(if last { "  └─ " } else { "  ├─ " }, muted()),
-        plan_status_marker_span(item.status),
-        Span::styled(" ", muted()),
-        Span::styled(truncate(&item.text, 120), plan_status_style(item.status)),
-    ])
-}
-
-fn plan_modal_lines(app: &App) -> Vec<Line<'static>> {
-    match app.plan_tab {
-        PlanTab::Plan => plan_current_lines(app.current_plan()),
-        PlanTab::History => plan_history_lines(&app.plan_history()),
-        PlanTab::Blockers => plan_blocker_lines(app.current_plan()),
-        PlanTab::Evidence => plan_evidence_lines(app.current_plan()),
-    }
-}
-
-fn plan_current_lines(plan: Option<&PlanView>) -> Vec<Line<'static>> {
-    let Some(plan) = plan else {
-        return vec![
-            Line::from(Span::styled("No plan yet.", muted())),
-            Line::from(""),
-            Line::from(vec![
-                Span::styled("Ask Medusa to tackle a multi-step task, or use ", muted()),
-                Span::styled("plan.update", prompt_style()),
-                Span::styled(" from the model loop.", muted()),
-            ]),
-        ];
-    };
-
-    let progress = plan_progress(plan);
-    let mut lines = vec![
-        Line::from(vec![
-            Span::styled("current", muted().add_modifier(Modifier::BOLD)),
-            Span::styled("  ", muted()),
-            Span::styled(
-                if plan.summary.is_empty() {
-                    "Untitled plan".to_string()
-                } else {
-                    plan.summary.clone()
-                },
-                prompt_style(),
-            ),
-        ]),
-        Line::from(vec![
-            Span::styled(format!("{} steps", plan.items.len()), value_style()),
-            Span::styled(" · ", muted()),
-            Span::styled(format!("{} pending", progress.pending), muted()),
-            Span::styled(" · ", muted()),
-            Span::styled(format!("{} active", progress.active), prompt_style()),
-            Span::styled(" · ", muted()),
-            Span::styled(format!("{} done", progress.done), success_style()),
-            Span::styled(" · ", muted()),
-            Span::styled(format!("{} blocked", progress.blocked), error_style()),
-        ]),
-        Line::from(""),
-    ];
-
-    for (index, item) in plan.items.iter().enumerate() {
-        lines.push(Line::from(vec![
-            Span::styled(format!("{:>2}. ", index + 1), muted()),
-            plan_status_marker_span(item.status),
-            Span::styled(" ", muted()),
-            Span::styled(
-                plan_status_label(item.status),
-                plan_status_style(item.status),
-            ),
-            Span::styled("  ", muted()),
-            Span::styled(item.text.clone(), value_style()),
-        ]));
-    }
-    lines
-}
-
-fn plan_history_lines(history: &[&PlanView]) -> Vec<Line<'static>> {
-    if history.is_empty() {
-        return vec![Line::from(Span::styled("No plan snapshots yet.", muted()))];
-    }
-
-    let mut lines = Vec::new();
-    for (index, plan) in history.iter().rev().take(12).enumerate() {
-        let progress = plan_progress(plan);
-        lines.push(Line::from(vec![
-            Span::styled(
-                format!("#{} ", history.len().saturating_sub(index)),
-                muted(),
-            ),
-            Span::styled(
-                if plan.summary.is_empty() {
-                    "Untitled plan".to_string()
-                } else {
-                    truncate(&plan.summary, 56)
-                },
-                prompt_style(),
-            ),
-            Span::styled("  ", muted()),
-            Span::styled(
-                format!(
-                    "{} steps · {} done · {} blocked",
-                    plan.items.len(),
-                    progress.done,
-                    progress.blocked
-                ),
-                muted(),
-            ),
-        ]));
-    }
-    lines
-}
-
-fn plan_blocker_lines(plan: Option<&PlanView>) -> Vec<Line<'static>> {
-    let Some(plan) = plan else {
-        return vec![Line::from(Span::styled("No plan yet.", muted()))];
-    };
-    let blocked = plan
-        .items
-        .iter()
-        .filter(|item| item.status == PlanItemStatus::Blocked)
-        .collect::<Vec<_>>();
-    if blocked.is_empty() {
-        return vec![Line::from(Span::styled(
-            "No blocked steps.",
-            success_style(),
-        ))];
-    }
-
-    let mut lines = Vec::new();
-    for item in blocked {
-        lines.push(Line::from(vec![
-            Span::styled("× ", error_style()),
-            Span::styled(item.text.clone(), value_style()),
-        ]));
-        for evidence in &item.evidence {
+    // Long plans fold the completed prefix into one line so the strip always
+    // centers on what's happening now.
+    let mut start = 0;
+    if plan.items.len() > PLAN_STRIP_MAX_ITEMS {
+        let leading_done = plan
+            .items
+            .iter()
+            .take_while(|item| item.status == PlanItemStatus::Done)
+            .count();
+        if leading_done > 1 {
             lines.push(Line::from(vec![
-                Span::styled("  └─ ", muted()),
-                Span::styled(evidence.clone(), muted()),
+                Span::raw("  "),
+                Span::styled("✓", success_style()),
+                Span::styled(format!(" {leading_done} done"), success_style()),
             ]));
+            start = leading_done;
         }
     }
-    lines
-}
 
-fn plan_evidence_lines(plan: Option<&PlanView>) -> Vec<Line<'static>> {
-    let Some(plan) = plan else {
-        return vec![Line::from(Span::styled("No plan yet.", muted()))];
-    };
-
-    let mut lines = Vec::new();
-    for item in &plan.items {
-        if item.evidence.is_empty() {
-            continue;
-        }
+    let remaining = &plan.items[start..];
+    let shown = remaining.len().min(PLAN_STRIP_MAX_ITEMS);
+    for item in remaining.iter().take(shown) {
         lines.push(Line::from(vec![
+            Span::raw("  "),
             plan_status_marker_span(item.status),
-            Span::styled(" ", muted()),
-            Span::styled(item.text.clone(), value_style()),
+            Span::raw(" "),
+            Span::styled(truncate(&item.text, 110), plan_status_style(item.status)),
         ]));
-        for evidence in &item.evidence {
-            lines.push(Line::from(vec![
-                Span::styled("  └─ ", muted()),
-                Span::styled(evidence.clone(), muted()),
-            ]));
-        }
-        lines.push(Line::from(""));
+    }
+    if remaining.len() > shown {
+        lines.push(Line::from(vec![
+            Span::raw("  "),
+            Span::styled(format!("… +{} more", remaining.len() - shown), muted()),
+        ]));
     }
 
-    if lines.is_empty() {
-        lines.push(Line::from(Span::styled(
-            "No evidence attached to the current plan yet.",
-            muted(),
-        )));
-    }
     lines
 }
 
@@ -8118,15 +7936,6 @@ fn plan_status_marker_span(status: PlanItemStatus) -> Span<'static> {
     }
 }
 
-fn plan_status_label(status: PlanItemStatus) -> &'static str {
-    match status {
-        PlanItemStatus::Pending => "pending",
-        PlanItemStatus::Active => "active",
-        PlanItemStatus::Done => "done",
-        PlanItemStatus::Blocked => "blocked",
-    }
-}
-
 fn plan_status_style(status: PlanItemStatus) -> Style {
     match status {
         PlanItemStatus::Pending => muted(),
@@ -8136,7 +7945,11 @@ fn plan_status_style(status: PlanItemStatus) -> Style {
     }
 }
 
-fn append_decision_rows(rows: &mut Vec<TranscriptRow>, decision: &DecisionView) {
+fn append_decision_rows(
+    rows: &mut Vec<TranscriptRow>,
+    decision: &DecisionView,
+    selected_question: usize,
+) {
     let state = if decision.answered {
         "answered"
     } else {
@@ -8167,35 +7980,56 @@ fn append_decision_rows(rows: &mut Vec<TranscriptRow>, decision: &DecisionView) 
     }
     rows.push(TranscriptRow::text(Line::from(header)));
 
-    for (index, question) in decision.questions.iter().take(3).enumerate() {
+    let last = decision.questions.len().saturating_sub(1);
+    for (index, question) in decision.questions.iter().enumerate() {
         let answered = decision_question_answered(decision, question);
+        let selected = !decision.answered && index == selected_question;
+        let (marker, marker_style) = if selected {
+            ("› ", prompt_style())
+        } else if answered {
+            ("✓ ", success_style())
+        } else {
+            ("? ", prompt_style())
+        };
         rows.push(TranscriptRow::text(Line::from(vec![
-            Span::styled(if index == 2 { "  └─ " } else { "  ├─ " }, muted()),
+            Span::styled(if index == last { "  └─ " } else { "  ├─ " }, muted()),
+            Span::styled(marker, marker_style),
             Span::styled(
-                if answered { "✓ " } else { "? " },
-                if answered {
-                    success_style()
+                truncate(&question.prompt, 120),
+                if selected {
+                    value_style().add_modifier(Modifier::BOLD)
                 } else {
-                    prompt_style()
+                    value_style()
                 },
             ),
-            Span::styled(truncate(&question.prompt, 120), value_style()),
         ])));
-        if let Some(answer) = decision.answers.get(&question.id) {
+        let continuation = if index == last { "     " } else { "  │  " };
+        if question.kind == DecisionQuestionKind::Choice && !decision.answered {
+            for (option_index, option) in question.options.iter().take(4).enumerate() {
+                let recommended = question.recommended.as_deref() == Some(option.as_str());
+                let picked = decision.answers.get(&question.id) == Some(option);
+                let mut spans = vec![
+                    Span::styled(continuation, muted()),
+                    Span::styled(
+                        format!("{} {}. ", if picked { "●" } else { "○" }, option_index + 1),
+                        if picked { success_style() } else { muted() },
+                    ),
+                    Span::styled(
+                        truncate(option, 100),
+                        if picked { success_style() } else { value_style() },
+                    ),
+                ];
+                if recommended {
+                    spans.push(Span::styled(" · recommended", muted()));
+                }
+                rows.push(TranscriptRow::text(Line::from(spans)));
+            }
+        } else if let Some(answer) = decision.answers.get(&question.id) {
             rows.push(TranscriptRow::text(Line::from(vec![
-                Span::styled("  │  ", muted()),
+                Span::styled(continuation, muted()),
                 Span::styled(truncate(answer, 120), success_style()),
             ])));
         }
-    }
-    if decision.questions.len() > 3 {
-        rows.push(TranscriptRow::text(Line::from(vec![
-            Span::styled("  └─ ", muted()),
-            Span::styled(
-                format!("{} more question(s)", decision.questions.len() - 3),
-                muted(),
-            ),
-        ])));
     }
     if let Some(answer) = &decision.answer {
         rows.push(TranscriptRow::text(Line::from(vec![
@@ -8268,223 +8102,6 @@ fn decision_answer_text(decision: &DecisionView) -> String {
         }
     }
     lines.join("\n")
-}
-
-fn planning_rail_lines(app: &App, width: u16, max_lines: usize) -> Vec<Line<'static>> {
-    let mut lines = Vec::new();
-    lines.push(Line::from(vec![
-        Span::styled("Planning", accent().add_modifier(Modifier::BOLD)),
-        Span::styled("  ", muted()),
-        Span::styled("ctrl+←/→ resize", muted()),
-    ]));
-    lines.push(Line::from(""));
-
-    if let Some(plan) = app.current_plan() {
-        append_planning_rail_plan(&mut lines, plan, width);
-    } else {
-        lines.push(Line::from(Span::styled("No plan yet.", muted())));
-    }
-
-    lines.push(Line::from(""));
-
-    if let Some(decision) = app.current_decision() {
-        append_planning_rail_decision(
-            &mut lines,
-            decision,
-            width,
-            app.selected_decision_question_index(),
-        );
-    } else {
-        lines.push(Line::from(Span::styled("No decisions queued.", muted())));
-    }
-
-    if lines.len() > max_lines {
-        let keep = max_lines.saturating_sub(1);
-        lines.truncate(keep);
-        lines.push(Line::from(Span::styled("…", muted())));
-    }
-
-    lines
-}
-
-fn append_planning_rail_plan(lines: &mut Vec<Line<'static>>, plan: &PlanView, width: u16) {
-    let progress = plan_progress(plan);
-    lines.push(Line::from(vec![
-        Span::styled("Plan", tool_label_style()),
-        Span::styled("  ", muted()),
-        Span::styled(
-            format!("{} / {}", progress.done, plan.items.len()),
-            success_style(),
-        ),
-    ]));
-    if !plan.summary.trim().is_empty() {
-        lines.push(Line::from(Span::styled(
-            truncate_for_width(&plan.summary, width),
-            muted(),
-        )));
-    }
-
-    for item in plan.items.iter().take(7) {
-        lines.push(Line::from(vec![
-            plan_status_marker_span(item.status),
-            Span::styled(" ", muted()),
-            Span::styled(
-                truncate_for_width(&item.text, width.saturating_sub(3)),
-                plan_status_style(item.status),
-            ),
-        ]));
-    }
-    if plan.items.len() > 7 {
-        lines.push(Line::from(Span::styled(
-            format!("+{} more", plan.items.len() - 7),
-            muted(),
-        )));
-    }
-}
-
-fn append_planning_rail_decision(
-    lines: &mut Vec<Line<'static>>,
-    decision: &DecisionView,
-    width: u16,
-    selected_question: usize,
-) {
-    lines.push(Line::from(vec![
-        Span::styled("Decisions", prompt_style()),
-        Span::styled("  ", muted()),
-        Span::styled(
-            if decision.answered {
-                "answered"
-            } else {
-                "waiting"
-            },
-            if decision.answered {
-                success_style()
-            } else {
-                prompt_style()
-            },
-        ),
-    ]));
-    if !decision.title.trim().is_empty() {
-        lines.push(Line::from(Span::styled(
-            truncate_for_width(&decision.title, width),
-            value_style(),
-        )));
-    }
-    if !decision.reason.trim().is_empty() {
-        lines.push(Line::from(Span::styled(
-            truncate_for_width(&decision.reason, width),
-            muted(),
-        )));
-    }
-
-    for (index, question) in decision.questions.iter().enumerate() {
-        let selected = !decision.answered && index == selected_question;
-        let answered = decision_question_answered(decision, question);
-        let marker = if selected {
-            "›"
-        } else if answered {
-            "✓"
-        } else {
-            "·"
-        };
-        lines.push(Line::from(vec![
-            Span::styled(
-                format!("{marker} {}. ", index + 1),
-                if selected { prompt_style() } else { muted() },
-            ),
-            Span::styled(
-                truncate_for_width(&question.prompt, width.saturating_sub(6)),
-                if selected {
-                    prompt_style()
-                } else {
-                    value_style()
-                },
-            ),
-        ]));
-        if question.kind == DecisionQuestionKind::Choice {
-            for option in question.options.iter().take(4) {
-                let recommended = question.recommended.as_deref() == Some(option.as_str());
-                let picked = decision.answers.get(&question.id) == Some(option);
-                lines.push(Line::from(vec![
-                    Span::styled("   ", muted()),
-                    Span::styled(
-                        if picked {
-                            "● "
-                        } else if recommended {
-                            "◦ "
-                        } else {
-                            "  "
-                        },
-                        if picked {
-                            success_style()
-                        } else {
-                            prompt_style()
-                        },
-                    ),
-                    Span::styled(
-                        truncate_for_width(option, width.saturating_sub(5)),
-                        if picked {
-                            success_style()
-                        } else if selected || recommended {
-                            prompt_style()
-                        } else {
-                            muted()
-                        },
-                    ),
-                ]));
-            }
-        } else {
-            let answer = decision.answers.get(&question.id);
-            lines.push(Line::from(vec![
-                Span::styled("   ", muted()),
-                Span::styled(
-                    answer
-                        .map(|answer| truncate_for_width(answer, width.saturating_sub(5)))
-                        .unwrap_or_else(|| "type in composer".to_string()),
-                    if answer.is_some() {
-                        success_style()
-                    } else {
-                        muted()
-                    },
-                ),
-            ]));
-        }
-    }
-
-    if !decision.assumptions.is_empty() {
-        lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled("Assumptions", muted())));
-        for assumption in decision.assumptions.iter().take(3) {
-            lines.push(Line::from(vec![
-                Span::styled("· ", muted()),
-                Span::styled(
-                    truncate_for_width(assumption, width.saturating_sub(2)),
-                    muted(),
-                ),
-            ]));
-        }
-    }
-
-    if let Some(answer) = &decision.answer {
-        lines.push(Line::from(""));
-        lines.push(Line::from(vec![
-            Span::styled("Answer  ", success_style()),
-            Span::styled(
-                truncate_for_width(answer, width.saturating_sub(8)),
-                value_style(),
-            ),
-        ]));
-    } else {
-        lines.push(Line::from(""));
-        lines.push(Line::from(vec![
-            Span::styled("Controls", prompt_style()),
-            Span::styled(" · j/k question · h/l option · enter", muted()),
-        ]));
-    }
-}
-
-fn truncate_for_width(value: &str, width: u16) -> String {
-    truncate(value, width.saturating_sub(1).max(8) as usize)
 }
 
 fn workflow_view_from_plan(
@@ -8872,7 +8489,7 @@ fn workflow_state_marker_span(state: WorkflowViewState, animation_tick: u64) -> 
     match state {
         WorkflowViewState::Pending => Span::styled("·", muted()),
         WorkflowViewState::Running => {
-            let frame = animation::ThrobberKind::ToolPulse.frame(animation_tick);
+            let frame = animation::ThrobberKind::BrailleOrbit.frame(animation_tick);
             Span::styled(frame.symbol, tool_pulse_style(frame))
         }
         WorkflowViewState::Succeeded => Span::styled("✓", success_style()),
@@ -8989,18 +8606,16 @@ fn visible_transcript_rows(
                 append_workflow_rows(&mut rows, workflow, context);
                 index += 1;
             }
-            TranscriptItem::Plan(plan) => {
-                if !rows.is_empty() {
-                    rows.push(TranscriptRow::text(Line::from("")));
-                }
-                append_plan_rows(&mut rows, plan);
+            // Plans render in the live strip above the composer, not in the
+            // transcript; the item stays only as state (persistence + strip).
+            TranscriptItem::Plan(_) => {
                 index += 1;
             }
             TranscriptItem::Decision(decision) => {
                 if !rows.is_empty() {
                     rows.push(TranscriptRow::text(Line::from("")));
                 }
-                append_decision_rows(&mut rows, decision);
+                append_decision_rows(&mut rows, decision, context.decision_selection);
                 index += 1;
             }
             TranscriptItem::Tool(_) | TranscriptItem::Reasoning(_) => {
@@ -9064,68 +8679,75 @@ fn should_preserve_launch_rows(
     )
 }
 
+const WORDMARK_WIDE_MIN_COLUMNS: u16 = 64;
+
 fn launch_rows() -> Vec<TranscriptRow> {
-    [
+    let wide = crossterm::terminal::size()
+        .map(|(width, _)| width >= WORDMARK_WIDE_MIN_COLUMNS)
+        .unwrap_or(false);
+
+    let mut lines = vec![Line::from("")];
+    if wide {
+        for art in [
+            "  ███╗   ███╗███████╗██████╗ ██╗   ██╗███████╗ █████╗ ",
+            "  ████╗ ████║██╔════╝██╔══██╗██║   ██║██╔════╝██╔══██╗",
+            "  ██╔████╔██║█████╗  ██║  ██║██║   ██║███████╗███████║",
+            "  ██║╚██╔╝██║██╔══╝  ██║  ██║██║   ██║╚════██║██╔══██║",
+            "  ██║ ╚═╝ ██║███████╗██████╔╝╚██████╔╝███████║██║  ██║",
+        ] {
+            lines.push(Line::from(Span::styled(
+                art,
+                accent().add_modifier(Modifier::BOLD),
+            )));
+        }
+        lines.push(Line::from(vec![
+            Span::styled(
+                "  ╚═╝     ╚═╝╚══════╝╚═════╝  ╚═════╝ ╚══════╝╚═╝  ╚═╝",
+                accent().add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(concat!("  v", env!("CARGO_PKG_VERSION")), muted()),
+        ]));
+    } else {
+        lines.push(Line::from(Span::styled(
+            "  █▀▄▀█ █▀▀ █▀▄ █░█ █▀ ▄▀█",
+            accent().add_modifier(Modifier::BOLD),
+        )));
+        lines.push(Line::from(vec![
+            Span::styled(
+                "  █░▀░█ ██▄ █▄▀ █▄█ ▄█ █▀█",
+                accent().add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(concat!("  v", env!("CARGO_PKG_VERSION")), muted()),
+        ]));
+    }
+
+    lines.extend([
         Line::from(""),
         Line::from(vec![Span::styled(
-            "  __  __ _____ ____  _   _ ____    _    ",
-            accent().add_modifier(Modifier::BOLD),
-        )]),
-        Line::from(vec![Span::styled(
-            " |  \\/  | ____|  _ \\| | | / ___|  / \\   ",
-            accent().add_modifier(Modifier::BOLD),
-        )]),
-        Line::from(vec![Span::styled(
-            " | |\\/| |  _| | | | | | | \\___ \\ / _ \\  ",
-            accent().add_modifier(Modifier::BOLD),
-        )]),
-        Line::from(vec![Span::styled(
-            " | |  | | |___| |_| | |_| |___) / ___ \\ ",
-            accent().add_modifier(Modifier::BOLD),
-        )]),
-        Line::from(vec![Span::styled(
-            " |_|  |_|_____|____/ \\___/|____/_/   \\_\\",
-            accent().add_modifier(Modifier::BOLD),
+            "  the coding agent that plans, edits, and verifies",
+            value_style(),
         )]),
         Line::from(""),
         Line::from(vec![
-            Span::styled("  terminal-native coding harness", value_style()),
-            Span::styled("  ·  ", muted()),
-            Span::styled("read", prompt_style()),
-            Span::styled(" / ", muted()),
-            Span::styled("edit", prompt_style()),
-            Span::styled(" / ", muted()),
-            Span::styled("patch", prompt_style()),
-            Span::styled(" / ", muted()),
-            Span::styled("test", prompt_style()),
-            Span::styled(" / ", muted()),
-            Span::styled("review", prompt_style()),
+            Span::styled("  enter", prompt_style()),
+            Span::styled(" send a task", muted()),
+            Span::styled("      shift+tab", prompt_style()),
+            Span::styled(" plan mode", muted()),
+            Span::styled("      ctrl+p", prompt_style()),
+            Span::styled(" commands", muted()),
         ]),
         Line::from(vec![
-            Span::styled("  type a task below", muted()),
-            Span::styled("  ·  ", muted()),
-            Span::styled("ctrl+p", prompt_style()),
-            Span::styled(" palette  ", muted()),
-            Span::styled("/settings", prompt_style()),
-            Span::styled(" settings  ", muted()),
-            Span::styled("ctrl+i", prompt_style()),
-            Span::styled(" image", muted()),
+            Span::styled("  ctrl+i", prompt_style()),
+            Span::styled(" paste image", muted()),
+            Span::styled("    /workflow", prompt_style()),
+            Span::styled(" agent fleet", muted()),
+            Span::styled("     esc esc", prompt_style()),
+            Span::styled(" quit", muted()),
         ]),
-        Line::from(vec![
-            Span::styled("  ", muted()),
-            Span::styled("● ", success_style()),
-            Span::styled("ready", muted()),
-            Span::styled("    ", muted()),
-            Span::styled("● ", tool_label_style()),
-            Span::styled("tools when needed", muted()),
-            Span::styled("    ", muted()),
-            Span::styled("● ", prompt_style()),
-            Span::styled("workflows for larger changes", muted()),
-        ]),
-    ]
-    .into_iter()
-    .map(TranscriptRow::text)
-    .collect()
+        Line::from(""),
+    ]);
+
+    lines.into_iter().map(TranscriptRow::text).collect()
 }
 
 fn transcript_lines_from_rows(rows: &[TranscriptRow]) -> Vec<Line<'static>> {
@@ -9664,9 +9286,102 @@ fn append_user_message_lines(
     }
 }
 
+fn code_syntaxes() -> &'static syntect::parsing::SyntaxSet {
+    static SYNTAXES: OnceLock<syntect::parsing::SyntaxSet> = OnceLock::new();
+    SYNTAXES.get_or_init(syntect::parsing::SyntaxSet::load_defaults_newlines)
+}
+
+fn code_theme() -> &'static syntect::highlighting::Theme {
+    static THEME: OnceLock<syntect::highlighting::Theme> = OnceLock::new();
+    THEME.get_or_init(|| {
+        // Muted base16 palette that sits well on all of Medusa's dark themes.
+        // Only foreground colors are used; the terminal background shows through.
+        syntect::highlighting::ThemeSet::load_defaults()
+            .themes
+            .remove("base16-eighties.dark")
+            .expect("syntect default themes include base16-eighties.dark")
+    })
+}
+
+struct CodeHighlighter {
+    inner: syntect::easy::HighlightLines<'static>,
+}
+
+impl CodeHighlighter {
+    /// None when the fence has no language tag or we don't know the syntax —
+    /// the block then renders in the plain code style.
+    fn for_language(token: &str) -> Option<Self> {
+        let token = token.trim();
+        if token.is_empty() {
+            return None;
+        }
+        let syntaxes = code_syntaxes();
+        let syntax = syntaxes
+            .find_syntax_by_token(token)
+            .or_else(|| syntaxes.find_syntax_by_extension(token))?;
+        Some(Self {
+            inner: syntect::easy::HighlightLines::new(syntax, code_theme()),
+        })
+    }
+
+    fn spans(&mut self, line: &str) -> Vec<Span<'static>> {
+        let with_newline = format!("{line}\n");
+        let Ok(regions) = self.inner.highlight_line(&with_newline, code_syntaxes()) else {
+            return vec![Span::styled(line.to_string(), code_block_style())];
+        };
+        regions
+            .into_iter()
+            .map(|(style, text)| {
+                let fg = style.foreground;
+                Span::styled(
+                    text.trim_end_matches('\n').to_string(),
+                    Style::default().fg(Color::Rgb(fg.r, fg.g, fg.b)),
+                )
+            })
+            .filter(|span| !span.content.is_empty())
+            .collect()
+    }
+}
+
+/// Memoized front for [`markdown_content_lines_uncached`]. During streaming
+/// every delta invalidates the whole-transcript row cache, which would
+/// re-render (and re-highlight) every historical message per frame; this keeps
+/// that cost to the one message actually changing.
 fn markdown_content_lines(content: &str, role: ChatRole) -> Vec<Line<'static>> {
+    use std::hash::{Hash, Hasher};
+
+    const MARKDOWN_CACHE_CAP: usize = 512;
+    static CACHE: OnceLock<std::sync::Mutex<HashMap<u64, Vec<Line<'static>>>>> = OnceLock::new();
+
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    content.hash(&mut hasher);
+    (role as u8).hash(&mut hasher);
+    ACTIVE_THEME.load(Ordering::Relaxed).hash(&mut hasher);
+    let key = hasher.finish();
+
+    let cache = CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+    if let Ok(cache) = cache.lock()
+        && let Some(lines) = cache.get(&key)
+    {
+        return lines.clone();
+    }
+
+    let lines = markdown_content_lines_uncached(content, role);
+    if let Ok(mut cache) = cache.lock() {
+        // Streaming generates a new key per delta; a full reset at the cap is
+        // fine because live entries repopulate on the next frame.
+        if cache.len() >= MARKDOWN_CACHE_CAP {
+            cache.clear();
+        }
+        cache.insert(key, lines.clone());
+    }
+    lines
+}
+
+fn markdown_content_lines_uncached(content: &str, role: ChatRole) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     let mut in_code_block = false;
+    let mut highlighter: Option<CodeHighlighter> = None;
 
     for raw_line in content.lines() {
         let line = raw_line.trim_end();
@@ -9674,14 +9389,21 @@ fn markdown_content_lines(content: &str, role: ChatRole) -> Vec<Line<'static>> {
 
         if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
             in_code_block = !in_code_block;
+            highlighter = if in_code_block {
+                CodeHighlighter::for_language(&trimmed[3..])
+            } else {
+                None
+            };
             continue;
         }
 
         if in_code_block {
-            lines.push(Line::from(vec![
-                Span::styled("  │ ", code_border_style()),
-                Span::styled(line.to_string(), code_block_style()),
-            ]));
+            let mut spans = vec![Span::styled("  │ ", code_border_style())];
+            match highlighter.as_mut() {
+                Some(highlighter) => spans.extend(highlighter.spans(line)),
+                None => spans.push(Span::styled(line.to_string(), code_block_style())),
+            }
+            lines.push(Line::from(spans));
             continue;
         }
 
@@ -9892,6 +9614,136 @@ fn append_activity_lines(
     append_tool_group_lines(lines, transcript, start, end, selected_tool, context);
 }
 
+fn tool_group_is_open(transcript: &[TranscriptItem], start: usize, end: usize) -> bool {
+    transcript[start..end]
+        .iter()
+        .find_map(|item| match item {
+            TranscriptItem::Tool(run) => Some(run.group_expanded),
+            _ => None,
+        })
+        .unwrap_or(false)
+}
+
+/// The tool verb without the redundant leading name, e.g. "read src/main.rs" -> "src/main.rs".
+fn tool_summary_rest(run: &ToolRun) -> String {
+    let name = tool_display_name(&run.name);
+    let summary = tool_summary(&run.summary);
+    summary
+        .strip_prefix(name)
+        .map(str::trim_start)
+        .unwrap_or(summary.as_str())
+        .to_string()
+}
+
+/// Edits and patches carry diffs the user should see per-call; never merge them.
+fn tool_name_coalescible(name: &str) -> bool {
+    !matches!(name, "file.edit" | "file.patch")
+}
+
+/// True when the group contains at least one coalescible run — consecutive
+/// succeeded calls to the same tool (reasoning items in between don't break a run).
+fn tool_group_has_coalesced_runs(transcript: &[TranscriptItem], start: usize, end: usize) -> bool {
+    let mut previous: Option<&str> = None;
+    for item in &transcript[start..end] {
+        match item {
+            TranscriptItem::Tool(run)
+                if run.state == ToolRunState::Succeeded && tool_name_coalescible(&run.name) =>
+            {
+                let name = tool_display_name(&run.name);
+                if previous == Some(name) {
+                    return true;
+                }
+                previous = Some(name);
+            }
+            TranscriptItem::Tool(_) => previous = None,
+            _ => {}
+        }
+    }
+    false
+}
+
+const TOOL_COALESCE_SHOWN_TARGETS: usize = 3;
+
+fn append_coalesced_tool_lines(
+    lines: &mut Vec<Line<'static>>,
+    runs: &[&ToolRun],
+    selected: bool,
+    context: RenderContext,
+) {
+    let selection = if selected {
+        activity_selected_style()
+    } else {
+        Style::default()
+    };
+    let sel = |style: Style| style.patch(selection);
+
+    let name = tool_display_name(&runs[0].name);
+    // A running call can only ever be the tail of a coalesced run.
+    let active = runs
+        .last()
+        .filter(|run| run.state == ToolRunState::Running)
+        .copied();
+    let targets: Vec<String> = runs
+        .iter()
+        .filter(|run| run.state == ToolRunState::Succeeded)
+        .map(|run| tool_summary_rest(run))
+        .filter(|target| !target.is_empty())
+        .collect();
+    let extra = targets.len().saturating_sub(TOOL_COALESCE_SHOWN_TARGETS);
+    let mut label = targets
+        .iter()
+        .take(TOOL_COALESCE_SHOWN_TARGETS)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(", ");
+    if extra > 0 {
+        label.push_str(&format!(" +{extra} more"));
+    }
+    if let Some(active) = active {
+        let target = tool_summary_rest(active);
+        if !target.is_empty() {
+            if !label.is_empty() {
+                label.push_str(", ");
+            }
+            label.push_str(&target);
+        }
+    }
+    if label.is_empty() {
+        label = format!("×{}", runs.len());
+    }
+
+    let marker = if active.is_some() {
+        tool_running_marker_span(ToolRunState::Running, context.animation_tick)
+    } else {
+        Span::styled(TOOL_MARKER, sel(tool_marker_style()))
+    };
+    lines.push(Line::from(vec![
+        marker,
+        Span::raw(" "),
+        Span::styled(
+            name.to_string(),
+            sel(tool_label_style().add_modifier(Modifier::BOLD)),
+        ),
+        Span::styled(
+            format!(" {}", truncate(&label, 140)),
+            sel(message_style(ChatRole::Tool)),
+        ),
+    ]));
+
+    let mut result = vec![
+        Span::raw("  "),
+        Span::styled("⎿ ", separator_style()),
+        Span::styled(format!("{} calls", runs.len()), muted()),
+    ];
+    if active.is_some() {
+        result.push(Span::styled(" · running…", muted()));
+    }
+    if selected {
+        result.push(Span::styled(" · enter to expand", muted()));
+    }
+    lines.push(Line::from(result));
+}
+
 fn append_tool_group_lines(
     lines: &mut Vec<Line<'static>>,
     transcript: &[TranscriptItem],
@@ -9900,170 +9752,194 @@ fn append_tool_group_lines(
     selected_tool: Option<usize>,
     context: RenderContext,
 ) {
-    let runs = transcript[start..end]
-        .iter()
-        .filter_map(|item| match item {
-            TranscriptItem::Tool(run) => Some(run),
-            _ => None,
-        })
-        .collect::<Vec<_>>();
+    let coalesce = !tool_group_is_open(transcript, start, end);
+    let mut first = true;
+    let mut index = start;
+    while index < end {
+        let TranscriptItem::Tool(run) = &transcript[index] else {
+            index += 1;
+            continue;
+        };
 
-    if runs.is_empty() {
-        return;
-    }
+        // Collect the consecutive run of succeeded calls to the same tool,
+        // skipping reasoning items in between.
+        let mut matched: Vec<&ToolRun> = vec![run];
+        let mut cursor = index + 1;
+        if coalesce
+            && run.state == ToolRunState::Succeeded
+            && !run.expanded
+            && tool_name_coalescible(&run.name)
+        {
+            loop {
+                let mut probe = cursor;
+                while probe < end && matches!(transcript[probe], TranscriptItem::Reasoning(_)) {
+                    probe += 1;
+                }
+                match transcript.get(probe) {
+                    Some(TranscriptItem::Tool(next))
+                        if probe < end
+                            && next.state == ToolRunState::Succeeded
+                            && !next.expanded
+                            && tool_display_name(&next.name) == tool_display_name(&run.name) =>
+                    {
+                        matched.push(next);
+                        cursor = probe + 1;
+                    }
+                    // A running call of the same tool joins as the live tail, so
+                    // it doesn't render below only to jump into the run on success.
+                    Some(TranscriptItem::Tool(next))
+                        if probe < end
+                            && next.state == ToolRunState::Running
+                            && tool_display_name(&next.name) == tool_display_name(&run.name) =>
+                    {
+                        matched.push(next);
+                        cursor = probe + 1;
+                        break;
+                    }
+                    _ => break,
+                }
+            }
+        }
 
-    let status = tool_group_status(&runs);
-    let selected = selected_tool.is_some_and(|index| (start..end).contains(&index));
-    let expanded = selected
-        && transcript[start..end]
-            .iter()
-            .any(|item| matches!(item, TranscriptItem::Tool(run) if run.expanded));
-    let row_style = if selected {
-        activity_selected_style()
-    } else {
-        Style::default()
-    };
-    let selected_style = |style: Style| style.patch(row_style);
-    let call_label = if runs.len() == 1 { "call" } else { "calls" };
-    let disclosure = if selected {
-        if expanded { "▾ " } else { "▸ " }
-    } else {
-        "  "
-    };
-    let breakdown = tool_group_breakdown(&runs);
-    if status == ToolRunState::Running {
-        let mut row = vec![Span::styled(disclosure, selected_style(muted()))];
-        row.push(tool_running_marker_span(status, context.animation_tick));
-        row.push(Span::raw(" "));
-        row.push(Span::styled(
-            "tools",
-            selected_style(tool_group_label_style()),
-        ));
-        row.push(Span::styled(
-            format!("  {} {call_label}  ", runs.len()),
-            selected_style(tool_group_meta_style()),
-        ));
-        row.push(Span::styled(
-            breakdown,
-            selected_style(message_style(ChatRole::Tool)),
-        ));
-        lines.push(Line::from(row));
-    } else if status == ToolRunState::Failed {
-        let mut row = vec![
-            Span::styled(disclosure, selected_style(muted())),
-            Span::styled("tools", selected_style(tool_group_label_style())),
-            Span::styled(
-                format!("  {} {call_label}  ", runs.len()),
-                selected_style(tool_group_meta_style()),
-            ),
-            Span::styled(breakdown, selected_style(message_style(ChatRole::Tool))),
-        ];
-        row.push(Span::styled("  ", selected_style(tool_group_meta_style())));
-        row.push(Span::styled("failed", selected_style(error_style())));
-        lines.push(Line::from(row));
-    } else {
-        lines.push(Line::from(vec![
-            Span::styled(disclosure, selected_style(muted())),
-            Span::styled("tools", selected_style(tool_group_label_style())),
-            Span::styled(
-                format!("  {} {call_label}  ", runs.len()),
-                selected_style(tool_group_meta_style()),
-            ),
-            Span::styled(breakdown, selected_style(message_style(ChatRole::Tool))),
-        ]));
-    }
+        if !first {
+            lines.push(Line::from(""));
+        }
+        first = false;
 
-    if expanded {
-        append_tool_group_detail_lines(lines, &runs, context);
-    } else {
-        append_tool_group_subtree_lines(lines, &runs, context);
-        if status == ToolRunState::Failed {
-            append_tool_failure_preview(lines, &runs);
+        if matched.len() > 1 {
+            let selected =
+                matches!(selected_tool, Some(sel) if sel >= index && sel < cursor);
+            append_coalesced_tool_lines(lines, &matched, selected, context);
+            index = cursor;
+        } else {
+            append_tool_call_lines(lines, run, selected_tool == Some(index), context);
+            index += 1;
         }
     }
 }
 
-fn append_tool_group_subtree_lines(
+const TOOL_DETAIL_COLLAPSED_LINES: usize = 1;
+const TOOL_DETAIL_FAILED_LINES: usize = 4;
+const TOOL_DETAIL_EXPANDED_LINES: usize = 24;
+/// Diffs are the payoff of an edit — show a real chunk of them by default.
+const TOOL_DETAIL_DIFF_COLLAPSED_LINES: usize = 12;
+const TOOL_DETAIL_DIFF_EXPANDED_LINES: usize = 64;
+
+fn append_tool_call_lines(
     lines: &mut Vec<Line<'static>>,
-    runs: &[&ToolRun],
+    run: &ToolRun,
+    selected: bool,
     context: RenderContext,
 ) {
-    let items = tool_group_subtree_items(runs);
-    let hidden = items.len().saturating_sub(4);
-    let visible_count = items.len().min(4);
-    for (index, item) in items.iter().take(visible_count).enumerate() {
-        append_tool_group_subtree_item_line(
-            lines,
-            item,
-            index + 1 == visible_count && hidden == 0,
-            context,
-        );
-    }
+    let selection = if selected {
+        activity_selected_style()
+    } else {
+        Style::default()
+    };
+    let sel = |style: Style| style.patch(selection);
 
-    if hidden > 0 {
-        lines.push(Line::from(vec![
-            Span::styled("    └─ ", separator_style()),
-            Span::styled(
-                format!(
-                    "… {hidden} more categor{} hidden",
-                    if hidden == 1 { "y" } else { "ies" }
-                ),
-                muted(),
-            ),
-        ]));
-    }
-}
+    let marker = match run.state {
+        ToolRunState::Running => tool_running_marker_span(run.state, context.animation_tick),
+        ToolRunState::Succeeded => Span::styled(TOOL_MARKER, sel(tool_marker_style())),
+        ToolRunState::Failed => Span::styled(TOOL_MARKER, sel(error_style())),
+    };
 
-fn append_tool_group_subtree_item_line(
-    lines: &mut Vec<Line<'static>>,
-    item: &ToolSubtreeItem,
-    is_last: bool,
-    context: RenderContext,
-) {
-    let branch = if is_last { "└─" } else { "├─" };
-    let mut row = vec![
-        Span::styled("    ", tool_group_meta_style()),
-        Span::styled(branch, separator_style()),
-        Span::raw(" "),
-        tool_running_marker_span(item.state, context.animation_tick),
-        Span::raw(" "),
-        Span::styled(item.summary(), tool_label_style()),
-    ];
-    let detail = item.detail();
-    if !detail.is_empty() {
-        row.push(Span::styled(" · ", muted()));
+    let mut row = vec![marker, Span::raw(" ")];
+    let name = tool_display_name(&run.name);
+    // Summaries like "read AGENTS.md" already start with the tool verb, so
+    // drop the redundant name to avoid "read read AGENTS.md".
+    let summary = tool_summary(&run.summary);
+    let summary_rest = summary
+        .strip_prefix(name)
+        .map(str::trim_start)
+        .unwrap_or(summary.as_str());
+    row.push(Span::styled(
+        name.to_string(),
+        sel(tool_label_style().add_modifier(Modifier::BOLD)),
+    ));
+    if !summary_rest.is_empty() {
         row.push(Span::styled(
-            truncate(&detail, 120),
-            message_style(ChatRole::Tool),
+            format!(" {}", truncate(summary_rest, 140)),
+            sel(message_style(ChatRole::Tool)),
         ));
     }
     lines.push(Line::from(row));
-}
 
-#[cfg(test)]
-fn append_compact_tool_call_lines(
-    lines: &mut Vec<Line<'static>>,
-    run: &ToolRun,
-    context: RenderContext,
-) {
-    let card = tool_activity_card(run);
-    let action_style = if run.state == ToolRunState::Running {
-        tool_label_style().add_modifier(Modifier::BOLD)
+    if run.state == ToolRunState::Running {
+        lines.push(Line::from(vec![
+            Span::raw("  "),
+            Span::styled("⎿ ", separator_style()),
+            Span::styled("running…", muted()),
+        ]));
+        return;
+    }
+
+    let detail_lines = meaningful_tool_output_lines(run);
+    if detail_lines.is_empty() {
+        lines.push(Line::from(vec![
+            Span::raw("  "),
+            Span::styled("⎿ ", separator_style()),
+            match run.state {
+                ToolRunState::Failed => Span::styled("failed", error_style()),
+                _ => Span::styled("done", muted()),
+            },
+        ]));
+        return;
+    }
+
+    let has_diff = tool_run_has_diff(run);
+    let visible = if run.expanded {
+        if has_diff {
+            TOOL_DETAIL_DIFF_EXPANDED_LINES
+        } else {
+            TOOL_DETAIL_EXPANDED_LINES
+        }
+    } else if run.state == ToolRunState::Failed {
+        TOOL_DETAIL_FAILED_LINES
+    } else if has_diff {
+        TOOL_DETAIL_DIFF_COLLAPSED_LINES
     } else {
-        tool_label_style()
+        TOOL_DETAIL_COLLAPSED_LINES
     };
-    lines.push(Line::from(vec![
-        Span::styled("    ", tool_group_meta_style()),
-        tool_running_marker_span(run.state, context.animation_tick),
-        Span::raw(" "),
-        Span::styled(card.action, action_style),
-        Span::raw(" "),
-        Span::styled(truncate(&card.target, 120), message_style(ChatRole::Tool)),
-    ]));
+    let body_style = match run.state {
+        ToolRunState::Failed => error_preview_style(),
+        _ => muted(),
+    };
 
-    let mut result = vec![Span::styled("      ⎿ ", tool_output_border_style())];
-    result.extend(tool_result_spans(run, context.animation_tick));
-    lines.push(Line::from(result));
+    for (index, line) in detail_lines.iter().take(visible).enumerate() {
+        let prefix = if index == 0 { "⎿ " } else { "  " };
+        let mut row = vec![Span::raw("  "), Span::styled(prefix, separator_style())];
+        if line.contains('\u{1b}') {
+            row.extend(ansi_detail_spans(line, body_style));
+        } else {
+            let line_style = if has_diff && run.state != ToolRunState::Failed {
+                diff_line_style(line).unwrap_or(body_style)
+            } else {
+                body_style
+            };
+            row.push(Span::styled(truncate(line, 170), line_style));
+        }
+        lines.push(Line::from(row));
+    }
+
+    let hidden = detail_lines.len().saturating_sub(visible);
+    if hidden > 0 {
+        let hint = if run.expanded {
+            format!(
+                "… +{hidden} more line{}",
+                if hidden == 1 { "" } else { "s" }
+            )
+        } else {
+            format!(
+                "… +{hidden} line{} (enter to expand)",
+                if hidden == 1 { "" } else { "s" }
+            )
+        };
+        lines.push(Line::from(vec![
+            Span::raw("    "),
+            Span::styled(hint, muted()),
+        ]));
+    }
 }
 
 fn tool_running_marker_span(state: ToolRunState, animation_tick: u64) -> Span<'static> {
@@ -10087,66 +9963,6 @@ fn tool_pulse_style(frame: animation::ThrobberFrame) -> Style {
             .fg(accent_color())
             .add_modifier(Modifier::BOLD),
         _ => muted(),
-    }
-}
-
-fn tool_running_text_style(animation_tick: u64) -> Style {
-    let _ = animation_tick;
-    muted()
-}
-
-fn tool_running_verb(animation_tick: u64) -> &'static str {
-    let _ = animation_tick;
-    "running"
-}
-
-fn tool_status_spans(state: ToolRunState, animation_tick: u64) -> Vec<Span<'static>> {
-    match state {
-        ToolRunState::Running => {
-            vec![Span::styled(
-                tool_running_verb(animation_tick),
-                tool_running_text_style(animation_tick),
-            )]
-        }
-        ToolRunState::Succeeded => vec![Span::styled("done", success_style())],
-        ToolRunState::Failed => vec![Span::styled("failed", error_style())],
-    }
-}
-
-#[cfg(test)]
-fn tool_result_spans(run: &ToolRun, animation_tick: u64) -> Vec<Span<'static>> {
-    match run.state {
-        ToolRunState::Running => {
-            vec![Span::styled(
-                tool_running_verb(animation_tick),
-                tool_running_text_style(animation_tick),
-            )]
-        }
-        ToolRunState::Succeeded => vec![Span::styled(
-            tool_result_line(run),
-            tool_output_style(run.state),
-        )],
-        ToolRunState::Failed => vec![Span::styled(
-            tool_result_line(run),
-            tool_output_style(run.state),
-        )],
-    }
-}
-
-#[cfg(test)]
-fn tool_result_line(run: &ToolRun) -> String {
-    match run.state {
-        ToolRunState::Running => "working…".to_string(),
-        ToolRunState::Succeeded => {
-            let preview = tool_result_preview(run).unwrap_or_else(|| "done".to_string());
-            format!("done · {}", compact_one_line(&preview, 140))
-        }
-        ToolRunState::Failed => {
-            let preview = tool_result_preview(run)
-                .or_else(|| tool_failure_preview(&[run]).map(|(_, preview)| preview))
-                .unwrap_or_else(|| "failed".to_string());
-            format!("failed · {}", compact_one_line(&preview, 140))
-        }
     }
 }
 
@@ -10178,358 +9994,6 @@ fn light_sweep_spans(
         .collect()
 }
 
-fn append_tool_group_detail_lines(
-    lines: &mut Vec<Line<'static>>,
-    runs: &[&ToolRun],
-    context: RenderContext,
-) {
-    let hidden = runs.len().saturating_sub(5);
-    if hidden > 0 {
-        lines.push(Line::from(vec![
-            Span::styled("      ", muted()),
-            Span::styled(format!("{hidden} earlier calls hidden"), muted()),
-        ]));
-    }
-
-    let visible_start = runs.len().saturating_sub(5);
-    for run in &runs[visible_start..] {
-        append_tool_run_lines(
-            lines,
-            run,
-            runs.len() == 1 || run.state == ToolRunState::Failed,
-            context,
-        );
-    }
-}
-
-fn append_tool_run_lines(
-    lines: &mut Vec<Line<'static>>,
-    run: &ToolRun,
-    include_output: bool,
-    context: RenderContext,
-) {
-    let card = tool_activity_card(run);
-    let action_style = if run.state == ToolRunState::Running {
-        tool_label_style().add_modifier(Modifier::BOLD)
-    } else {
-        tool_label_style()
-    };
-
-    let mut row = vec![
-        Span::styled("      ", tool_group_meta_style()),
-        tool_running_marker_span(run.state, context.animation_tick),
-        Span::raw(" "),
-        Span::styled(format!("{:<8}", card.action), action_style),
-        Span::raw(" "),
-        Span::styled(truncate(&card.target, 110), message_style(ChatRole::Tool)),
-        Span::raw("  "),
-    ];
-    row.extend(tool_status_spans(run.state, context.animation_tick));
-    lines.push(Line::from(row));
-
-    if include_output {
-        append_tool_output_lines(lines, run);
-    }
-}
-
-fn tool_state_label(state: ToolRunState) -> &'static str {
-    match state {
-        ToolRunState::Running => "working",
-        ToolRunState::Succeeded => "done",
-        ToolRunState::Failed => "failed",
-    }
-}
-
-fn tool_state_style(state: ToolRunState) -> Style {
-    match state {
-        ToolRunState::Running => muted(),
-        ToolRunState::Succeeded => success_style(),
-        ToolRunState::Failed => error_style(),
-    }
-}
-
-fn tool_output_style(state: ToolRunState) -> Style {
-    match state {
-        ToolRunState::Failed => error_preview_style(),
-        _ => message_style(ChatRole::Tool),
-    }
-}
-
-fn append_tool_output_lines(lines: &mut Vec<Line<'static>>, run: &ToolRun) {
-    lines.push(Line::from(vec![
-        Span::styled("      hint ", muted()),
-        Span::styled(
-            "enter expand/collapse · y copy soon · failures auto-expand",
-            muted(),
-        ),
-    ]));
-    let detail = run.detail.trim();
-    if detail.is_empty() || detail == "done" {
-        lines.push(Line::from(vec![
-            Span::styled("      output ", muted()),
-            Span::styled("no details", muted()),
-        ]));
-        return;
-    }
-
-    for line in detail
-        .lines()
-        .filter(|line| !line.trim().is_empty())
-        .take(10)
-    {
-        lines.push(Line::from(vec![
-            Span::styled("      │ ", tool_output_border_style()),
-            Span::styled(truncate(line.trim(), 180), tool_output_style(run.state)),
-        ]));
-    }
-}
-
-fn append_tool_failure_preview(lines: &mut Vec<Line<'static>>, runs: &[&ToolRun]) {
-    let Some((name, preview)) = tool_failure_preview(runs) else {
-        return;
-    };
-
-    lines.push(Line::from(vec![
-        Span::styled("      ", muted()),
-        Span::styled(format!("{name} "), tool_label_style()),
-        Span::styled(truncate(&preview, 170), error_preview_style()),
-    ]));
-}
-
-fn tool_failure_preview(runs: &[&ToolRun]) -> Option<(String, String)> {
-    runs.iter()
-        .rev()
-        .find(|run| run.state == ToolRunState::Failed)
-        .and_then(|run| {
-            let preview = run
-                .detail
-                .lines()
-                .map(str::trim)
-                .find(|line| {
-                    !line.is_empty()
-                        && *line != "stdout:"
-                        && *line != "stderr:"
-                        && *line != "stdout: <empty>"
-                        && !line.starts_with("exit: ")
-                })
-                .or_else(|| {
-                    run.detail
-                        .lines()
-                        .map(str::trim)
-                        .find(|line| !line.is_empty())
-                })?;
-
-            Some((
-                tool_display_name(&run.name).to_string(),
-                preview.to_string(),
-            ))
-        })
-}
-
-fn tool_group_status(runs: &[&ToolRun]) -> ToolRunState {
-    if runs.iter().any(|run| run.state == ToolRunState::Running) {
-        ToolRunState::Running
-    } else if runs.iter().any(|run| run.state == ToolRunState::Failed) {
-        ToolRunState::Failed
-    } else {
-        ToolRunState::Succeeded
-    }
-}
-
-fn tool_group_breakdown(runs: &[&ToolRun]) -> String {
-    let mut counts: Vec<(&str, usize)> = Vec::new();
-    for run in runs {
-        let name = tool_display_name(&run.name);
-        if let Some((_, count)) = counts.iter_mut().find(|(existing, _)| *existing == name) {
-            *count += 1;
-        } else {
-            counts.push((name, 1));
-        }
-    }
-
-    counts
-        .into_iter()
-        .take(4)
-        .map(|(name, count)| {
-            if count == 1 {
-                name.to_string()
-            } else {
-                format!("{name} x{count}")
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(", ")
-}
-
-#[derive(Debug, Clone)]
-struct ToolSubtreeItem {
-    key: &'static str,
-    noun: &'static str,
-    verb: &'static str,
-    count: usize,
-    state: ToolRunState,
-    sample: Option<String>,
-}
-
-impl ToolSubtreeItem {
-    fn summary(&self) -> String {
-        format!(
-            "{} {} {}",
-            self.verb,
-            self.count,
-            pluralize(self.noun, self.count)
-        )
-    }
-
-    fn detail(&self) -> String {
-        self.sample.clone().unwrap_or_default()
-    }
-}
-
-fn tool_group_subtree_items(runs: &[&ToolRun]) -> Vec<ToolSubtreeItem> {
-    let mut items: Vec<ToolSubtreeItem> = Vec::new();
-    for run in runs {
-        let bucket = tool_subtree_bucket(run);
-        if let Some(index) = items.iter().position(|item| item.key == bucket.key) {
-            let item = &mut items[index];
-            item.count += 1;
-            item.state = merge_tool_state(item.state, run.state);
-            if item.sample.is_none() {
-                item.sample = tool_subtree_sample(run);
-            }
-            continue;
-        }
-
-        items.push(ToolSubtreeItem {
-            key: bucket.key,
-            noun: bucket.noun,
-            verb: bucket.verb,
-            count: 1,
-            state: run.state,
-            sample: tool_subtree_sample(run),
-        });
-    }
-    items
-}
-
-#[derive(Debug, Clone, Copy)]
-struct ToolSubtreeBucket {
-    key: &'static str,
-    noun: &'static str,
-    verb: &'static str,
-}
-
-fn tool_subtree_bucket(run: &ToolRun) -> ToolSubtreeBucket {
-    match run.name.as_str() {
-        "file.read" => ToolSubtreeBucket {
-            key: "read",
-            noun: "file",
-            verb: "read",
-        },
-        "file.search" => ToolSubtreeBucket {
-            key: "search",
-            noun: "query",
-            verb: "searched",
-        },
-        "fs.list" => ToolSubtreeBucket {
-            key: "list",
-            noun: "path",
-            verb: "listed",
-        },
-        "file.edit" | "file.patch" => ToolSubtreeBucket {
-            key: "edit",
-            noun: "file",
-            verb: "edited",
-        },
-        "task.update" => ToolSubtreeBucket {
-            key: "status",
-            noun: "update",
-            verb: "posted",
-        },
-        "terminal.exec" => terminal_subtree_bucket(run),
-        _ => ToolSubtreeBucket {
-            key: "tool",
-            noun: "call",
-            verb: "ran",
-        },
-    }
-}
-
-fn terminal_subtree_bucket(run: &ToolRun) -> ToolSubtreeBucket {
-    match classify_command_action(&command_from_summary(&run.summary)) {
-        "Read" => ToolSubtreeBucket {
-            key: "read",
-            noun: "file",
-            verb: "read",
-        },
-        "Search" => ToolSubtreeBucket {
-            key: "search",
-            noun: "query",
-            verb: "searched",
-        },
-        "List" => ToolSubtreeBucket {
-            key: "list",
-            noun: "path",
-            verb: "listed",
-        },
-        "Test" => ToolSubtreeBucket {
-            key: "test",
-            noun: "command",
-            verb: "tested",
-        },
-        "Build" => ToolSubtreeBucket {
-            key: "build",
-            noun: "command",
-            verb: "built",
-        },
-        "Format" => ToolSubtreeBucket {
-            key: "format",
-            noun: "command",
-            verb: "formatted",
-        },
-        "Git" => ToolSubtreeBucket {
-            key: "git",
-            noun: "command",
-            verb: "ran git",
-        },
-        _ => ToolSubtreeBucket {
-            key: "terminal",
-            noun: "command",
-            verb: "ran",
-        },
-    }
-}
-
-fn tool_subtree_sample(run: &ToolRun) -> Option<String> {
-    let card = tool_activity_card(run);
-    let target = compact_tool_target(&card.target, 70);
-    if target.is_empty() {
-        None
-    } else {
-        Some(target)
-    }
-}
-
-fn merge_tool_state(left: ToolRunState, right: ToolRunState) -> ToolRunState {
-    if matches!(left, ToolRunState::Failed) || matches!(right, ToolRunState::Failed) {
-        ToolRunState::Failed
-    } else if matches!(left, ToolRunState::Running) || matches!(right, ToolRunState::Running) {
-        ToolRunState::Running
-    } else {
-        ToolRunState::Succeeded
-    }
-}
-
-fn pluralize(noun: &str, count: usize) -> String {
-    if count == 1 {
-        noun.to_string()
-    } else if noun.ends_with('y') {
-        format!("{}ies", noun.trim_end_matches('y'))
-    } else {
-        format!("{noun}s")
-    }
-}
-
 fn tool_display_name(name: &str) -> &str {
     match name {
         "file.read" => "read",
@@ -10543,368 +10007,60 @@ fn tool_display_name(name: &str) -> &str {
     }
 }
 
-#[derive(Debug, Clone)]
-struct ToolActivityCard {
-    action: String,
-    target: String,
-    preview: Option<String>,
-}
-
-fn tool_activity_card(run: &ToolRun) -> ToolActivityCard {
-    match run.name.as_str() {
-        "terminal.exec" => terminal_activity_card(run),
-        "file.edit" => patch_activity_card(run),
-        "file.patch" => patch_activity_card(run),
-        _ => ToolActivityCard {
-            action: tool_display_name(&run.name).to_string(),
-            target: tool_summary(&run.summary),
-            preview: tool_result_preview(run),
-        },
-    }
-}
-
 fn meaningful_tool_output_lines(run: &ToolRun) -> Vec<String> {
     run.detail
         .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty() && *line != "done")
+        // trim_end only: leading whitespace is meaningful in diff output.
+        .map(str::trim_end)
+        .filter(|line| !line.trim().is_empty() && line.trim() != "done")
         .map(ToString::to_string)
         .collect()
 }
 
-fn output_count_label(count: usize) -> String {
-    match count {
-        0 => "no details".to_string(),
-        1 => "1 line".to_string(),
-        count => format!("{count} lines"),
-    }
+/// True when this run's detail carries a display diff from file.edit/file.patch.
+fn tool_run_has_diff(run: &ToolRun) -> bool {
+    matches!(run.name.as_str(), "file.edit" | "file.patch")
 }
 
-fn tool_activity_output_lines(run: &ToolRun, width: u16) -> Vec<Line<'static>> {
-    let output = meaningful_tool_output_lines(run);
-    if output.is_empty() {
-        return vec![Line::from(Span::styled("no output details", muted()))];
-    }
+/// Convert a detail line containing ANSI escape codes into styled spans.
+/// Unstyled segments fall back to the tool body style so colored fragments
+/// (e.g. cargo's red `error`) sit inside otherwise-muted output.
+fn ansi_detail_spans(line: &str, fallback: Style) -> Vec<Span<'static>> {
+    use ansi_to_tui::IntoText;
 
-    let max_width = width.saturating_sub(2).max(12) as usize;
-    output
+    let Ok(text) = line.into_text() else {
+        return vec![Span::styled(line.replace('\u{1b}', "␛"), fallback)];
+    };
+    let Some(parsed) = text.lines.into_iter().next() else {
+        return Vec::new();
+    };
+    parsed
+        .spans
         .into_iter()
-        .map(|line| {
-            let style = if line.starts_with("stderr:")
-                || line.starts_with("error:")
-                || line.starts_with("failed")
-            {
-                error_preview_style()
-            } else if line.starts_with("stdout:") || line.starts_with("exit:") {
-                muted()
-            } else {
-                tool_output_style(run.state)
+        .map(|span| {
+            // Reset/uncolored segments take the tool body style; ansi-to-tui
+            // encodes SGR reset as explicit Color::Reset rather than default.
+            let unstyled = match span.style.fg {
+                None | Some(Color::Reset) => true,
+                Some(_) => false,
             };
-            Line::from(vec![
-                Span::styled("│ ", tool_output_border_style()),
-                Span::styled(truncate(&line, max_width), style),
-            ])
+            let style = if unstyled { fallback } else { span.style };
+            Span::styled(span.content.into_owned(), style)
         })
         .collect()
 }
 
-fn tool_activity_timeline_lines(run: &ToolRun) -> Vec<Line<'static>> {
-    let card = tool_activity_card(run);
-    let elapsed = run.started_at.elapsed().as_secs();
-    let result =
-        tool_result_preview(run).unwrap_or_else(|| tool_state_label(run.state).to_string());
-    vec![
-        Line::from(vec![
-            Span::styled("● ", tool_label_style()),
-            Span::styled("started", value_style()),
-            Span::styled(" · ", muted()),
-            Span::styled(card.action, tool_label_style()),
-            Span::styled(" · ", muted()),
-            Span::styled(
-                compact_tool_target(&card.target, 90),
-                message_style(ChatRole::Tool),
-            ),
-        ]),
-        Line::from(vec![
-            Span::styled("│ ", separator_style()),
-            Span::styled("elapsed ", muted()),
-            Span::styled(format!("{elapsed}s"), value_style()),
-        ]),
-        Line::from(vec![
-            Span::styled("└ ", tool_state_style(run.state)),
-            Span::styled(tool_state_label(run.state), tool_state_style(run.state)),
-            Span::styled(" · ", muted()),
-            Span::styled(compact_one_line(&result, 100), tool_output_style(run.state)),
-        ]),
-    ]
-}
-
-fn terminal_activity_card(run: &ToolRun) -> ToolActivityCard {
-    let command = command_from_summary(&run.summary);
-    ToolActivityCard {
-        action: classify_command_action(&command).to_string(),
-        target: if command.is_empty() {
-            tool_summary(&run.summary)
-        } else {
-            command
-        },
-        preview: tool_result_preview(run),
-    }
-}
-
-fn patch_activity_card(run: &ToolRun) -> ToolActivityCard {
-    ToolActivityCard {
-        action: match run.state {
-            ToolRunState::Running | ToolRunState::Succeeded => "Edit".to_string(),
-            ToolRunState::Failed => "Edit failed".to_string(),
-        },
-        target: patch_detail(run),
-        preview: tool_result_preview(run),
-    }
-}
-
-fn tool_activity_header_line(phase: ToolActivityPhase, runs: &[ToolRun]) -> Line<'static> {
-    let failed = runs
-        .iter()
-        .filter(|run| run.state == ToolRunState::Failed)
-        .count();
-    let running = runs
-        .iter()
-        .filter(|run| run.state == ToolRunState::Running)
-        .count();
-    let edited = runs.iter().any(|run| run.name == "file.patch");
-
-    let (label, style) = if failed > 0 {
-        (
-            format!("Failed · {failed}/{} tools", runs.len()),
-            error_style(),
-        )
-    } else if running > 0 {
-        ("Working…".to_string(), tool_label_style())
+fn diff_line_style(line: &str) -> Option<Style> {
+    let trimmed = line.trim_start();
+    if trimmed.starts_with("+") {
+        Some(Style::default().fg(palette().success))
+    } else if trimmed.starts_with("-") {
+        Some(Style::default().fg(palette().error))
+    } else if trimmed.starts_with("@@") {
+        Some(muted().add_modifier(Modifier::DIM))
     } else {
-        let noun = if edited { "changes" } else { "checks" };
-        match phase {
-            ToolActivityPhase::LastTurn | ToolActivityPhase::CurrentTurn => {
-                (format!("Done · {} {noun}", runs.len()), success_style())
-            }
-            ToolActivityPhase::Idle => ("Idle".to_string(), muted()),
-        }
-    };
-
-    Line::from(vec![
-        Span::styled("● ", style),
-        Span::styled(label, style.add_modifier(Modifier::BOLD)),
-    ])
-}
-
-fn command_from_summary(summary: &str) -> String {
-    let summary = tool_summary(summary);
-    summary
-        .strip_prefix('$')
-        .map(str::trim)
-        .unwrap_or(summary.trim())
-        .to_string()
-}
-
-fn classify_command_action(command: &str) -> &'static str {
-    let command = command.trim_start();
-    let first = command.split_whitespace().next().unwrap_or("");
-    if command.is_empty() {
-        return "Bash";
+        None
     }
-    if command.contains(" test")
-        || command.starts_with("cargo test")
-        || command.starts_with("npm test")
-        || command.starts_with("pnpm test")
-        || command.starts_with("yarn test")
-        || command.starts_with("pytest")
-        || command.starts_with("go test")
-    {
-        "Test"
-    } else if command.contains(" build")
-        || command.starts_with("cargo build")
-        || command.starts_with("npm run build")
-        || command.starts_with("pnpm build")
-        || command.starts_with("yarn build")
-        || command.starts_with("go build")
-    {
-        "Build"
-    } else if command.contains(" fmt")
-        || command.starts_with("cargo fmt")
-        || command.starts_with("rustfmt")
-        || command.starts_with("prettier")
-        || command.starts_with("npm run format")
-    {
-        "Format"
-    } else if matches!(first, "rg" | "grep" | "ack" | "ag") {
-        "Search"
-    } else if matches!(first, "cat" | "sed" | "head" | "tail" | "bat") {
-        "Read"
-    } else if matches!(first, "ls" | "find" | "fd" | "tree" | "pwd") {
-        "List"
-    } else if matches!(first, "git") {
-        "Git"
-    } else {
-        "Bash"
-    }
-}
-
-fn patch_detail(run: &ToolRun) -> String {
-    if run.state == ToolRunState::Succeeded {
-        let files = run
-            .detail
-            .lines()
-            .filter(|line| !line.trim().is_empty() && *line != "done")
-            .collect::<Vec<_>>();
-        return match files.len() {
-            0 => "Patch applied".to_string(),
-            1 => files[0].trim().to_string(),
-            count => format!("{count} files changed"),
-        };
-    }
-
-    let summary = tool_summary(&run.summary);
-    if summary == "tool call" {
-        "patch".to_string()
-    } else {
-        summary
-    }
-}
-
-fn tool_result_preview(run: &ToolRun) -> Option<String> {
-    match run.state {
-        ToolRunState::Running => None,
-        ToolRunState::Succeeded => success_result_preview(run),
-        ToolRunState::Failed => failure_result_preview(run),
-    }
-}
-
-fn success_result_preview(run: &ToolRun) -> Option<String> {
-    if run.name == "file.patch" {
-        return None;
-    }
-    if run.name == "terminal.exec" && command_success_is_noise(&command_from_summary(&run.summary))
-    {
-        return None;
-    }
-    let detail = run.detail.trim();
-    if detail.is_empty() || detail == "done" {
-        return None;
-    }
-    detail
-        .lines()
-        .map(str::trim)
-        .find(|line| !line.is_empty() && *line != "exit: 0")
-        .map(|line| compact_one_line(line, 90))
-}
-
-fn command_success_is_noise(command: &str) -> bool {
-    let first = command.split_whitespace().next().unwrap_or("");
-    matches!(
-        first,
-        "rg" | "grep"
-            | "ack"
-            | "ag"
-            | "cat"
-            | "sed"
-            | "head"
-            | "tail"
-            | "bat"
-            | "ls"
-            | "find"
-            | "fd"
-            | "tree"
-            | "pwd"
-            | "git"
-    )
-}
-
-fn failure_result_preview(run: &ToolRun) -> Option<String> {
-    if let Some((_, preview)) = tool_failure_preview(&[run]) {
-        Some(preview)
-    } else {
-        Some("failed".to_string())
-    }
-}
-
-fn tool_activity_item(
-    run: &ToolRun,
-    selected: bool,
-    animation_tick: u64,
-    width: u16,
-) -> ListItem<'static> {
-    let card = tool_activity_card(run);
-    let (marker, marker_style) = match run.state {
-        ToolRunState::Running => {
-            let frame = animation::ThrobberKind::BrailleOrbit.frame(animation_tick);
-            (frame.symbol.to_string(), tool_label_style())
-        }
-        ToolRunState::Succeeded => ("✓".to_string(), success_style()),
-        ToolRunState::Failed => ("✕".to_string(), error_style()),
-    };
-    let action_style = match run.state {
-        ToolRunState::Running => tool_label_style().add_modifier(Modifier::BOLD),
-        ToolRunState::Succeeded => message_style(ChatRole::Assistant).add_modifier(Modifier::BOLD),
-        ToolRunState::Failed => error_style().add_modifier(Modifier::BOLD),
-    };
-    let target_width = width.saturating_sub(15).max(8) as usize;
-    let preview_width = width.saturating_sub(8).max(8) as usize;
-    let target = compact_tool_target(&card.target, target_width);
-    let branch = if selected { "╞" } else { "├" };
-
-    let mut lines = vec![Line::from(vec![
-        Span::styled(
-            branch,
-            if selected {
-                accent()
-            } else {
-                separator_style()
-            },
-        ),
-        Span::styled("─ ", separator_style()),
-        Span::styled(marker, marker_style),
-        Span::raw(" "),
-        Span::styled(card.action, action_style),
-        Span::styled("(", muted()),
-        Span::styled(target, message_style(ChatRole::Tool)),
-        Span::styled(")", muted()),
-    ])];
-
-    if let Some(result) = card.preview.filter(|preview| !preview.trim().is_empty()) {
-        let result_style = if run.state == ToolRunState::Failed {
-            error_preview_style()
-        } else {
-            muted()
-        };
-        lines.push(Line::from(vec![
-            Span::styled("│  ⎿ ", separator_style()),
-            Span::styled(truncate(&result, preview_width), result_style),
-        ]));
-    }
-    lines.push(Line::from(Span::styled("│", separator_style())));
-
-    ListItem::new(lines).style(Style::default().bg(surface()))
-}
-
-fn tool_activity_list_height(runs: &[ToolRun], width: u16) -> u16 {
-    let mut height = 2;
-    for run in runs {
-        let card = tool_activity_card(run);
-        height += 1;
-        if card.preview.is_some_and(|result| !result.trim().is_empty()) {
-            height += 1;
-        }
-    }
-    height.min(width.saturating_add(height))
-}
-
-fn compact_tool_target(target: &str, max_chars: usize) -> String {
-    let target = compact_one_line(target, max_chars);
-    target
-        .strip_prefix("$ ")
-        .unwrap_or(&target)
-        .trim()
-        .to_string()
 }
 
 fn tool_output_failed(output: &str) -> bool {
@@ -10925,7 +10081,23 @@ fn compact_tool_detail(output: &str) -> String {
         return "done".to_string();
     }
 
-    if output.starts_with("exit: 0")
+    let is_raw_terminal = output.starts_with("exit:")
+        && output
+            .lines()
+            .any(|line| matches!(line.trim(), "stdout:" | "stderr:" | "stdout: <empty>"));
+
+    // Edit/patch diffs and pre-summarized terminal output are already compacted
+    // upstream and their body is the whole point of the expanded view; keep them whole.
+    if !is_raw_terminal
+        && (output.starts_with("edited ")
+            || output.starts_with("patched ")
+            || output.starts_with("exit:"))
+    {
+        return output.to_string();
+    }
+
+    // Raw terminal-format output (background streams): drop section markers.
+    if is_raw_terminal
         || output.starts_with("patched files:")
         || output.starts_with("edited files:")
     {
@@ -10939,7 +10111,7 @@ fn compact_tool_detail(output: &str) -> String {
                     && line != "stdout: <empty>"
             })
             .skip(1)
-            .take(4)
+            .take(40)
             .collect::<Vec<_>>()
             .join("\n")
             .if_empty("done");
@@ -10948,7 +10120,7 @@ fn compact_tool_detail(output: &str) -> String {
     output
         .lines()
         .filter(|line| !line.trim().is_empty())
-        .take(4)
+        .take(40)
         .collect::<Vec<_>>()
         .join("\n")
 }
@@ -11168,6 +10340,16 @@ fn tool_label_style() -> Style {
         .add_modifier(Modifier::BOLD)
 }
 
+/// Marker for finished tool calls — small bullet in the theme's tool accent
+/// (failures override with the error color).
+const TOOL_MARKER: &str = "•";
+
+fn tool_marker_style() -> Style {
+    Style::default()
+        .fg(palette().tool)
+        .add_modifier(Modifier::BOLD)
+}
+
 fn tool_group_label_style() -> Style {
     Style::default()
         .fg(palette().tool)
@@ -11194,8 +10376,11 @@ fn error_preview_style() -> Style {
     Style::default().fg(palette().error)
 }
 
-fn tool_output_border_style() -> Style {
-    Style::default().fg(palette().tool)
+fn tool_output_style(state: ToolRunState) -> Style {
+    match state {
+        ToolRunState::Failed => error_preview_style(),
+        _ => message_style(ChatRole::Tool),
+    }
 }
 
 fn code_border_style() -> Style {
@@ -11411,6 +10596,28 @@ fn permission_detail_lines(selected: PermissionMode, active: PermissionMode) -> 
                 ]),
             ]);
         }
+        PermissionMode::Ask => {
+            lines.extend([
+                Line::from(vec![
+                    Span::styled("terminal  ", muted()),
+                    Span::styled(
+                        "safe reads run freely; other commands pause for approval",
+                        value_style(),
+                    ),
+                ]),
+                Line::from(vec![
+                    Span::styled("edits     ", muted()),
+                    Span::styled("file edits and patches pause for approval", value_style()),
+                ]),
+                Line::from(vec![
+                    Span::styled("grants    ", muted()),
+                    Span::styled(
+                        "'always allow' persists to .medusa/permissions.json",
+                        value_style(),
+                    ),
+                ]),
+            ]);
+        }
         PermissionMode::Guarded => {
             lines.extend([
                 Line::from(vec![
@@ -11447,6 +10654,148 @@ fn permission_detail_lines(selected: PermissionMode, active: PermissionMode) -> 
     lines
 }
 
+fn command_has_shell_tokens(command: &str) -> bool {
+    [
+        "\n", "\r", ";", "&&", "||", "|", "&", ">", "<", "`", "$(", "${",
+    ]
+    .iter()
+    .any(|token| command.contains(token))
+}
+
+/// Hard-wrap a string to at most `width` columns per line (character-based,
+/// no word splitting when a break point exists). Caps the number of lines so a
+/// pathological command can't grow the prompt off-screen.
+fn wrap_str(text: &str, width: usize) -> Vec<String> {
+    const MAX_LINES: usize = 8;
+    let width = width.max(8);
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    let mut count = 0usize;
+    for ch in text.chars() {
+        if count >= width {
+            lines.push(std::mem::take(&mut current));
+            count = 0;
+            if lines.len() == MAX_LINES {
+                current.push('…');
+                break;
+            }
+        }
+        current.push(ch);
+        count += 1;
+    }
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    if lines.is_empty() {
+        lines.push(String::new());
+    }
+    lines
+}
+
+/// Strip leading `VAR=value` assignments so grant matching sees the program.
+fn strip_env_assignments(command: &str) -> &str {
+    let mut rest = command.trim_start();
+    loop {
+        let word_end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+        let word = &rest[..word_end];
+        if word.contains('=') && !word.starts_with('-') && !word.is_empty() {
+            rest = rest[word_end..].trim_start();
+        } else {
+            return rest;
+        }
+    }
+}
+
+fn command_matches_grant(command: &str, prefix: &str) -> bool {
+    command == prefix
+        || command
+            .strip_prefix(prefix)
+            .is_some_and(|rest| rest.starts_with(char::is_whitespace))
+}
+
+/// A session edit grant ending in `/` covers a directory subtree; otherwise it
+/// is an exact file path (so `Cargo.toml` never grants `Cargo.toml.bak`).
+fn edit_grant_matches(grants: &[String], path: &str) -> bool {
+    grants.iter().any(|grant| {
+        if grant.ends_with('/') {
+            path.starts_with(grant.as_str())
+        } else {
+            path == grant
+        }
+    })
+}
+
+/// Derive the allow-prefix persisted by "always allow": program name, plus
+/// the subcommand for multi-command tools, never for compound shell strings.
+fn derive_terminal_grant_prefix(command: &str) -> Option<String> {
+    let command = command.trim();
+    if command.is_empty() || command_has_shell_tokens(command) {
+        return None;
+    }
+
+    let mut words = command
+        .split_whitespace()
+        .skip_while(|word| word.contains('=') && !word.starts_with('-'));
+    let program = words.next()?;
+
+    // Interpreters and shells take arbitrary code as arguments, so a prefix
+    // grant on them ("always allow bash") is a blanket execution grant. These
+    // only ever get allow-once, never a persisted/session prefix.
+    const INTERPRETER_PROGRAMS: &[&str] = &[
+        "sh",
+        "bash",
+        "zsh",
+        "fish",
+        "dash",
+        "ksh",
+        "python",
+        "python3",
+        "python2",
+        "node",
+        "deno",
+        "ruby",
+        "perl",
+        "php",
+        "lua",
+        "Rscript",
+        "osascript",
+        "env",
+        "eval",
+        "exec",
+        "xargs",
+        "nohup",
+        "time",
+        "sudo",
+        "doas",
+        "ssh",
+        "docker",
+        "kubectl",
+    ];
+    if INTERPRETER_PROGRAMS.contains(&program) {
+        return None;
+    }
+
+    const SUBCOMMAND_PROGRAMS: &[&str] = &[
+        "git", "cargo", "npm", "pnpm", "yarn", "bun", "make", "go", "pip", "pip3", "uv", "just",
+    ];
+    if !SUBCOMMAND_PROGRAMS.contains(&program) {
+        return Some(program.to_string());
+    }
+
+    let subcommand = words.next().filter(|word| !word.starts_with('-'));
+    match subcommand {
+        Some("run") => {
+            let script = words.next().filter(|word| !word.starts_with('-'));
+            match script {
+                Some(script) => Some(format!("{program} run {script}")),
+                None => Some(format!("{program} run")),
+            }
+        }
+        Some(sub) => Some(format!("{program} {sub}")),
+        None => Some(program.to_string()),
+    }
+}
+
 fn permission_context_text(mode: PermissionMode) -> &'static str {
     match mode {
         PermissionMode::Open => {
@@ -11454,6 +10803,9 @@ fn permission_context_text(mode: PermissionMode) -> &'static str {
         }
         PermissionMode::Guarded => {
             "Medusa permission mode: guarded. Workspace inspection is available. Terminal commands and file mutations are allowed unless blocked by Medusa's guarded permission policy. Mention guarded mode when a command or edit is blocked."
+        }
+        PermissionMode::Ask => {
+            "Medusa permission mode: ask. Safe inspection commands run freely; mutating terminal commands and file edits pause for the user's interactive approval. If a tool result says it was denied by the user, respect the decision — do not retry the same operation; adjust the approach or ask the user."
         }
         PermissionMode::Readonly => {
             "Medusa permission mode: readonly. Reading, listing, searching, and safe inspection commands are allowed. File mutation tools are unavailable for this turn, and write-like shell commands are blocked by policy. If the user asks for changes, explain that this session is in readonly mode and offer a plan or ask them to switch permissions."
@@ -11497,14 +10849,6 @@ fn transcript_conversation_message(item: &TranscriptItem) -> Option<Conversation
         },
         _ => None,
     }
-}
-
-fn conversation_message_cost(message: &ConversationMessage) -> usize {
-    message
-        .content
-        .chars()
-        .count()
-        .saturating_add(message.attachments.len().saturating_mul(2_000))
 }
 
 fn session_state_context_text(
@@ -12133,24 +11477,6 @@ fn activity_selected_style() -> Style {
     Style::default().bg(palette().activity_bg)
 }
 
-fn activity_scrollbar() -> Scrollbar<'static> {
-    Scrollbar::new(ScrollbarOrientation::VerticalRight)
-        .thumb_symbol("█")
-        .track_symbol(Some("│"))
-        .thumb_style(accent())
-        .track_style(separator_style())
-}
-
-fn panel_block(title: &'static str, focused: bool) -> Block<'static> {
-    let border_style = if focused { accent() } else { separator_style() };
-    Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .title(title)
-        .border_style(border_style)
-        .style(Style::default().bg(surface()).fg(text()))
-}
-
 fn toast_style(kind: ToastKind) -> Style {
     match kind {
         ToastKind::Info => Style::default().fg(palette().info),
@@ -12355,6 +11681,52 @@ mod tests {
     }
 
     #[test]
+    fn alt_enter_also_inserts_newline() {
+        let mut app = app();
+
+        app.input = "one".to_string();
+        app.input_cursor = 3;
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT));
+
+        assert_eq!(app.input, "one\n");
+        assert_eq!(app.input_cursor, 4);
+    }
+
+    #[test]
+    fn up_and_down_move_between_input_lines_keeping_column() {
+        let mut app = app();
+
+        app.input = "first line\nsecond\nthird line".to_string();
+        // Cursor at column 8 of the last line ("third li|ne").
+        app.input_cursor = "first line\nsecond\nthird li".chars().count();
+
+        app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        // "second" has 6 chars; column clamps to its end.
+        assert_eq!(app.input_cursor, "first line\nsecond".chars().count());
+
+        app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(app.input_cursor, 6, "column carries to the longer line");
+
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(app.input_cursor, "first line\nsecond\nthird ".chars().count());
+    }
+
+    #[test]
+    fn home_and_end_are_line_local_in_multiline_input() {
+        let mut app = app();
+
+        app.input = "first\nsecond".to_string();
+        app.input_cursor = "first\nsec".chars().count();
+
+        app.handle_key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE));
+        assert_eq!(app.input_cursor, "first\n".chars().count());
+
+        app.handle_key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE));
+        assert_eq!(app.input_cursor, "first\nsecond".chars().count());
+    }
+
+    #[test]
     fn composer_attachment_preview_has_fixed_height_and_overflow() {
         let attachments = vec![
             image_attachment("one"),
@@ -12441,15 +11813,15 @@ mod tests {
     }
 
     #[test]
-    fn images_command_opens_preview_modal() {
+    fn images_command_is_gone_but_ctrl_o_still_previews() {
         let mut app = app();
         app.pending_attachments.push(image_attachment("clipboard"));
 
         assert!(app.run_local_tool_command("/images"));
+        assert_ne!(app.active_modal, Some(Modal::ImagePreview));
 
+        app.handle_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL));
         assert_eq!(app.active_modal, Some(Modal::ImagePreview));
-        assert_eq!(app.image_preview_index, 0);
-        assert_eq!(app.status_line, "image preview 1/1");
     }
 
     #[test]
@@ -12560,12 +11932,12 @@ mod tests {
         let attachment = image_attachment("screenshot");
         app.pending_attachments.push(attachment.clone());
         app.last_chat_viewport = Some(Rect::new(0, 0, 80, 20));
-        app.last_transcript_rows = vec![
+        let mut rows = vec![
             TranscriptRow::text(Line::from("before image")),
             TranscriptRow::image(Line::from("image placeholder"), attachment),
         ];
-        app.last_transcript_rows
-            .extend((1..CHAT_IMAGE_PREVIEW_HEIGHT).map(|_| TranscriptRow::text(Line::from(""))));
+        rows.extend((1..CHAT_IMAGE_PREVIEW_HEIGHT).map(|_| TranscriptRow::text(Line::from(""))));
+        app.last_transcript_rows = Arc::new(rows);
 
         app.handle_mouse(MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
@@ -12769,13 +12141,13 @@ mod tests {
             Some("system")
         );
         assert!(messages[1].content.contains("Medusa rolling session state"));
-        assert!(messages[1].content.contains("older messages summarized"));
         assert!(messages[1].content.contains("old task 39"));
+        // Full history flows through; the ContextEngine compacts at turn
+        // start only when the token budget requires it.
         assert!(
-            !messages
+            messages
                 .iter()
-                .skip(2)
-                .any(|message| { message.role == "user" && message.content == "old task 0" })
+                .any(|message| message.role == "user" && message.content == "old task 0")
         );
         assert!(
             messages
@@ -12810,12 +12182,6 @@ mod tests {
                 .content
                 .contains("preference: I prefer concise answers")
         );
-        assert!(
-            !messages
-                .iter()
-                .skip(2)
-                .any(|message| { message.content.contains("I prefer concise answers") })
-        );
     }
 
     #[test]
@@ -12830,6 +12196,7 @@ mod tests {
             state: ToolRunState::Succeeded,
             detail: "also touched README.md".to_string(),
             expanded: false,
+            group_expanded: false,
         }));
 
         let messages = app.conversation_history();
@@ -12876,7 +12243,38 @@ mod tests {
         app.input_cursor = 3;
 
         let matches = app.slash_matches();
-        assert!(matches.iter().any(|command| command.name == "/settings"));
+        assert!(
+            matches
+                .iter()
+                .any(|(command, _)| command.name == "/settings")
+        );
+    }
+
+    #[test]
+    fn fuzzy_subsequence_matches_commands() {
+        let mut app = app();
+
+        app.input = "/wf".to_string();
+        app.input_cursor = 3;
+
+        let matches = app.slash_matches();
+        let workflow = matches
+            .iter()
+            .find(|(command, _)| command.name == "/workflow")
+            .expect("fuzzy match for /workflow");
+        assert_eq!(workflow.1, vec![0, 4]);
+    }
+
+    #[test]
+    fn enter_on_fully_typed_command_runs_it_directly() {
+        let mut app = app();
+
+        app.input = "/help".to_string();
+        app.input_cursor = app.input_len();
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert_eq!(app.active_modal, Some(Modal::Help));
+        assert!(app.input.is_empty());
     }
 
     #[test]
@@ -12887,7 +12285,7 @@ mod tests {
         app.input_cursor = 3;
 
         let matches = app.slash_matches();
-        assert!(matches.iter().any(|command| command.name == "/fork"));
+        assert!(matches.iter().any(|(command, _)| command.name == "/fork"));
     }
 
     #[test]
@@ -12898,7 +12296,7 @@ mod tests {
         app.input_cursor = 3;
 
         let matches = app.slash_matches();
-        assert!(matches.iter().any(|command| command.name == "/resume"));
+        assert!(matches.iter().any(|(command, _)| command.name == "/resume"));
     }
 
     #[test]
@@ -12909,7 +12307,7 @@ mod tests {
         app.input_cursor = 3;
 
         let matches = app.slash_matches();
-        assert!(matches.iter().any(|command| command.name == "/tree"));
+        assert!(matches.iter().any(|(command, _)| command.name == "/tree"));
     }
 
     #[test]
@@ -12920,7 +12318,7 @@ mod tests {
         app.input_cursor = 3;
 
         let matches = app.slash_matches();
-        assert!(matches.iter().any(|command| command.name == "/skills"));
+        assert!(matches.iter().any(|(command, _)| command.name == "/skills"));
     }
 
     #[test]
@@ -12931,24 +12329,32 @@ mod tests {
         app.input_cursor = app.input_len();
 
         let matches = app.slash_matches();
-        assert!(matches.iter().any(|command| command.name == "/workflow"));
-        assert!(matches.iter().any(|command| command.name == "/workflows"));
+        assert!(
+            matches
+                .iter()
+                .any(|(command, _)| command.name == "/workflow")
+        );
+        assert!(
+            matches
+                .iter()
+                .any(|(command, _)| command.name == "/workflows")
+        );
     }
 
     #[test]
     fn slash_search_matches_description_and_category() {
         let mut app = app();
 
-        app.input = "/browse".to_string();
+        app.input = "/switch".to_string();
         app.input_cursor = app.input_len();
 
         let matches = app.slash_matches();
-        assert!(matches.iter().any(|command| command.name == "/themes"));
+        assert!(matches.iter().any(|(command, _)| command.name == "/theme"));
 
         app.input = "/session".to_string();
         app.input_cursor = app.input_len();
         let matches = app.slash_matches();
-        assert!(matches.iter().any(|command| command.name == "/resume"));
+        assert!(matches.iter().any(|(command, _)| command.name == "/resume"));
     }
 
     #[test]
@@ -13072,7 +12478,7 @@ mod tests {
     fn themes_command_opens_theme_modal() {
         let mut app = app();
 
-        app.input = "/themes".to_string();
+        app.input = "/theme".to_string();
         app.input_cursor = app.input_len();
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
 
@@ -13140,6 +12546,7 @@ mod tests {
                 state: ToolRunState::Succeeded,
                 detail: "done".to_string(),
                 expanded: false,
+                group_expanded: false,
             }),
         ];
         app.attachment_previews.insert(
@@ -13169,7 +12576,7 @@ mod tests {
             Some(ThemeKind::MaterialAmber)
         );
         assert!(first_span_fg_containing(&updated, "›").is_some());
-        assert!(first_span_fg_containing(&updated, "tools").is_some());
+        assert!(first_span_fg_containing(&updated, "terminal").is_some());
     }
 
     #[test]
@@ -13228,8 +12635,8 @@ mod tests {
         assert_eq!(app.theme, ThemeKind::Medusa);
 
         assert!(app.run_local_tool_command("/theme previous"));
-        assert_eq!(app.theme, ThemeKind::MaterialRose);
-        assert_eq!(app.status_line, "theme: material-rose");
+        assert_eq!(app.theme, ThemeKind::Vesper);
+        assert_eq!(app.status_line, "theme: vesper");
     }
 
     #[test]
@@ -13241,7 +12648,7 @@ mod tests {
         let names = app
             .slash_matches()
             .into_iter()
-            .map(|command| command.name)
+            .map(|(command, _)| command.name)
             .collect::<Vec<_>>();
 
         assert!(names.contains(&"/theme material-dark"));
@@ -13373,14 +12780,17 @@ mod tests {
     }
 
     #[test]
-    fn status_command_updates_visible_state() {
+    fn plan_mode_badge_shows_in_composer_title() {
         let mut app = app();
 
-        app.input = "/status reading repo".to_string();
-        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-
-        assert_eq!(app.status_line, "reading repo");
-        assert!(app.transcript.is_empty());
+        app.plan_mode = true;
+        let title = app.input_title_content();
+        let text = title
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        assert!(text.contains(" plan "));
     }
 
     #[test]
@@ -13410,6 +12820,7 @@ mod tests {
             agent_index: 0,
             name: "mapper".to_string(),
             role: "mapper".to_string(),
+            tool_policy: SubagentToolPolicy::ShellRead,
         });
         app.apply_workflow_event(WorkflowEvent::AgentFinished {
             run_id: "workflow-test".to_string(),
@@ -13439,6 +12850,56 @@ mod tests {
             Some(TranscriptItem::Message(ChatMessage { role: ChatRole::Assistant, content, .. }))
                 if content == "workflow completed"
         ));
+    }
+
+    #[test]
+    fn script_workflow_events_append_dynamic_phases_and_agents() {
+        let mut app = app();
+
+        app.apply_workflow_event(WorkflowEvent::RunStarted {
+            run_id: "script-test".to_string(),
+            title: "script:bug-hunt".to_string(),
+            task: "bug-hunt".to_string(),
+            phases: Vec::new(),
+        });
+        app.apply_workflow_event(WorkflowEvent::PhaseStarted {
+            run_id: "script-test".to_string(),
+            phase_index: 0,
+            name: "find round 1".to_string(),
+            agent_count: 0,
+        });
+        app.apply_workflow_event(WorkflowEvent::AgentStarted {
+            run_id: "script-test".to_string(),
+            phase_index: 0,
+            agent_index: 1,
+            name: "finder-2".to_string(),
+            role: "finder-2".to_string(),
+            tool_policy: SubagentToolPolicy::ShellRead,
+        });
+        app.apply_workflow_event(WorkflowEvent::AgentFinished {
+            run_id: "script-test".to_string(),
+            phase_index: 0,
+            agent_index: 1,
+            name: "finder-2".to_string(),
+            status: WorkflowStatus::Succeeded,
+            output: "no bugs".to_string(),
+            tool_counts: BTreeMap::new(),
+        });
+        app.apply_workflow_event(WorkflowEvent::Log {
+            run_id: "script-test".to_string(),
+            message: "round 1: nothing new".to_string(),
+        });
+
+        let workflow = &app.workflows[0];
+        assert_eq!(workflow.phases.len(), 1);
+        assert_eq!(workflow.phases[0].name, "find round 1");
+        assert_eq!(workflow.phases[0].agents.len(), 2);
+        assert_eq!(workflow.phases[0].agents[1].name, "finder-2");
+        assert_eq!(
+            workflow.phases[0].agents[1].status,
+            WorkflowViewState::Succeeded
+        );
+        assert!(app.status_line.contains("round 1: nothing new"));
     }
 
     #[test]
@@ -13621,13 +13082,18 @@ mod tests {
         let lines = visible_transcript_lines(&transcript, None, None);
         let text = lines.iter().map(line_text).collect::<Vec<_>>();
 
-        assert!(text.iter().any(|line| line.contains("____")));
+        // Wordmark is width-adaptive: wide ansi-shadow or compact fallback.
         assert!(
             text.iter()
-                .any(|line| line.contains("terminal-native coding harness"))
+                .any(|line| line.contains("███╗") || line.contains("█▀▄▀█"))
         );
-        assert!(text.iter().any(|line| line.contains("/settings")));
+        assert!(
+            text.iter()
+                .any(|line| line.contains("plans, edits, and verifies"))
+        );
+        assert!(text.iter().any(|line| line.contains("shift+tab")));
         assert!(text.iter().any(|line| line.contains("ctrl+p")));
+        assert!(text.iter().any(|line| line.contains("esc esc")));
     }
 
     #[test]
@@ -13641,7 +13107,7 @@ mod tests {
 
         assert!(
             text.iter()
-                .any(|line| line.contains("terminal-native coding harness"))
+                .any(|line| line.contains("plans, edits, and verifies"))
         );
         assert!(text.iter().any(|line| line.contains("› hi")));
     }
@@ -14237,6 +13703,48 @@ mod tests {
     }
 
     #[test]
+    fn ansi_escape_codes_render_as_colored_spans() {
+        let spans = ansi_detail_spans("\u{1b}[31merror\u{1b}[0m: something broke", muted());
+        assert!(spans.len() >= 2);
+        assert_eq!(spans[0].content.as_ref(), "error");
+        assert_eq!(spans[0].style.fg, Some(Color::Red));
+        // Unstyled remainder falls back to the muted body style.
+        assert_eq!(spans.last().unwrap().style, muted());
+    }
+
+    #[test]
+    fn rust_code_blocks_get_syntax_highlighting() {
+        let lines = markdown_content_lines(
+            "```rust\nfn main() { let x = \"hi\"; }\n```",
+            ChatRole::Assistant,
+        );
+        assert_eq!(lines.len(), 1);
+        // Border span + several differently-styled token spans.
+        assert!(
+            lines[0].spans.len() > 3,
+            "expected token-level spans, got {:?}",
+            lines[0].spans
+        );
+        let distinct_colors = lines[0]
+            .spans
+            .iter()
+            .skip(1)
+            .filter_map(|span| span.style.fg)
+            .collect::<std::collections::HashSet<_>>();
+        assert!(distinct_colors.len() > 1, "expected multiple token colors");
+    }
+
+    #[test]
+    fn unknown_language_code_blocks_fall_back_to_plain_style() {
+        let lines = markdown_content_lines(
+            "```notalanguage\nsome text\n```",
+            ChatRole::Assistant,
+        );
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].spans.len(), 2);
+    }
+
+    #[test]
     fn markdown_content_lines_formats_common_blocks() {
         let content = "# Title\n\n- item `code`\n```rust\nfn main() {}\n```\n> quote";
 
@@ -14269,12 +13777,6 @@ mod tests {
         let mut app = app();
 
         app.push_tool_start("terminal.exec".to_string(), "$ cargo test".to_string());
-        for run in &mut app.activity_tools {
-            run.started_at = run
-                .started_at
-                .checked_sub(MIN_TOOL_PULSE_VISIBLE)
-                .unwrap_or(run.started_at);
-        }
         for item in &mut app.transcript {
             if let TranscriptItem::Tool(run) = item {
                 run.started_at = run
@@ -14292,41 +13794,388 @@ mod tests {
         assert_eq!(inline_run.name, "terminal.exec");
         assert_eq!(inline_run.state, ToolRunState::Succeeded);
         assert_eq!(inline_run.detail, "ok");
-        assert_eq!(app.activity_tools.len(), 1);
-        let run = &app.activity_tools[0];
-        assert_eq!(run.name, "terminal.exec");
-        assert_eq!(run.state, ToolRunState::Succeeded);
-        assert_eq!(run.detail, "ok");
-        assert_eq!(app.activity_phase, ToolActivityPhase::CurrentTurn);
     }
 
     #[test]
-    fn ctrl_a_opens_activity_modal() {
+    fn plan_command_toggles_plan_mode() {
         let mut app = app();
-
-        app.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL));
-
-        assert_eq!(app.active_modal, Some(Modal::Activity));
-        assert_eq!(app.status_line, "activity opened");
-    }
-
-    #[test]
-    fn plan_command_opens_tabbed_plan_modal() {
-        let mut app = app();
+        assert!(!app.plan_mode);
 
         assert!(app.run_local_tool_command("/plan"));
-        assert_eq!(app.active_modal, Some(Modal::Plan));
-        assert_eq!(app.plan_tab, PlanTab::Plan);
+        assert!(app.plan_mode);
+        assert!(app.status_line.contains("plan mode on"));
+        let history = app.conversation_history();
+        assert!(
+            history.iter().any(|message| message.role == "system"
+                && message.content.contains("Plan mode is active"))
+        );
 
-        app.handle_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE));
-        assert_eq!(app.plan_tab, PlanTab::History);
-
-        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
-        assert_eq!(app.active_modal, None);
+        assert!(app.run_local_tool_command("/plan"));
+        assert!(!app.plan_mode);
+        assert!(
+            !app.conversation_history()
+                .iter()
+                .any(|message| message.content.contains("Plan mode is active"))
+        );
     }
 
     #[test]
-    fn plan_update_output_renders_inline_checklist() {
+    fn shift_tab_toggles_plan_mode_in_composer() {
+        let mut app = app();
+
+        app.handle_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT));
+        assert!(app.plan_mode);
+
+        app.handle_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT));
+        assert!(!app.plan_mode);
+    }
+
+    #[test]
+    fn single_escape_never_quits_idle_composer() {
+        let mut app = app();
+
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+
+        assert!(!app.should_quit);
+        assert_eq!(app.status_line, "press esc again to quit");
+    }
+
+    #[test]
+    fn double_escape_quits_within_window() {
+        let mut app = app();
+
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+
+        assert!(app.should_quit);
+    }
+
+    #[test]
+    fn stale_escape_does_not_count_toward_quit() {
+        let mut app = app();
+
+        app.last_escape_at = Instant::now().checked_sub(DOUBLE_ESCAPE_WINDOW * 2);
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+
+        assert!(!app.should_quit);
+        assert_eq!(app.status_line, "press esc again to quit");
+    }
+
+    #[test]
+    fn escape_clears_input_before_arming_quit() {
+        let mut app = app();
+        app.input = "half-typed task".to_string();
+        app.input_cursor = app.input_len();
+
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(!app.should_quit);
+        assert!(app.input.is_empty());
+        assert_eq!(app.status_line, "input cleared");
+
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(!app.should_quit);
+    }
+
+    #[test]
+    fn escape_exits_plan_mode_before_arming_quit() {
+        let mut app = app();
+        app.plan_mode = true;
+
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(!app.plan_mode);
+        assert!(!app.should_quit);
+        assert!(app.status_line.contains("plan mode off"));
+
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(!app.should_quit);
+        assert_eq!(app.status_line, "press esc again to quit");
+    }
+
+    #[test]
+    fn escape_deselects_tool_before_arming_quit() {
+        let mut app = app();
+        app.transcript.push(TranscriptItem::Tool(ToolRun {
+            id: None,
+            started_at: Instant::now(),
+            pending_result: None,
+            name: "terminal.exec".to_string(),
+            summary: "$ ls".to_string(),
+            state: ToolRunState::Succeeded,
+            detail: "done".to_string(),
+            expanded: true,
+            group_expanded: false,
+        }));
+        app.selected_tool = Some(0);
+
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+
+        assert!(!app.should_quit);
+        assert_eq!(app.selected_tool, None);
+    }
+
+    fn queue_approval(app: &mut App, command: &str) -> mpsc::Receiver<ApprovalDecision> {
+        let (respond, decision) = mpsc::channel();
+        app.approval_queue.push_back(PendingApproval {
+            request: ApprovalRequest {
+                tool: ApprovalTool::TerminalExec,
+                command: Some(command.to_string()),
+                paths: Vec::new(),
+                background: false,
+            },
+            respond,
+        });
+        // Pretend the prompt has been visible past the grace window so the
+        // decision keys act immediately in tests.
+        app.approval_shown_at = Instant::now().checked_sub(APPROVAL_KEY_GRACE * 2);
+        decision
+    }
+
+    #[test]
+    fn approval_keys_resolve_and_unblock_worker() {
+        let mut app = app();
+        let decision = queue_approval(&mut app, "cargo build");
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+
+        assert_eq!(decision.try_recv().unwrap(), ApprovalDecision::AllowOnce);
+        assert!(app.approval_queue.is_empty());
+        assert_eq!(app.status_line, "approved once");
+    }
+
+    #[test]
+    fn approval_deny_remembers_command_for_turn() {
+        let mut app = app();
+        let first = queue_approval(&mut app, "touch scary.txt");
+        app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE));
+        assert_eq!(first.try_recv().unwrap(), ApprovalDecision::Deny);
+
+        // A verbatim retry auto-denies without prompting.
+        assert_eq!(
+            app.auto_approval_decision(&ApprovalRequest {
+                tool: ApprovalTool::TerminalExec,
+                command: Some("touch scary.txt".to_string()),
+                paths: Vec::new(),
+                background: false,
+            }),
+            Some(ApprovalDecision::Deny)
+        );
+    }
+
+    #[test]
+    fn escape_denies_pending_approval_without_quitting() {
+        let mut app = app();
+        let decision = queue_approval(&mut app, "cargo build");
+
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+
+        assert_eq!(decision.try_recv().unwrap(), ApprovalDecision::Deny);
+        assert!(!app.should_quit);
+
+        // The armed-quit state was reset: next Esc only arms.
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(!app.should_quit);
+    }
+
+    #[test]
+    fn always_allow_settles_queued_siblings_and_persists() {
+        let (mut app, workspace) = app_in_workspace();
+        let first = queue_approval(&mut app, "cargo test -p medusa-core");
+        let sibling = queue_approval(&mut app, "cargo test -p medusa-tui");
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
+
+        assert_eq!(first.try_recv().unwrap(), ApprovalDecision::AlwaysAllow);
+        // The sibling with the same derived prefix resolved without a prompt.
+        assert_eq!(sibling.try_recv().unwrap(), ApprovalDecision::AllowOnce);
+        assert!(app.approval_queue.is_empty());
+
+        let persisted = fs::read_to_string(workspace.join(".medusa/permissions.json")).unwrap();
+        assert!(persisted.contains("cargo test"));
+    }
+
+    #[test]
+    fn approval_keys_do_not_leak_into_composer() {
+        let mut app = app();
+        let _decision = queue_approval(&mut app, "cargo build");
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        assert!(app.input.is_empty(), "keys must not reach the composer");
+        assert_eq!(app.approval_queue.len(), 1);
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+        assert!(app.input.is_empty());
+        assert!(app.approval_queue.is_empty());
+    }
+
+    #[test]
+    fn approval_keys_are_ignored_during_grace_window() {
+        let mut app = app();
+        let (respond, decision) = mpsc::channel();
+        app.approval_queue.push_back(PendingApproval {
+            request: ApprovalRequest {
+                tool: ApprovalTool::TerminalExec,
+                command: Some("cargo build".to_string()),
+                paths: Vec::new(),
+                background: false,
+            },
+            respond,
+        });
+        app.approval_shown_at = Some(Instant::now());
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+        assert!(decision.try_recv().is_err());
+        assert_eq!(app.approval_queue.len(), 1);
+
+        app.approval_shown_at = Instant::now().checked_sub(APPROVAL_KEY_GRACE * 2);
+        app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+        assert_eq!(decision.try_recv().unwrap(), ApprovalDecision::AllowOnce);
+    }
+
+    #[test]
+    fn ctrl_modified_keys_never_decide_an_approval() {
+        let mut app = app();
+        let decision = queue_approval(&mut app, "cargo build");
+
+        // Ctrl+A (readline home) must not trigger AlwaysAllow.
+        app.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL));
+        assert!(decision.try_recv().is_err());
+        assert_eq!(app.approval_queue.len(), 1);
+
+        // Plain 'a' still works.
+        app.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
+        assert_eq!(decision.try_recv().unwrap(), ApprovalDecision::AlwaysAllow);
+    }
+
+    #[test]
+    fn env_prefixed_commands_settle_against_grants() {
+        let mut app = app();
+        app.session_terminal_grants.push("cargo build".to_string());
+
+        assert_eq!(
+            app.auto_approval_decision(&ApprovalRequest {
+                tool: ApprovalTool::TerminalExec,
+                command: Some("FOO=bar cargo build --release".to_string()),
+                paths: Vec::new(),
+                background: false,
+            }),
+            Some(ApprovalDecision::AllowOnce)
+        );
+    }
+
+    #[test]
+    fn edit_grants_do_not_leak_to_prefix_siblings() {
+        let mut app = app();
+        app.session_edit_grants.push("Cargo.toml".to_string());
+        app.session_edit_grants.push("src/".to_string());
+
+        let granted = |app: &App, p: &str| {
+            app.auto_approval_decision(&ApprovalRequest {
+                tool: ApprovalTool::FileEdit,
+                command: None,
+                paths: vec![p.to_string()],
+                background: false,
+            }) == Some(ApprovalDecision::AllowOnce)
+        };
+
+        assert!(granted(&app, "Cargo.toml"));
+        assert!(!granted(&app, "Cargo.toml.bak")); // exact-match, no leak
+        assert!(granted(&app, "src/main.rs")); // dir subtree
+        assert!(!granted(&app, "src-evil/x.rs"));
+    }
+
+    #[test]
+    fn denied_edits_are_remembered_for_the_turn() {
+        let mut app = app();
+        let (respond, _decision) = mpsc::channel();
+        app.approval_queue.push_back(PendingApproval {
+            request: ApprovalRequest {
+                tool: ApprovalTool::FileEdit,
+                command: None,
+                paths: vec!["src/secret.rs".to_string()],
+                background: false,
+            },
+            respond,
+        });
+        app.approval_shown_at = Instant::now().checked_sub(APPROVAL_KEY_GRACE * 2);
+        app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE));
+
+        // A retry of the same edit auto-denies instead of re-prompting.
+        assert_eq!(
+            app.auto_approval_decision(&ApprovalRequest {
+                tool: ApprovalTool::FileEdit,
+                command: None,
+                paths: vec!["src/secret.rs".to_string()],
+                background: false,
+            }),
+            Some(ApprovalDecision::Deny)
+        );
+    }
+
+    #[test]
+    fn long_commands_wrap_instead_of_hiding_their_tail() {
+        let long = format!("echo {} && rm -rf important", "x".repeat(200));
+        let lines = wrap_str(&long, 40);
+        assert!(lines.len() > 1);
+        // The destructive tail is present somewhere in the wrapped output.
+        assert!(lines.iter().any(|line| line.contains("rm -rf important")));
+    }
+
+    #[test]
+    fn interpreter_grants_are_never_persisted() {
+        for command in [
+            "bash scripts/lint.sh",
+            "python gen.py",
+            "sudo rm x",
+            "env FOO=1 python evil.py",
+            "xargs rm",
+        ] {
+            assert_eq!(
+                derive_terminal_grant_prefix(command),
+                None,
+                "`{command}` must not yield a persistable grant prefix"
+            );
+        }
+    }
+
+    #[test]
+    fn terminal_grant_prefixes_are_derived_conservatively() {
+        assert_eq!(
+            derive_terminal_grant_prefix("cargo test -p medusa-core"),
+            Some("cargo test".to_string())
+        );
+        assert_eq!(
+            derive_terminal_grant_prefix("npm run build --watch"),
+            Some("npm run build".to_string())
+        );
+        assert_eq!(
+            derive_terminal_grant_prefix("rustfmt src/main.rs"),
+            Some("rustfmt".to_string())
+        );
+        assert_eq!(
+            derive_terminal_grant_prefix("FOO=bar cargo build"),
+            Some("cargo build".to_string())
+        );
+        assert_eq!(derive_terminal_grant_prefix("cargo test && rm -rf /"), None);
+        assert_eq!(derive_terminal_grant_prefix("echo hi | sh"), None);
+        assert_eq!(derive_terminal_grant_prefix(""), None);
+    }
+
+    #[test]
+    fn removed_viewer_commands_report_unknown() {
+        let mut app = app();
+
+        for command in ["/images", "/themes", "/demo", "/recap"] {
+            assert!(app.run_local_tool_command(command));
+        }
+        assert!(matches!(
+            app.transcript.last(),
+            Some(TranscriptItem::Message(ChatMessage { content, .. }))
+                if content.contains("unknown command: /recap")
+        ));
+    }
+
+    #[test]
+    fn plan_updates_render_in_strip_not_transcript() {
         let mut app = app();
         app.apply_plan_update_output(
             r#"{"summary":"Ship plan UI","items":[{"text":"Inspect current renderer","status":"done","evidence":["main.rs"]},{"text":"Render plan rows","status":"active"},{"text":"Run tests","status":"pending"}]}"#,
@@ -14337,14 +14186,63 @@ mod tests {
             panic!("expected current plan");
         };
         assert_eq!(plan.summary, "Ship plan UI");
-        assert_eq!(plan.items.len(), 3);
         assert_eq!(plan.items[1].status, PlanItemStatus::Active);
 
+        // Not in the chat transcript…
         let lines = visible_transcript_lines(&app.transcript, None, None);
         let text = lines.iter().map(line_text).collect::<Vec<_>>();
-        assert!(text.iter().any(|line| line.contains("plan")));
-        assert!(text.iter().any(|line| line.contains("3 steps")));
-        assert!(text.iter().any(|line| line.contains("Render plan rows")));
+        assert!(!text.iter().any(|line| line.contains("Render plan rows")));
+
+        // …but in the strip above the composer.
+        let strip = plan_strip_lines(app.plan_strip().expect("strip visible"))
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>();
+        assert!(strip[0].contains("plan · 1/3"));
+        assert!(strip[0].contains("Ship plan UI"));
+        assert!(strip.iter().any(|line| line.contains("Render plan rows")));
+        assert!(app.plan_strip_height(40) > 0);
+    }
+
+    #[test]
+    fn completed_plan_leaves_the_strip() {
+        let mut app = app();
+        app.apply_plan_update_output(
+            r#"{"summary":"Done","items":[{"text":"one","status":"done"},{"text":"two","status":"done"}]}"#,
+        )
+        .unwrap();
+
+        assert!(app.plan_strip().is_none());
+        assert_eq!(app.plan_strip_height(40), 0);
+    }
+
+    #[test]
+    fn long_plan_strip_folds_completed_prefix_and_tail() {
+        let mut app = app();
+        let items = (1..=12)
+            .map(|index| {
+                let status = if index <= 4 {
+                    "done"
+                } else if index == 5 {
+                    "active"
+                } else {
+                    "pending"
+                };
+                format!(r#"{{"text":"step {index}","status":"{status}"}}"#)
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        app.apply_plan_update_output(&format!(r#"{{"summary":"Big","items":[{items}]}}"#))
+            .unwrap();
+
+        let strip = plan_strip_lines(app.plan_strip().expect("strip visible"))
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>();
+        assert!(strip.iter().any(|line| line.contains("✓ 4 done")));
+        assert!(strip.iter().any(|line| line.contains("step 5")));
+        assert!(!strip.iter().any(|line| line.contains("step 1 ")));
+        assert!(strip.last().unwrap().contains("… "), "tail folds: {strip:?}");
     }
 
     #[test]
@@ -14366,20 +14264,16 @@ mod tests {
         };
         assert_eq!(plan.summary, "Second");
         assert_eq!(plan.items[0].status, PlanItemStatus::Done);
-
-        let evidence_lines = plan_evidence_lines(Some(plan))
-            .iter()
-            .map(line_text)
-            .collect::<Vec<_>>();
         assert!(
-            evidence_lines
+            plan.items[1]
+                .evidence
                 .iter()
                 .any(|line| line.contains("cargo check"))
         );
     }
 
     #[test]
-    fn decision_request_output_renders_inline_and_in_planning_rail() {
+    fn decision_request_output_renders_inline() {
         let mut app = app();
 
         app.apply_decision_request_output(
@@ -14402,15 +14296,8 @@ mod tests {
             text.iter()
                 .any(|line| line.contains("Where should plans live?"))
         );
-
-        let rail = planning_rail_lines(&app, 42, 30)
-            .iter()
-            .map(line_text)
-            .collect::<Vec<_>>();
-        assert!(rail.iter().any(|line| line.contains("Planning")));
-        assert!(rail.iter().any(|line| line.contains("Decisions")));
-        assert!(rail.iter().any(|line| line.contains("Choose storage")));
-        assert!(rail.iter().any(|line| line.contains("transcript")));
+        assert!(text.iter().any(|line| line.contains("Choose storage")));
+        assert!(text.iter().any(|line| line.contains("transcript")));
     }
 
     #[test]
@@ -14499,20 +14386,6 @@ mod tests {
     }
 
     #[test]
-    fn planning_rail_visibility_requires_width_and_state() {
-        let mut app = app();
-        assert!(!app.planning_rail_visible(Rect::new(0, 0, 120, 40)));
-
-        app.apply_plan_update_output(
-            r#"{"summary":"Plan","items":[{"text":"one","status":"active"}]}"#,
-        )
-        .unwrap();
-
-        assert!(app.planning_rail_visible(Rect::new(0, 0, 120, 40)));
-        assert!(!app.planning_rail_visible(Rect::new(0, 0, 80, 40)));
-    }
-
-    #[test]
     fn tool_output_failure_detects_nonzero_exit() {
         assert!(!tool_output_failed("exit: 0\nstdout:\nok"));
         assert!(tool_output_failed("exit: 101\nstderr:\nfailed"));
@@ -14530,14 +14403,13 @@ mod tests {
             state: ToolRunState::Running,
             detail: String::new(),
             expanded: false,
+            group_expanded: false,
         })];
 
         let lines = visible_transcript_lines(&transcript, None, None);
         let text = lines.iter().map(line_text).collect::<Vec<_>>();
 
-        assert_eq!(lines.len(), 3);
-        assert!(text[0].contains("tools"));
-        assert!(text[0].contains("1 call"));
+        assert!(text[0].contains("patch apply patch"));
         assert!(
             text[0].contains("⠁")
                 || text[0].contains("⠃")
@@ -14546,15 +14418,7 @@ mod tests {
                 || text[0].contains("⠷")
                 || text[0].contains("⠿")
         );
-        assert!(
-            text[1].contains("edited 1 file")
-                && (text[1].contains("⠁")
-                    || text[1].contains("⠃")
-                    || text[1].contains("⠇")
-                    || text[1].contains("⠧")
-                    || text[1].contains("⠷")
-                    || text[1].contains("⠿"))
-        );
+        assert!(text[1].contains("⎿ running…"));
     }
 
     #[test]
@@ -14568,12 +14432,18 @@ mod tests {
             state: ToolRunState::Running,
             detail: String::new(),
             expanded: false,
+            group_expanded: false,
         };
 
         let mut first = Vec::new();
-        append_compact_tool_call_lines(&mut first, &run, RenderContext { animation_tick: 0 });
+        append_tool_call_lines(&mut first, &run, false, RenderContext { animation_tick: 0, ..Default::default() });
         let mut second = Vec::new();
-        append_compact_tool_call_lines(&mut second, &run, RenderContext { animation_tick: 12 });
+        append_tool_call_lines(
+            &mut second,
+            &run,
+            false,
+            RenderContext { animation_tick: 12, ..Default::default() },
+        );
 
         let first_text = first.iter().map(line_text).collect::<Vec<_>>();
         let second_text = second.iter().map(line_text).collect::<Vec<_>>();
@@ -14586,62 +14456,116 @@ mod tests {
     }
 
     #[test]
-    fn tool_group_subtree_items_aggregate_related_calls() {
-        let read_one = ToolRun {
-            id: None,
-            started_at: Instant::now(),
-            pending_result: None,
-            name: "terminal.exec".to_string(),
-            summary: "$ sed -n '1,80p' README.md".to_string(),
-            state: ToolRunState::Succeeded,
-            detail: "done".to_string(),
-            expanded: false,
-        };
-        let read_two = ToolRun {
+    fn tool_calls_render_one_block_per_call() {
+        let read = ToolRun {
             id: None,
             started_at: Instant::now(),
             pending_result: None,
             name: "file.read".to_string(),
             summary: "crates/medusa-tui/src/main.rs".to_string(),
             state: ToolRunState::Succeeded,
-            detail: "read 20 lines".to_string(),
+            detail: "read 1 • crates/medusa-tui/src/main.rs".to_string(),
             expanded: false,
+            group_expanded: false,
         };
-        let edit = ToolRun {
+        let failed_patch = ToolRun {
             id: None,
             started_at: Instant::now(),
             pending_result: None,
             name: "file.patch".to_string(),
             summary: "apply patch".to_string(),
             state: ToolRunState::Failed,
-            detail: "error: patch rejected".to_string(),
+            detail: "error: patch rejected\ncontext mismatch at line 4".to_string(),
             expanded: false,
+            group_expanded: false,
         };
-        let runs = vec![&read_one, &read_two, &edit];
+        let transcript = vec![
+            TranscriptItem::Tool(read),
+            TranscriptItem::Tool(failed_patch),
+        ];
 
-        let items = tool_group_subtree_items(&runs);
+        let mut lines = Vec::new();
+        append_tool_group_lines(
+            &mut lines,
+            &transcript,
+            0,
+            transcript.len(),
+            None,
+            RenderContext::static_view(),
+        );
+        let text = lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
 
-        assert_eq!(items.len(), 2);
-        assert_eq!(items[0].summary(), "read 2 files");
-        assert_eq!(items[1].summary(), "edited 1 file");
-        assert_eq!(items[1].state, ToolRunState::Failed);
+        assert!(text.contains("• read crates/medusa-tui/src/main.rs"));
+        assert!(text.contains("⎿ read 1 • crates/medusa-tui/src/main.rs"));
+        assert!(text.contains("• patch apply patch"));
+        assert!(text.contains("⎿ error: patch rejected"));
+        assert!(text.contains("context mismatch at line 4"));
     }
 
     #[test]
-    fn activity_detail_tabs_cycle_and_scroll() {
-        let mut app = app();
+    fn collapsed_tool_output_shows_expand_hint() {
+        let noisy = ToolRun {
+            id: None,
+            started_at: Instant::now(),
+            pending_result: None,
+            name: "terminal.exec".to_string(),
+            summary: "$ cargo test".to_string(),
+            state: ToolRunState::Succeeded,
+            detail: (1..=6)
+                .map(|index| format!("output line {index}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            expanded: false,
+            group_expanded: false,
+        };
 
-        assert_eq!(app.activity_detail_tab, ToolDetailTab::Summary);
+        let mut lines = Vec::new();
+        append_tool_call_lines(&mut lines, &noisy, false, RenderContext::static_view());
+        let text = lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
 
-        app.next_activity_detail_tab();
-        assert_eq!(app.activity_detail_tab, ToolDetailTab::Output);
+        assert!(text.contains("⎿ output line 1"));
+        assert!(!text.contains("output line 2"));
+        assert!(text.contains("+5 lines (enter to expand)"));
 
-        app.scroll_activity_detail_by(8);
-        assert_eq!(app.activity_detail_scroll, 8);
-
-        app.previous_activity_detail_tab();
-        assert_eq!(app.activity_detail_tab, ToolDetailTab::Summary);
-        assert_eq!(app.activity_detail_scroll, 0);
+        let mut expanded_run = noisy;
+        expanded_run.expanded = true;
+        let mut expanded_lines = Vec::new();
+        append_tool_call_lines(
+            &mut expanded_lines,
+            &expanded_run,
+            false,
+            RenderContext::static_view(),
+        );
+        let expanded_text = expanded_lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(expanded_text.contains("output line 6"));
+        assert!(!expanded_text.contains("enter to expand"));
     }
 
     #[test]
@@ -14656,6 +14580,7 @@ mod tests {
                 state: ToolRunState::Succeeded,
                 detail: "24 passed".to_string(),
                 expanded: false,
+                group_expanded: false,
             }),
             TranscriptItem::Tool(ToolRun {
                 id: None,
@@ -14666,18 +14591,277 @@ mod tests {
                 state: ToolRunState::Failed,
                 detail: "error: patch rejected\nrecovery: inspect context".to_string(),
                 expanded: false,
+                group_expanded: false,
             }),
         ];
 
         let lines = visible_transcript_lines(&transcript, None, None);
         let text = lines.iter().map(line_text).collect::<Vec<_>>();
 
-        assert_eq!(lines.len(), 5);
-        assert!(text[0].contains("tools"));
-        assert!(!text[0].contains("done"));
-        assert!(text.iter().any(|line| line.contains("tested 1 command")));
-        assert!(text.iter().any(|line| line.contains("edited 1 file")));
-        assert!(text.iter().any(|line| line.contains("patch rejected")));
+        assert!(
+            text.iter()
+                .any(|line| line.contains("terminal $ cargo test -p medusa-tui"))
+        );
+        assert!(text.iter().any(|line| line.contains("⎿ 24 passed")));
+        assert!(
+            text.iter()
+                .any(|line| line.contains("patch crates/medusa-tui/src/main.rs - update renderer"))
+        );
+        assert!(
+            text.iter()
+                .any(|line| line.contains("⎿ error: patch rejected"))
+        );
+        assert!(
+            text.iter()
+                .any(|line| line.contains("recovery: inspect context"))
+        );
+    }
+
+    fn finished_tool(name: &str, summary: &str, state: ToolRunState) -> ToolRun {
+        ToolRun {
+            id: None,
+            started_at: Instant::now(),
+            pending_result: None,
+            name: name.to_string(),
+            summary: summary.to_string(),
+            state,
+            detail: "done".to_string(),
+            expanded: false,
+            group_expanded: false,
+        }
+    }
+
+    #[test]
+    fn consecutive_same_tool_calls_coalesce_into_one_line() {
+        let transcript = vec![
+            TranscriptItem::Tool(finished_tool(
+                "file.read",
+                "read src/main.rs",
+                ToolRunState::Succeeded,
+            )),
+            TranscriptItem::Tool(finished_tool(
+                "file.read",
+                "read src/tools.rs",
+                ToolRunState::Succeeded,
+            )),
+            TranscriptItem::Tool(finished_tool(
+                "file.read",
+                "read src/wire.rs",
+                ToolRunState::Succeeded,
+            )),
+            TranscriptItem::Tool(finished_tool(
+                "file.read",
+                "read src/exec.rs",
+                ToolRunState::Succeeded,
+            )),
+            TranscriptItem::Tool(finished_tool(
+                "terminal.exec",
+                "$ cargo check",
+                ToolRunState::Succeeded,
+            )),
+        ];
+
+        let lines = visible_transcript_lines(&transcript, None, None);
+        let text = lines.iter().map(line_text).collect::<Vec<_>>();
+
+        assert!(text.iter().any(|line| {
+            line.contains("read src/main.rs, src/tools.rs, src/wire.rs +1 more")
+        }));
+        assert!(text.iter().any(|line| line.contains("⎿ 4 calls")));
+        // The lone terminal call renders as a normal block.
+        assert!(text.iter().any(|line| line.contains("terminal $ cargo check")));
+        assert!(!text.iter().any(|line| line.contains("read src/tools.rs\n")));
+    }
+
+    #[test]
+    fn out_of_order_tool_results_land_on_the_right_blocks_by_call_id() {
+        let mut app = app();
+        app.push_tool_start_with_id(
+            Some("call_a".to_string()),
+            "file.read".to_string(),
+            "read src/a.rs".to_string(),
+        );
+        app.push_tool_start_with_id(
+            Some("call_b".to_string()),
+            "file.read".to_string(),
+            "read src/b.rs".to_string(),
+        );
+        for item in &mut app.transcript {
+            if let TranscriptItem::Tool(run) = item {
+                run.started_at = run
+                    .started_at
+                    .checked_sub(MIN_TOOL_PULSE_VISIBLE)
+                    .unwrap_or(run.started_at);
+            }
+        }
+
+        // Second call finishes first (parallel execution), then the first.
+        app.push_tool_result_for_call("call_b", "file.read", "content of b".to_string());
+        app.push_tool_result_for_call("call_a", "file.read", "content of a".to_string());
+
+        let TranscriptItem::Tool(first) = &app.transcript[0] else {
+            panic!("expected tool run");
+        };
+        let TranscriptItem::Tool(second) = &app.transcript[1] else {
+            panic!("expected tool run");
+        };
+        assert_eq!(first.detail, "content of a");
+        assert_eq!(second.detail, "content of b");
+        assert_eq!(first.state, ToolRunState::Succeeded);
+        assert_eq!(second.state, ToolRunState::Succeeded);
+    }
+
+    #[test]
+    fn edit_tool_shows_diff_lines_and_never_coalesces() {
+        let mut first = finished_tool("file.edit", "edit src/a.rs", ToolRunState::Succeeded);
+        first.detail =
+            "edited src/a.rs (1 replacement)\n- fn old() {}\n+ fn new() {}\n  shared".to_string();
+        let mut second = finished_tool("file.edit", "edit src/b.rs", ToolRunState::Succeeded);
+        second.detail = "edited src/b.rs (1 replacement)\n- x\n+ y".to_string();
+        let transcript = vec![
+            TranscriptItem::Tool(first),
+            TranscriptItem::Tool(second),
+        ];
+
+        let lines = visible_transcript_lines(&transcript, None, None);
+        let text = lines.iter().map(line_text).collect::<Vec<_>>();
+
+        // Both edits stay as separate blocks with their diff bodies visible.
+        assert!(text.iter().any(|line| line.contains("edit src/a.rs")));
+        assert!(text.iter().any(|line| line.contains("edit src/b.rs")));
+        assert!(text.iter().any(|line| line.contains("- fn old() {}")));
+        assert!(text.iter().any(|line| line.contains("+ fn new() {}")));
+        assert!(!text.iter().any(|line| line.contains("2 calls")));
+    }
+
+    #[test]
+    fn running_call_joins_coalesced_run_as_live_tail() {
+        let mut running = finished_tool("file.read", "read src/slow.rs", ToolRunState::Running);
+        running.detail = String::new();
+        let transcript = vec![
+            TranscriptItem::Tool(finished_tool(
+                "file.read",
+                "read src/main.rs",
+                ToolRunState::Succeeded,
+            )),
+            TranscriptItem::Tool(finished_tool(
+                "file.read",
+                "read src/tools.rs",
+                ToolRunState::Succeeded,
+            )),
+            TranscriptItem::Tool(running),
+        ];
+
+        let lines = visible_transcript_lines(&transcript, None, None);
+        let text = lines.iter().map(line_text).collect::<Vec<_>>();
+
+        assert!(
+            text.iter()
+                .any(|line| line.contains("read src/main.rs, src/tools.rs, src/slow.rs")),
+            "running call renders inside the coalesced line, not below it"
+        );
+        assert!(
+            text.iter()
+                .any(|line| line.contains("⎿ 3 calls · running…"))
+        );
+        assert_eq!(
+            text.iter()
+                .filter(|line| line.contains("src/slow.rs"))
+                .count(),
+            1,
+            "the running call must not also render as its own block"
+        );
+    }
+
+    #[test]
+    fn failed_and_running_calls_never_coalesce() {
+        let mut running = finished_tool("file.read", "read src/slow.rs", ToolRunState::Running);
+        running.detail = String::new();
+        let transcript = vec![
+            TranscriptItem::Tool(finished_tool(
+                "file.read",
+                "read src/main.rs",
+                ToolRunState::Succeeded,
+            )),
+            TranscriptItem::Tool(finished_tool(
+                "file.read",
+                "read src/missing.rs",
+                ToolRunState::Failed,
+            )),
+            TranscriptItem::Tool(running),
+        ];
+
+        let lines = visible_transcript_lines(&transcript, None, None);
+        let text = lines.iter().map(line_text).collect::<Vec<_>>();
+
+        assert!(!text.iter().any(|line| line.contains("calls")));
+        assert!(text.iter().any(|line| line.contains("read src/main.rs")));
+        assert!(text.iter().any(|line| line.contains("read src/missing.rs")));
+        assert!(text.iter().any(|line| line.contains("read src/slow.rs")));
+    }
+
+    #[test]
+    fn reasoning_between_same_tool_calls_does_not_break_coalescing() {
+        let transcript = vec![
+            TranscriptItem::Tool(finished_tool(
+                "file.read",
+                "read src/main.rs",
+                ToolRunState::Succeeded,
+            )),
+            TranscriptItem::Reasoning(ReasoningTrace {
+                content: "Reading the next file.".to_string(),
+                expanded: false,
+            }),
+            TranscriptItem::Tool(finished_tool(
+                "file.read",
+                "read src/tools.rs",
+                ToolRunState::Succeeded,
+            )),
+        ];
+
+        let lines = visible_transcript_lines(&transcript, None, None);
+        let text = lines.iter().map(line_text).collect::<Vec<_>>();
+
+        assert!(
+            text.iter()
+                .any(|line| line.contains("read src/main.rs, src/tools.rs"))
+        );
+        assert!(text.iter().any(|line| line.contains("⎿ 2 calls")));
+    }
+
+    #[test]
+    fn enter_cycles_coalesced_group_open_then_details_then_coalesced() {
+        let mut app = app();
+        app.transcript.push(TranscriptItem::Tool(finished_tool(
+            "file.read",
+            "read src/main.rs",
+            ToolRunState::Succeeded,
+        )));
+        app.transcript.push(TranscriptItem::Tool(finished_tool(
+            "file.read",
+            "read src/tools.rs",
+            ToolRunState::Succeeded,
+        )));
+        app.transcript.push(TranscriptItem::Tool(finished_tool(
+            "terminal.exec",
+            "$ cargo check",
+            ToolRunState::Succeeded,
+        )));
+
+        app.selected_tool = Some(0);
+        app.toggle_selected_tool();
+        assert!(tool_group_is_open(&app.transcript, 0, 3));
+        assert!(
+            !matches!(&app.transcript[0], TranscriptItem::Tool(run) if run.expanded),
+            "first enter un-coalesces the group without opening details"
+        );
+
+        app.toggle_selected_tool();
+        assert!(matches!(&app.transcript[0], TranscriptItem::Tool(run) if run.expanded));
+
+        app.toggle_selected_tool();
+        assert!(!tool_group_is_open(&app.transcript, 0, 3));
+        assert!(!matches!(&app.transcript[0], TranscriptItem::Tool(run) if run.expanded));
     }
 
     #[test]
@@ -14696,6 +14880,7 @@ mod tests {
                 state: ToolRunState::Succeeded,
                 detail: "done".to_string(),
                 expanded: false,
+                group_expanded: false,
             }),
             TranscriptItem::Reasoning(ReasoningTrace {
                 content: "Reading matching files.".to_string(),
@@ -14710,18 +14895,17 @@ mod tests {
                 state: ToolRunState::Succeeded,
                 detail: "done".to_string(),
                 expanded: false,
+                group_expanded: false,
             }),
         ];
 
         let lines = visible_transcript_lines(&transcript, None, None);
         let text = lines.iter().map(line_text).collect::<Vec<_>>();
 
-        assert_eq!(lines.len(), 4);
-        assert!(text[0].contains("tools"));
-        assert!(text[0].contains("2 calls"));
-        assert!(text[0].contains("terminal x2"));
-        assert!(text.iter().any(|line| line.contains("searched 1 query")));
-        assert!(text.iter().any(|line| line.contains("read 1 file")));
+        assert!(
+            text.iter()
+                .any(|line| line.contains("terminal $ rg TODO, $ sed -n '1,80p' README.md"))
+        );
         assert!(!text.iter().any(|line| line.contains("thinking")));
     }
 
@@ -14736,14 +14920,14 @@ mod tests {
             state: ToolRunState::Succeeded,
             detail: "done".to_string(),
             expanded: false,
+            group_expanded: false,
         })];
 
         let lines = visible_transcript_lines(&transcript, None, Some(0));
 
-        assert_eq!(lines.len(), 3);
         let text = lines.iter().map(line_text).collect::<Vec<_>>();
-        assert!(!text[0].contains("done"));
-        assert!(text[1].contains("ran 1 command"));
+        assert!(text[0].contains("terminal $ cargo check"));
+        assert!(text[1].contains("⎿ done"));
     }
 
     #[test]
@@ -14758,6 +14942,7 @@ mod tests {
             state: ToolRunState::Succeeded,
             detail: "24 passed".to_string(),
             expanded: false,
+            group_expanded: false,
         }));
 
         app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
@@ -14788,10 +14973,13 @@ mod tests {
             state: ToolRunState::Succeeded,
             detail: "29 passed\n2 ignored".to_string(),
             expanded: true,
+            group_expanded: false,
         })];
 
         let lines = visible_transcript_lines(&transcript, None, Some(0));
 
-        assert_eq!(lines.len(), 6);
+        let text = lines.iter().map(line_text).collect::<Vec<_>>();
+        assert!(text.iter().any(|line| line.contains("⎿ 29 passed")));
+        assert!(text.iter().any(|line| line.contains("2 ignored")));
     }
 }

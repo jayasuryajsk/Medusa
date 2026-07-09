@@ -18,9 +18,45 @@ use crate::auth::load_codex_oauth_credentials;
 use crate::harness::HarnessPolicy;
 use crate::tools::ToolRuntime;
 
+pub(crate) fn retryable_status(status: u16) -> bool {
+    status == 429 || (500..=504).contains(&status)
+}
+
+pub(crate) fn retry_backoff(attempt: u32, retry_after_seconds: Option<u64>) -> Duration {
+    match retry_after_seconds {
+        Some(seconds) => Duration::from_secs(seconds.clamp(1, 30)),
+        None => Duration::from_millis(1_000 * 2u64.saturating_pow(attempt.saturating_sub(1))),
+    }
+}
+
+fn retry_after_seconds(headers: &HeaderMap) -> Option<u64> {
+    headers
+        .get("retry-after")?
+        .to_str()
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
+}
+
 pub use types::{
     ConversationAttachment, ConversationMessage, DirectCodexBackend, ModelStreamEvent,
 };
+
+fn finish_tool_call<F>(
+    on_event: &mut F,
+    call: &types::ToolCall,
+    execution: &types::ToolExecution,
+) -> Result<()>
+where
+    F: FnMut(types::ModelStreamEvent) -> Result<()>,
+{
+    on_event(types::ModelStreamEvent::ToolResult {
+        call_id: call.call_id.clone(),
+        name: exec::display_tool_name(&call.name).to_string(),
+        output: exec::summarize_tool_result(call, execution),
+    })
+}
 
 impl DirectCodexBackend {
     pub fn new(workspace: impl Into<PathBuf>) -> Result<Self> {
@@ -155,6 +191,24 @@ impl DirectCodexBackend {
         )
     }
 
+    pub(crate) fn chat_stream_messages_subagent<F>(
+        &self,
+        messages: &[types::ConversationMessage],
+        tools: ToolRuntime,
+        allow_mutation: bool,
+        mut on_event: F,
+    ) -> Result<usize>
+    where
+        F: FnMut(types::ModelStreamEvent) -> Result<()>,
+    {
+        self.chat_stream_messages_with_tool_policy(
+            messages,
+            tools,
+            types::ToolLoopPolicy::subagent(allow_mutation),
+            &mut on_event,
+        )
+    }
+
     fn chat_stream_messages_with_tool_policy<F>(
         &self,
         messages: &[types::ConversationMessage],
@@ -168,8 +222,8 @@ impl DirectCodexBackend {
         use crate::hooks::HookEvent;
 
         let latest_prompt = wire::latest_user_prompt(messages);
-        let compacted_messages =
-            wire::compact_conversation_context(messages, wire::context_max_chars());
+        let context_budget = crate::context::context_max_tokens();
+        let compacted_messages = wire::compact_conversation_context(messages, context_budget);
         let mut input = compacted_messages
             .iter()
             .filter(|message| !message.content.trim().is_empty() || !message.attachments.is_empty())
@@ -180,6 +234,13 @@ impl DirectCodexBackend {
         let policy = HarnessPolicy::for_user_prompt(&latest_prompt);
         let turn_mode = policy.mode_label();
         let skill_context = tools.skills().prompt_context(&latest_prompt);
+        let project_context = crate::project::project_instructions_context(&self.workspace);
+        let extra_context = match (project_context, skill_context) {
+            (Some(project), Some(skills)) => Some(format!("{project}\n\n{skills}")),
+            (Some(project), None) => Some(project),
+            (None, Some(skills)) => Some(skills),
+            (None, None) => None,
+        };
 
         if let Some(error) = tools
             .hooks()
@@ -195,7 +256,7 @@ impl DirectCodexBackend {
                 &state,
                 policy,
                 tool_policy,
-                skill_context.as_deref(),
+                extra_context.as_deref(),
                 &mut on_event,
             )?;
             total_events += outcome.event_count;
@@ -211,7 +272,11 @@ impl DirectCodexBackend {
                 return Ok(total_events);
             }
 
-            for call in outcome.tool_calls {
+            let calls = outcome.tool_calls;
+
+            // Announce every call up front (in emission order) so the
+            // transcript shows the whole batch before results stream in.
+            for call in &calls {
                 let mut call_item = json!({
                     "type": "function_call",
                     "call_id": call.call_id,
@@ -225,26 +290,264 @@ impl DirectCodexBackend {
                 }
                 input.push(call_item);
 
-                let summary = exec::summarize_tool_call(&call);
                 on_event(types::ModelStreamEvent::ToolStart {
+                    call_id: call.call_id.clone(),
                     name: exec::display_tool_name(&call.name).to_string(),
-                    summary,
+                    summary: exec::summarize_tool_call(call),
                 })?;
+            }
 
-                let execution =
-                    exec::execute_tool_call_with_hooks(&tools, &call, &state, policy, tool_policy);
-                on_event(types::ModelStreamEvent::ToolResult {
-                    name: exec::display_tool_name(&call.name).to_string(),
-                    output: exec::summarize_tool_result(&call, &execution),
-                })?;
+            let executions = self.execute_turn_tool_calls(
+                &tools,
+                &calls,
+                &mut state,
+                policy,
+                tool_policy,
+                &mut on_event,
+            )?;
 
-                exec::update_tool_loop_state(&mut state, &call, &execution);
-
+            // Model context outputs go back in emission order regardless of
+            // completion order, so the conversation stays deterministic.
+            for (call, execution) in calls.iter().zip(executions) {
                 input.push(json!({
                     "type": "function_call_output",
                     "call_id": call.call_id,
-                    "output": exec::compact_tool_context_output(&call, &execution),
+                    "output": exec::compact_tool_context_output(call, &execution),
                 }));
+            }
+
+            crate::context::prune_input_tool_outputs(&mut input, context_budget);
+        }
+    }
+
+    /// Execute one turn's tool calls. Consecutive read-only calls fan out
+    /// concurrently; anything mutating (or workflow_run) is a barrier and
+    /// runs serially in emission order, preserving pre-parallel semantics.
+    /// ToolResult events surface in completion order (call_id keys them in
+    /// the UI); the returned executions are in emission order.
+    fn execute_turn_tool_calls<F>(
+        &self,
+        tools: &ToolRuntime,
+        calls: &[types::ToolCall],
+        state: &mut types::ToolLoopState,
+        policy: HarnessPolicy,
+        tool_policy: types::ToolLoopPolicy,
+        on_event: &mut F,
+    ) -> Result<Vec<types::ToolExecution>>
+    where
+        F: FnMut(types::ModelStreamEvent) -> Result<()>,
+    {
+        let mut executions: Vec<Option<types::ToolExecution>> = vec![None; calls.len()];
+        let mut index = 0;
+        while index < calls.len() {
+            let call = &calls[index];
+
+            if exec::tool_call_is_read_only(&call.name) {
+                let mut end = index + 1;
+                while end < calls.len() && exec::tool_call_is_read_only(&calls[end].name) {
+                    end += 1;
+                }
+
+                if end - index == 1 {
+                    let execution =
+                        exec::execute_tool_call_with_hooks(tools, call, state, policy, tool_policy);
+                    finish_tool_call(on_event, call, &execution)?;
+                    executions[index] = Some(execution);
+                } else {
+                    let (sender, receiver) = std::sync::mpsc::channel();
+                    for (offset, call) in calls[index..end].iter().enumerate() {
+                        let sender = sender.clone();
+                        let tools = tools.clone();
+                        let call = call.clone();
+                        let state = state.clone();
+                        std::thread::spawn(move || {
+                            let execution = exec::execute_tool_call_with_hooks(
+                                &tools,
+                                &call,
+                                &state,
+                                policy,
+                                tool_policy,
+                            );
+                            let _ = sender.send((index + offset, execution));
+                        });
+                    }
+                    drop(sender);
+                    for (slot, execution) in receiver {
+                        finish_tool_call(on_event, &calls[slot], &execution)?;
+                        executions[slot] = Some(execution);
+                    }
+                }
+
+                // Read-only calls never consult ToolLoopState during
+                // execution, so applying updates at batch end in emission
+                // order preserves serial semantics.
+                for (offset, execution) in executions[index..end].iter().enumerate() {
+                    if let Some(execution) = execution {
+                        exec::update_tool_loop_state(state, &calls[index + offset], execution);
+                    }
+                }
+                index = end;
+                continue;
+            }
+
+            let execution = if call.name == "workflow_run" {
+                exec::execute_workflow_run_with_hooks(tools, call, policy, tool_policy, self, on_event)
+            } else {
+                exec::execute_tool_call_with_hooks(tools, call, state, policy, tool_policy)
+            };
+            finish_tool_call(on_event, call, &execution)?;
+            exec::update_tool_loop_state(state, call, &execution);
+            executions[index] = Some(execution);
+            index += 1;
+        }
+
+        Ok(executions
+            .into_iter()
+            .map(|execution| {
+                execution.unwrap_or_else(|| types::ToolExecution {
+                    failed: true,
+                    output: "error: tool worker ended without returning a result".to_string(),
+                })
+            })
+            .collect())
+    }
+
+    /// One-shot, tool-free completion used for internal plumbing such as
+    /// context compaction summaries. Returns the model's text output.
+    pub fn plain_completion(&self, instructions: &str, user_text: &str) -> Result<String> {
+        let user_message = types::ConversationMessage {
+            role: "user".to_string(),
+            content: user_text.to_string(),
+            attachments: Vec::new(),
+        };
+        let input = vec![wire::conversation_message_json(&user_message)];
+
+        let mut text = String::new();
+        let mut on_event = |event: types::ModelStreamEvent| {
+            if let types::ModelStreamEvent::Delta(delta) = event {
+                text.push_str(&delta);
+            }
+            Ok(())
+        };
+
+        match self.provider {
+            types::ModelProvider::Codex => {
+                let credentials = load_codex_oauth_credentials()?;
+                let mut headers = HeaderMap::new();
+                headers.insert(
+                    AUTHORIZATION,
+                    HeaderValue::from_str(&format!("Bearer {}", credentials.bearer_token()))
+                        .wrap_err("failed to build auth header")?,
+                );
+                headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+                headers.insert(ACCEPT, HeaderValue::from_static("text/event-stream"));
+                headers.insert(USER_AGENT, HeaderValue::from_static("medusa-tui/0.1.0"));
+                if let Some(account_id) = credentials.account_id() {
+                    headers.insert(
+                        "ChatGPT-Account-ID",
+                        HeaderValue::from_str(account_id)
+                            .wrap_err("failed to build account header")?,
+                    );
+                }
+
+                let body = json!({
+                    "model": self.model,
+                    "instructions": instructions,
+                    "input": input,
+                    "tools": [],
+                    "store": false,
+                    "stream": true,
+                    "reasoning": { "effort": "low" },
+                });
+                let response = self.send_model_request(
+                    || {
+                        self.client
+                            .post("https://chatgpt.com/backend-api/codex/responses")
+                            .headers(headers.clone())
+                            .json(&body)
+                    },
+                    "Codex backend",
+                )?;
+                wire::read_sse_response(response, &mut on_event)?;
+            }
+            types::ModelProvider::DeepSeek | types::ModelProvider::OpenAiCompatible => {
+                let Some(api_key) = self.chat_api_key.as_ref() else {
+                    bail!(
+                        "{} backend requires {}",
+                        self.provider.label(),
+                        self.provider.auth_hint()
+                    );
+                };
+                let mut headers = HeaderMap::new();
+                headers.insert(
+                    AUTHORIZATION,
+                    HeaderValue::from_str(&format!("Bearer {api_key}"))
+                        .wrap_err("failed to build auth header")?,
+                );
+                headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+                headers.insert(ACCEPT, HeaderValue::from_static("text/event-stream"));
+                headers.insert(USER_AGENT, HeaderValue::from_static("medusa-tui/0.1.0"));
+
+                let body = json!({
+                    "model": self.model,
+                    "messages": wire::chat_completion_messages_from_input(input, instructions),
+                    "stream": true,
+                });
+                let url = format!(
+                    "{}/chat/completions",
+                    self.chat_base_url.trim_end_matches('/')
+                );
+                let response = self.send_model_request(
+                    || self.client.post(&url).headers(headers.clone()).json(&body),
+                    self.provider.label(),
+                )?;
+                wire::read_chat_completions_sse_response(response, &mut on_event)?;
+            }
+        }
+
+        Ok(text.trim().to_string())
+    }
+
+    /// Send the initial model request, retrying transient failures (transport
+    /// errors, 429, 5xx) with backoff. Only the pre-stream request is retried;
+    /// once SSE bytes start flowing a failure surfaces to the caller.
+    fn send_model_request(
+        &self,
+        build: impl Fn() -> reqwest::blocking::RequestBuilder,
+        label: &str,
+    ) -> Result<reqwest::blocking::Response> {
+        const MAX_ATTEMPTS: u32 = 3;
+
+        let mut attempt = 0;
+        loop {
+            attempt += 1;
+            match build().send() {
+                Ok(response) => {
+                    let status = response.status();
+                    if status.is_success() {
+                        return Ok(response);
+                    }
+                    let retry_after = retry_after_seconds(response.headers());
+                    let text = response.text().unwrap_or_default();
+                    if attempt < MAX_ATTEMPTS && retryable_status(status.as_u16()) {
+                        std::thread::sleep(retry_backoff(attempt, retry_after));
+                        continue;
+                    }
+                    bail!(
+                        "{label} returned {status} after {attempt} attempt{}: {}",
+                        if attempt == 1 { "" } else { "s" },
+                        exec::compact(&text, 360)
+                    );
+                }
+                Err(error) if attempt < MAX_ATTEMPTS => {
+                    std::thread::sleep(retry_backoff(attempt, None));
+                    let _ = error;
+                }
+                Err(error) => {
+                    return Err(error).wrap_err_with(|| {
+                        format!("failed to call {label} after {attempt} attempts")
+                    });
+                }
             }
         }
     }
@@ -255,7 +558,7 @@ impl DirectCodexBackend {
         state: &types::ToolLoopState,
         policy: HarnessPolicy,
         tool_policy: types::ToolLoopPolicy,
-        skill_context: Option<&str>,
+        extra_context: Option<&str>,
         on_event: &mut F,
     ) -> Result<types::TurnOutcome>
     where
@@ -263,7 +566,7 @@ impl DirectCodexBackend {
     {
         match self.provider {
             types::ModelProvider::Codex => {
-                self.stream_codex_turn(input, state, policy, tool_policy, skill_context, on_event)
+                self.stream_codex_turn(input, state, policy, tool_policy, extra_context, on_event)
             }
             types::ModelProvider::DeepSeek | types::ModelProvider::OpenAiCompatible => self
                 .stream_chat_completions_turn(
@@ -271,7 +574,7 @@ impl DirectCodexBackend {
                     state,
                     policy,
                     tool_policy,
-                    skill_context,
+                    extra_context,
                     on_event,
                 ),
         }
@@ -283,7 +586,7 @@ impl DirectCodexBackend {
         state: &types::ToolLoopState,
         policy: HarnessPolicy,
         tool_policy: types::ToolLoopPolicy,
-        skill_context: Option<&str>,
+        extra_context: Option<&str>,
         on_event: &mut F,
     ) -> Result<types::TurnOutcome>
     where
@@ -306,13 +609,12 @@ impl DirectCodexBackend {
             );
         }
 
-        let allow_patch =
-            policy.allows_patch() && tool_policy.allow_mutation() && !state.patch_requires_context;
+        let allow_patch = tool_policy.allow_mutation() && !state.patch_requires_context;
         let mut body = json!({
             "model": self.model,
-            "instructions": schema::medusa_instructions(&self.workspace, state, policy, skill_context),
+            "instructions": schema::medusa_instructions(&self.workspace, state, policy, extra_context),
             "input": input,
-            "tools": schema::medusa_tools(allow_patch),
+            "tools": schema::medusa_tools(allow_patch, tool_policy.allow_workflows()),
             "store": false,
             "stream": true,
         });
@@ -324,22 +626,15 @@ impl DirectCodexBackend {
             });
         }
 
-        let response = self
-            .client
-            .post("https://chatgpt.com/backend-api/codex/responses")
-            .headers(headers)
-            .json(&body)
-            .send()
-            .wrap_err("failed to call Codex backend")?;
-
-        let status = response.status();
-        if !status.is_success() {
-            let text = response.text().wrap_err("failed to read Codex error")?;
-            bail!(
-                "Codex backend returned {status}: {}",
-                exec::compact(&text, 360)
-            );
-        }
+        let response = self.send_model_request(
+            || {
+                self.client
+                    .post("https://chatgpt.com/backend-api/codex/responses")
+                    .headers(headers.clone())
+                    .json(&body)
+            },
+            "Codex backend",
+        )?;
 
         wire::read_sse_response(response, on_event)
     }
@@ -350,7 +645,7 @@ impl DirectCodexBackend {
         state: &types::ToolLoopState,
         policy: HarnessPolicy,
         tool_policy: types::ToolLoopPolicy,
-        skill_context: Option<&str>,
+        extra_context: Option<&str>,
         on_event: &mut F,
     ) -> Result<types::TurnOutcome>
     where
@@ -374,15 +669,14 @@ impl DirectCodexBackend {
         headers.insert(ACCEPT, HeaderValue::from_static("text/event-stream"));
         headers.insert(USER_AGENT, HeaderValue::from_static("medusa-tui/0.1.0"));
 
-        let allow_patch =
-            policy.allows_patch() && tool_policy.allow_mutation() && !state.patch_requires_context;
+        let allow_patch = tool_policy.allow_mutation() && !state.patch_requires_context;
         let mut body = json!({
             "model": self.model,
             "messages": wire::chat_completion_messages_from_input(
                 input,
-                &schema::medusa_instructions(&self.workspace, state, policy, skill_context),
+                &schema::medusa_instructions(&self.workspace, state, policy, extra_context),
             ),
-            "tools": schema::chat_completion_tools(allow_patch),
+            "tools": schema::chat_completion_tools(allow_patch, tool_policy.allow_workflows()),
             "tool_choice": "auto",
             "stream": true,
         });
@@ -400,28 +694,14 @@ impl DirectCodexBackend {
                 json!(schema::deepseek_reasoning_effort(&self.reasoning_effort));
         }
 
-        let response = self
-            .client
-            .post(format!(
-                "{}/chat/completions",
-                self.chat_base_url.trim_end_matches('/')
-            ))
-            .headers(headers)
-            .json(&body)
-            .send()
-            .wrap_err_with(|| format!("failed to call {} backend", self.provider.label()))?;
-
-        let status = response.status();
-        if !status.is_success() {
-            let text = response
-                .text()
-                .wrap_err("failed to read chat backend error")?;
-            bail!(
-                "{} backend returned {status}: {}",
-                self.provider.label(),
-                exec::compact(&text, 360)
-            );
-        }
+        let url = format!(
+            "{}/chat/completions",
+            self.chat_base_url.trim_end_matches('/')
+        );
+        let response = self.send_model_request(
+            || self.client.post(&url).headers(headers.clone()).json(&body),
+            self.provider.label(),
+        )?;
 
         wire::read_chat_completions_sse_response(response, on_event)
     }

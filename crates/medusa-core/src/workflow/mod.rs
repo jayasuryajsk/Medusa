@@ -14,6 +14,9 @@ use crate::{
     tools::ToolRuntime,
 };
 
+pub mod script;
+pub use script::WorkflowScript;
+
 const DEFAULT_MAX_AGENTS: usize = 12;
 
 #[derive(Debug, Clone)]
@@ -165,6 +168,7 @@ pub enum WorkflowEvent {
         agent_index: usize,
         name: String,
         role: String,
+        tool_policy: SubagentToolPolicy,
     },
     AgentFinished {
         run_id: String,
@@ -180,6 +184,10 @@ pub enum WorkflowEvent {
         phase_index: usize,
         name: String,
         status: WorkflowStatus,
+    },
+    Log {
+        run_id: String,
+        message: String,
     },
     RunFinished {
         run_id: String,
@@ -577,18 +585,16 @@ impl WorkflowRuntime {
                     }
                 }
                 ModelStreamEvent::ReasoningDelta(_)
+                | ModelStreamEvent::Workflow(_)
                 | ModelStreamEvent::Done { .. }
                 | ModelStreamEvent::Error(_) => {}
             }
             Ok(())
         };
 
-        if agent.mutation_allowed() {
-            backend.chat_stream_messages(&messages, tools, handle_event)
-        } else {
-            backend.chat_stream_messages_read_only(&messages, tools, handle_event)
-        }
-        .wrap_err_with(|| format!("{} subagent failed", agent.name))?;
+        backend
+            .chat_stream_messages_subagent(&messages, tools, agent.mutation_allowed(), handle_event)
+            .wrap_err_with(|| format!("{} subagent failed", agent.name))?;
 
         let output = output.trim().to_string();
         Ok(SubagentReport {
@@ -629,6 +635,7 @@ where
         agent_index,
         name: agent.name.clone(),
         role: agent.role.clone(),
+        tool_policy: agent.tool_policy,
     })
 }
 

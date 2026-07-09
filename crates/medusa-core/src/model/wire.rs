@@ -151,23 +151,15 @@ pub(crate) fn latest_user_prompt(messages: &[ConversationMessage]) -> String {
         .unwrap_or_default()
 }
 
-pub(crate) fn context_max_chars() -> usize {
-    std::env::var("MEDUSA_CONTEXT_MAX_CHARS")
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .filter(|value| *value >= 8_000)
-        .unwrap_or(DEFAULT_CONTEXT_MAX_CHARS)
-}
-
 pub(crate) fn compact_conversation_context(
     messages: &[ConversationMessage],
-    max_chars: usize,
+    max_tokens: usize,
 ) -> Vec<ConversationMessage> {
-    let total_chars = messages
+    let total_tokens = messages
         .iter()
-        .map(|message| message.content.chars().count())
+        .map(crate::context::message_tokens)
         .sum::<usize>();
-    if total_chars <= max_chars || messages.len() <= 2 {
+    if total_tokens <= max_tokens || messages.len() <= 2 {
         return messages.to_vec();
     }
 
@@ -180,16 +172,16 @@ pub(crate) fn compact_conversation_context(
         return messages.to_vec();
     }
 
-    let reserved_chars = system_prefix
+    let reserved_tokens = system_prefix
         .iter()
-        .map(|message| message.content.chars().count())
+        .map(crate::context::message_tokens)
         .sum::<usize>();
-    let body_budget = max_chars.saturating_sub(reserved_chars).max(1);
+    let body_budget = max_tokens.saturating_sub(reserved_tokens).max(1);
 
     let mut kept = Vec::new();
     let mut used = 0usize;
     for message in body.iter().rev() {
-        let cost = message.content.chars().count().max(1);
+        let cost = crate::context::message_tokens(message).max(1);
         if !kept.is_empty() && used + cost > body_budget {
             break;
         }
@@ -480,10 +472,10 @@ pub(crate) fn parse_sse_response(stream: &str) -> Result<ModelChatResult> {
                 }
             }
             Some("response.completed") => {
-                if text.trim().is_empty() {
-                    if let Some(done_text) = extract_completed_output_text(&event) {
-                        completed_text = done_text;
-                    }
+                if text.trim().is_empty()
+                    && let Some(done_text) = extract_completed_output_text(&event)
+                {
+                    completed_text = done_text;
                 }
                 break;
             }
