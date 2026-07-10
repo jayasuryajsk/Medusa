@@ -1303,22 +1303,24 @@ dependencies = [
 
 [[package]]
 name = "medusa-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "base64",
  "color-eyre",
  "globset",
+ "libc",
  "regex",
  "reqwest",
  "rquickjs",
  "serde",
  "serde_json",
  "similar",
+ "url",
 ]
 
 [[package]]
 name = "medusa-tui"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "ansi-to-tui",
  "arboard",

@@ -37,10 +37,17 @@ use ratatui_image::{
 };
 use serde::{Deserialize, Serialize};
 
+use medusa_core::agents::AgentRegistry;
 use medusa_core::auth::probe_codex_auth;
-use medusa_core::context::ContextEngine;
+use medusa_core::cancel::{CancelToken, error_is_cancellation};
+use medusa_core::checkpoint::{
+    CheckpointEntry, CheckpointMeta, CheckpointRecorder, CheckpointStore, CheckpointSummary,
+    RetentionLimits,
+};
+use medusa_core::context::{ContextEngine, ManualCompaction};
+use medusa_core::mcp::{McpRegistry, McpServerStateLabel, McpServerStatus};
 use medusa_core::model::{
-    ConversationAttachment, ConversationMessage, DirectCodexBackend, ModelStreamEvent,
+    ConversationAttachment, ConversationMessage, DirectCodexBackend, ModelStreamEvent, TokenUsage,
 };
 use medusa_core::permissions::{PermissionMode, PermissionPolicy};
 use medusa_core::session::{
@@ -81,6 +88,9 @@ fn main() -> Result<()> {
     let app_result = app.run(&mut terminal);
     let restart_requested = app.restart_requested;
     restore_terminal(&mut terminal)?;
+    // Reap MCP server children deterministically (stdin EOF, then a bounded
+    // kill) instead of leaning on process exit.
+    app.mcp.shutdown();
 
     app_result?;
 
@@ -260,6 +270,13 @@ struct HeadlessRunResult {
 fn run_headless(options: HeadlessOptions) -> Result<()> {
     let cwd = env::current_dir().unwrap_or_else(|_| Path::new(".").to_path_buf());
     let tools = ToolRuntime::new(&cwd).wrap_err("failed to initialize Medusa tools")?;
+    let tools = match McpRegistry::load(tools.workspace()) {
+        Ok(registry) => tools.with_mcp(registry),
+        Err(error) => {
+            eprintln!("warning: MCP config ignored: {error}");
+            tools
+        }
+    };
     let settings = load_app_settings(tools.workspace()).unwrap_or_default();
     let permission_mode = options
         .permission_mode
@@ -463,7 +480,10 @@ fn handle_headless_event(
                 }
             }
         }
-        ModelStreamEvent::Done { .. } | ModelStreamEvent::Error(_) => {}
+        ModelStreamEvent::Usage(_)
+        | ModelStreamEvent::Done { .. }
+        | ModelStreamEvent::Error(_)
+        | ModelStreamEvent::Cancelled => {}
     }
     Ok(())
 }
@@ -476,6 +496,8 @@ struct AppSettings {
     model: Option<String>,
     #[serde(default)]
     permission_mode: Option<String>,
+    #[serde(default)]
+    bell: Option<bool>,
 }
 
 impl AppSettings {
@@ -544,6 +566,29 @@ fn save_permission_mode_preference(workspace: &Path, mode: PermissionMode) -> Re
     PermissionPolicy::write_mode(workspace, mode)
 }
 
+fn save_bell_preference(workspace: &Path, enabled: bool) -> Result<()> {
+    let mut settings = load_app_settings(workspace).unwrap_or_default();
+    settings.bell = Some(enabled);
+    save_app_settings(workspace, &settings)
+}
+
+/// Effective bell enablement: the MEDUSA_BELL environment variable overrides
+/// the workspace setting ("off"/"0"/"false"/"no" disables, "on"/"1"/"true"/
+/// "yes" enables, anything else falls back to the setting).
+fn bell_enabled(setting: bool, env_value: Option<&str>) -> bool {
+    match env_value.map(|value| value.trim().to_ascii_lowercase()) {
+        Some(value) if matches!(value.as_str(), "off" | "0" | "false" | "no") => false,
+        Some(value) if matches!(value.as_str(), "on" | "1" | "true" | "yes") => true,
+        _ => setting,
+    }
+}
+
+/// Bell gating: only ring for turns that ran long enough that the user has
+/// plausibly tabbed away — rapid turns should never ding.
+fn should_ring_bell(enabled: bool, working_for: Option<Duration>) -> bool {
+    enabled && working_for.is_some_and(|elapsed| elapsed > BELL_MIN_WORKING_DURATION)
+}
+
 fn event_requests_immediate_draw(event: &Event) -> bool {
     matches!(
         event,
@@ -552,6 +597,17 @@ fn event_requests_immediate_draw(event: &Event) -> bool {
             ..
         })
     )
+}
+
+/// A background `/workflow` run: its event channel plus the per-run
+/// checkpoint recorder that captures pre-images for every file its subagents
+/// mutate, so `/rewind` can undo a bad workflow. Cloning the recorder into the
+/// worker's `ToolRuntime` shares state, so all subagent clones land in the
+/// same checkpoint. The cancel token lets a turn cancel stop the run's tools.
+struct BackgroundWorkflow {
+    events: Receiver<WorkflowEvent>,
+    checkpoint: CheckpointRecorder,
+    cancel: CancelToken,
 }
 
 struct App {
@@ -573,18 +629,30 @@ struct App {
     theme: ThemeKind,
     permission_mode: PermissionMode,
     tools: ToolRuntime,
+    /// App-owned MCP registry, re-injected into every ToolRuntime rebuild so
+    /// permission-mode switches never respawn live MCP servers.
+    mcp: Arc<McpRegistry>,
+    /// Snapshot rendered by the /mcp modal, captured when the command runs so
+    /// drawing never blocks on a connecting server's state lock.
+    mcp_statuses: Vec<McpServerStatus>,
+    /// Snapshot rendered by the /agents modal, reloaded from .medusa/agents
+    /// each time the command runs so file edits show up without a restart.
+    agent_registry: AgentRegistry,
     model: DirectCodexBackend,
     context_engine: ContextEngine,
     plan_mode: bool,
     model_enabled: bool,
     model_events: Option<Receiver<ModelStreamEvent>>,
-    workflow_events: Vec<Receiver<WorkflowEvent>>,
+    workflow_events: Vec<BackgroundWorkflow>,
     background_job_sender: Sender<BackgroundJobEvent>,
     approval_handler: medusa_core::tools::ApprovalHandler,
     approval_events: Receiver<PendingApproval>,
     approval_queue: VecDeque<PendingApproval>,
     session_terminal_grants: Vec<String>,
     session_edit_grants: Vec<String>,
+    /// Set once the user picks "always allow" on a web egress prompt; every
+    /// later web_fetch/web_search then auto-allows for the rest of the session.
+    session_web_egress_allowed: bool,
     denied_this_turn: Vec<String>,
     approval_shown_at: Option<Instant>,
     denied_edits_this_turn: Vec<String>,
@@ -592,6 +660,10 @@ struct App {
     background_jobs: BTreeMap<String, BackgroundJobView>,
     streaming_message: Option<usize>,
     queued_turns: VecDeque<String>,
+    /// Cancel token for the streaming turn; None while idle.
+    turn_cancel: Option<CancelToken>,
+    /// Set on the first Esc while working; a second Esc force-abandons.
+    cancel_requested_at: Option<Instant>,
     last_stream_save: Instant,
     chat_scroll: usize,
     chat_scroll_target: usize,
@@ -605,6 +677,15 @@ struct App {
     session: Option<SessionStore>,
     active_modal: Option<Modal>,
     slash_selection: usize,
+    mention_selection: usize,
+    /// Workspace file list backing the @ mention picker; loaded when a
+    /// mention token appears and dropped when it goes away, so every picker
+    /// activation sees fresh files without re-walking per keystroke.
+    mention_files: Option<Vec<String>>,
+    /// Esc closed the picker for the current @token; the next edit reopens.
+    mention_dismissed: bool,
+    /// Workspace bell preference (MEDUSA_BELL can override at ring time).
+    bell_setting: bool,
     settings_selection: usize,
     model_selection: usize,
     permission_selection: usize,
@@ -613,6 +694,42 @@ struct App {
     image_preview_zoom: u16,
     theme_preview_original: Option<ThemeKind>,
     toast: Option<Toast>,
+    /// Backend-reported token usage summed over every request this app run.
+    session_usage: TokenUsage,
+    session_requests: usize,
+    /// Usage accumulated across the streaming turn's requests (one model
+    /// request per tool iteration); reset when a new turn starts.
+    turn_usage: TokenUsage,
+    turn_requests: usize,
+    /// Usage of the most recently finished turn, for the /cost readout.
+    last_turn_usage: TokenUsage,
+    last_turn_requests: usize,
+    /// Snapshot rendered by the /context modal, captured when the command ran.
+    context_report: Option<ContextReport>,
+    /// Result channel for a background /compact run; None while idle.
+    compact_events: Option<Receiver<Result<ManualCompaction, String>>>,
+    /// Recorder for the turn currently streaming; finished on turn end.
+    active_checkpoint: Option<CheckpointRecorder>,
+    /// Test-only capture of the exact `ToolRuntime` handed to the last model
+    /// turn's worker, so tests can assert the checkpoint recorder and cancel
+    /// token were actually wired onto it (not just onto `App`).
+    #[cfg(test)]
+    last_turn_runtime: Option<ToolRuntime>,
+    /// Test-only capture of the `ToolRuntime` handed to the last background
+    /// workflow's worker, for the same wiring assertions.
+    #[cfg(test)]
+    last_workflow_runtime: Option<ToolRuntime>,
+    rewind_entries: Vec<CheckpointEntry>,
+    rewind_selection: usize,
+    rewind_stage: RewindStage,
+    rewind_confirm_selection: usize,
+    /// Rows offered by the /edit backtrack picker: previous user messages,
+    /// newest first.
+    edit_picker_entries: Vec<EditPickerEntry>,
+    edit_picker_selection: usize,
+    /// Git probe used by /review; a fn pointer so tests can exercise both
+    /// the seeded and the "nothing to review" paths without a real repo.
+    review_diff_check: fn(&Path) -> bool,
 }
 
 const COMPOSER_IMAGE_PREVIEW_WIDTH: u16 = 18;
@@ -639,6 +756,39 @@ const SESSION_STATE_MAX_FILES: usize = 16;
 const SESSION_MEMORY_MAX_PER_KIND: usize = 5;
 
 const DOUBLE_ESCAPE_WINDOW: Duration = Duration::from_millis(1_500);
+/// The @ mention file walk stops after this many files so giant workspaces
+/// cannot stall the composer.
+const MENTION_FILE_WALK_CAP: usize = 5_000;
+/// At most this many fuzzy matches are kept for the mention popup.
+const MENTION_MATCH_LIMIT: usize = 50;
+/// Directories the @ mention file walk skips: VCS internals, caches, and
+/// build output that would drown real sources.
+const MENTION_SKIP_DIRS: &[&str] = &[
+    ".git",
+    ".hg",
+    ".svn",
+    ".medusa",
+    "target",
+    "node_modules",
+    "dist",
+    "build",
+    "out",
+    ".next",
+    ".cache",
+    ".venv",
+    "venv",
+    "__pycache__",
+    ".idea",
+];
+/// Turns shorter than this never ring the terminal bell.
+const BELL_MIN_WORKING_DURATION: Duration = Duration::from_secs(10);
+/// Heading written when quick-memory creates AGENTS.md from scratch.
+const QUICK_MEMORY_HEADER: &str = "# Project notes";
+/// Section of AGENTS.md that `# <note>` composer input appends to.
+const QUICK_MEMORY_SECTION: &str = "## Notes";
+/// Transcript note (and model-history system message) left when the user
+/// interrupts a turn with Esc.
+const TURN_INTERRUPTED_NOTE: &str = "turn interrupted by user";
 /// Decision keys are ignored for this long after an approval prompt first
 /// appears, so a keystroke already in flight can't blindly approve or deny.
 const APPROVAL_KEY_GRACE: Duration = Duration::from_millis(350);
@@ -770,9 +920,17 @@ fn material_dark_palette(
 
 impl ThemeKind {
     fn from_workspace_settings(workspace: &Path) -> Self {
-        env::var("MEDUSA_THEME")
-            .ok()
-            .and_then(|value| Self::from_name(&value))
+        Self::resolve(env::var("MEDUSA_THEME").ok().as_deref(), workspace)
+    }
+
+    /// Resolve the active theme from an explicit `MEDUSA_THEME`-style override
+    /// (highest priority) then the persisted workspace settings. Taking the
+    /// override as a parameter keeps tests off the process-global environment:
+    /// `set_var` racing the parallel test harness's `getenv`-backed readers is
+    /// undefined behavior.
+    fn resolve(env_override: Option<&str>, workspace: &Path) -> Self {
+        env_override
+            .and_then(Self::from_name)
             .or_else(|| {
                 load_app_settings(workspace)
                     .ok()
@@ -1244,7 +1402,30 @@ enum Modal {
     Models,
     Permissions,
     Themes,
+    Rewind,
+    EditMessage,
+    Mcp,
+    Agents,
+    Cost,
+    Context,
 }
+
+/// Which screen of the /rewind modal is showing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RewindStage {
+    Pick,
+    Confirm,
+}
+
+/// One row in the /edit backtrack picker: a previous user message.
+#[derive(Debug, Clone)]
+struct EditPickerEntry {
+    transcript_index: usize,
+    preview: String,
+}
+
+/// The /edit picker shows at most this many previous user messages.
+const EDIT_PICKER_LIMIT: usize = 20;
 
 #[derive(Debug, Clone)]
 struct Toast {
@@ -1636,6 +1817,28 @@ fn apply_tool_result_now(
     run.expanded = expand_on_failure && state == ToolRunState::Failed;
 }
 
+/// Sweep an interrupted workflow row: everything still running (the run, its
+/// phases, their agents) resolves to Failed so no spinner survives the turn.
+fn mark_workflow_view_cancelled(view: &mut WorkflowRunView) {
+    if view.status != WorkflowViewState::Running {
+        return;
+    }
+    view.status = WorkflowViewState::Failed;
+    if view.summary.is_empty() {
+        view.summary = "cancelled".to_string();
+    }
+    for phase in &mut view.phases {
+        if phase.status == WorkflowViewState::Running {
+            phase.status = WorkflowViewState::Failed;
+        }
+        for agent in &mut phase.agents {
+            if agent.status == WorkflowViewState::Running {
+                agent.status = WorkflowViewState::Failed;
+            }
+        }
+    }
+}
+
 impl ChatMessage {
     fn user(content: impl Into<String>) -> Self {
         Self {
@@ -1724,6 +1927,17 @@ impl App {
             .or_else(|| env::current_dir().ok())
             .unwrap_or_else(|| Path::new(".").to_path_buf());
         let tools = ToolRuntime::new(&cwd).expect("current directory should be usable");
+        let (mcp, mcp_load_error) = match McpRegistry::load(tools.workspace()) {
+            Ok(registry) => (registry, None),
+            Err(error) => (McpRegistry::empty(), Some(error.to_string())),
+        };
+        let tools = tools.with_mcp(mcp.clone());
+        // Deliberately do NOT prewarm MCP servers here: spawning a server runs
+        // an arbitrary command from `.medusa/mcp.json`, and a freshly-cloned
+        // untrusted repo must not execute those without a human click. Servers
+        // start lazily on first use, gated by a launch approval in every
+        // confined mode (Open mode trusts the workspace config). See
+        // ToolRuntime::mcp_tool_schemas / authorize_mcp_launch.
         let app_settings = load_app_settings(tools.workspace()).unwrap_or_default();
         let mut model =
             DirectCodexBackend::new(tools.workspace().to_path_buf()).expect("HTTP client builds");
@@ -1751,7 +1965,7 @@ impl App {
                 decision.recv().unwrap_or(ApprovalDecision::Deny)
             });
 
-        Self {
+        let mut app = Self {
             input: String::new(),
             input_cursor: 0,
             pending_attachments: Vec::new(),
@@ -1770,6 +1984,9 @@ impl App {
             theme,
             permission_mode,
             tools,
+            mcp,
+            mcp_statuses: Vec::new(),
+            agent_registry: AgentRegistry::default(),
             context_engine: ContextEngine::new(),
             plan_mode: false,
             last_escape_at: None,
@@ -1783,6 +2000,7 @@ impl App {
             approval_queue: VecDeque::new(),
             session_terminal_grants: Vec::new(),
             session_edit_grants: Vec::new(),
+            session_web_egress_allowed: false,
             denied_this_turn: Vec::new(),
             approval_shown_at: None,
             denied_edits_this_turn: Vec::new(),
@@ -1790,6 +2008,8 @@ impl App {
             background_jobs: BTreeMap::new(),
             streaming_message: None,
             queued_turns: VecDeque::new(),
+            turn_cancel: None,
+            cancel_requested_at: None,
             last_stream_save: Instant::now(),
             chat_scroll: 0,
             chat_scroll_target: 0,
@@ -1802,6 +2022,10 @@ impl App {
             session,
             active_modal: None,
             slash_selection: 0,
+            mention_selection: 0,
+            mention_files: None,
+            mention_dismissed: false,
+            bell_setting: app_settings.bell.unwrap_or(true),
             settings_selection: 0,
             model_selection: 0,
             permission_selection: permission_mode_index(permission_mode),
@@ -1810,7 +2034,31 @@ impl App {
             image_preview_zoom: 100,
             theme_preview_original: None,
             toast: None,
+            session_usage: TokenUsage::default(),
+            session_requests: 0,
+            turn_usage: TokenUsage::default(),
+            turn_requests: 0,
+            last_turn_usage: TokenUsage::default(),
+            last_turn_requests: 0,
+            context_report: None,
+            compact_events: None,
+            active_checkpoint: None,
+            #[cfg(test)]
+            last_turn_runtime: None,
+            #[cfg(test)]
+            last_workflow_runtime: None,
+            rewind_entries: Vec::new(),
+            rewind_selection: 0,
+            rewind_stage: RewindStage::Pick,
+            rewind_confirm_selection: 0,
+            edit_picker_entries: Vec::new(),
+            edit_picker_selection: 0,
+            review_diff_check: workspace_has_reviewable_diff,
+        };
+        if let Some(error) = mcp_load_error {
+            app.toast(format!("MCP config ignored: {error}"), ToastKind::Warning);
         }
+        app
     }
 
     fn run(&mut self, terminal: &mut Tui) -> Result<()> {
@@ -1834,6 +2082,7 @@ impl App {
             let background_changed = self.drain_background_job_events();
             let approval_changed = self.drain_approval_requests();
             let pending_tool_changed = self.drain_pending_tool_results();
+            let compact_changed = self.drain_compact_events();
 
             needs_draw |= terminal_changed
                 || toast_changed
@@ -1842,6 +2091,7 @@ impl App {
                 || background_changed
                 || approval_changed
                 || pending_tool_changed
+                || compact_changed
                 || animation_changed;
 
             let frame_cadence = if animated {
@@ -1946,7 +2196,16 @@ impl App {
                         self.resolve_pending_approval(ApprovalDecision::AllowOnce);
                     }
                     KeyCode::Char('a') | KeyCode::Char('A') => {
-                        self.resolve_pending_approval(ApprovalDecision::AlwaysAllow);
+                        // Escalation cards do not offer always-allow: a
+                        // persisted grant must never silently unsandbox
+                        // future runs.
+                        if self
+                            .approval_queue
+                            .front()
+                            .is_none_or(|pending| !pending.request.sandbox_escalation)
+                        {
+                            self.resolve_pending_approval(ApprovalDecision::AlwaysAllow);
+                        }
                     }
                     KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
                         self.last_escape_at = None;
@@ -2019,6 +2278,16 @@ impl App {
                 return;
             }
 
+            if self.active_modal == Some(Modal::Rewind) {
+                self.handle_rewind_key(key);
+                return;
+            }
+
+            if self.active_modal == Some(Modal::EditMessage) {
+                self.handle_edit_message_key(key);
+                return;
+            }
+
             if self.active_modal == Some(Modal::Models) {
                 match key.code {
                     KeyCode::Esc => self.close_modal(),
@@ -2087,6 +2356,7 @@ impl App {
 
         match key.code {
             KeyCode::Esc if self.slash_suggestions_active() => self.close_command_palette(),
+            KeyCode::Esc if self.mention_popup_visible() => self.dismiss_mention_picker(),
             KeyCode::Esc => self.handle_escape(),
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.should_quit = true;
@@ -2124,6 +2394,10 @@ impl App {
             KeyCode::Down if self.slash_suggestions_active() => self.move_slash_selection_down(),
             KeyCode::Tab if self.slash_suggestions_active() => self.move_slash_selection_down(),
             KeyCode::BackTab if self.slash_suggestions_active() => self.move_slash_selection_up(),
+            KeyCode::Up if self.mention_popup_visible() => self.move_mention_selection_up(),
+            KeyCode::Down if self.mention_popup_visible() => self.move_mention_selection_down(),
+            KeyCode::Tab if self.mention_popup_visible() => self.accept_mention_suggestion(),
+            KeyCode::BackTab if self.mention_popup_visible() => self.move_mention_selection_up(),
             KeyCode::BackTab => self.toggle_plan_mode(),
             KeyCode::Home if key.modifiers.is_empty() && self.slash_suggestions_active() => {
                 self.move_slash_selection_first();
@@ -2154,6 +2428,11 @@ impl App {
                 if self.slash_suggestions_active() =>
             {
                 self.accept_slash_suggestion();
+            }
+            KeyCode::Enter | KeyCode::Char('\n') | KeyCode::Char('\r')
+                if self.mention_popup_visible() =>
+            {
+                self.accept_mention_suggestion();
             }
             KeyCode::Enter | KeyCode::Char('\n') | KeyCode::Char('\r') => self.submit_input(),
             KeyCode::Char('j' | 'm') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -2255,6 +2534,7 @@ impl App {
         self.input.insert(index, ch);
         self.input_cursor += 1;
         self.clamp_slash_selection();
+        self.refresh_mention_state();
     }
 
     fn backspace_input_char(&mut self) {
@@ -2268,6 +2548,7 @@ impl App {
         self.input.replace_range(start..end, "");
         self.input_cursor -= 1;
         self.clamp_slash_selection();
+        self.refresh_mention_state();
     }
 
     fn delete_input_char(&mut self) {
@@ -2280,6 +2561,7 @@ impl App {
         let end = self.input_byte_index(self.input_cursor + 1);
         self.input.replace_range(start..end, "");
         self.clamp_slash_selection();
+        self.refresh_mention_state();
     }
 
     fn handle_paste(&mut self, text: String) {
@@ -2299,6 +2581,7 @@ impl App {
         self.input.insert_str(index, &text);
         self.input_cursor += pasted_chars;
         self.clamp_slash_selection();
+        self.refresh_mention_state();
     }
 
     fn paste_image_from_clipboard(&mut self) {
@@ -2657,6 +2940,27 @@ impl App {
             self.status_line = "input cleared".to_string();
             return;
         }
+        if self.is_working() {
+            // Never arms double-esc quit: cancelling a turn and quitting the
+            // app must stay two distinct gestures.
+            self.last_escape_at = None;
+            if self.cancel_requested_at.is_some() {
+                self.force_abandon_turn();
+            } else {
+                self.request_cancel_turn();
+            }
+            return;
+        }
+        if self.has_active_workflows() {
+            // A background workflow is running but no model turn is streaming
+            // (`is_working()` is false). Esc cancels the workflow — never falls
+            // through to the double-esc quit arm, which would kill subagents
+            // mid file_edit/file_patch and orphan their process-grouped
+            // children. Like a turn cancel, this never arms quit.
+            self.last_escape_at = None;
+            self.cancel_active_workflows();
+            return;
+        }
         if self.plan_mode {
             self.toggle_plan_mode();
             self.last_escape_at = None;
@@ -2841,6 +3145,155 @@ impl App {
         }
     }
 
+    /// Char-index span (start..end) and typed query of the @token under the
+    /// cursor: an '@' at a token boundary (start of input or after
+    /// whitespace) with no whitespace between it and the cursor. `end`
+    /// extends to the end of the contiguous token so accepting a suggestion
+    /// mid-token replaces the whole token; the query is only what was typed
+    /// so far (between '@' and the cursor).
+    fn active_mention_token(&self) -> Option<(usize, usize, String)> {
+        let chars: Vec<char> = self.input.chars().collect();
+        let cursor = self.input_cursor.min(chars.len());
+        let mut at = None;
+        for index in (0..cursor).rev() {
+            let ch = chars[index];
+            if ch == '@' {
+                if index == 0 || chars[index - 1].is_whitespace() {
+                    at = Some(index);
+                }
+                break;
+            }
+            if ch.is_whitespace() {
+                break;
+            }
+        }
+        let start = at?;
+        let mut end = cursor;
+        while end < chars.len() && !chars[end].is_whitespace() {
+            end += 1;
+        }
+        let query = chars[start + 1..cursor].iter().collect();
+        Some((start, end, query))
+    }
+
+    fn mention_active(&self) -> bool {
+        !self.mention_dismissed
+            && !self.slash_suggestions_active()
+            && self.active_mention_token().is_some()
+    }
+
+    fn mention_popup_visible(&self) -> bool {
+        self.mention_active() && !self.mention_matches().is_empty()
+    }
+
+    /// Keep mention picker state in sync after any composer edit: load the
+    /// workspace file list when an @token appears, drop it when the token
+    /// goes away, and clear an Esc dismissal (typing reopens the picker).
+    fn refresh_mention_state(&mut self) {
+        self.mention_dismissed = false;
+        if !self.slash_suggestions_active() && self.active_mention_token().is_some() {
+            if self.mention_files.is_none() {
+                self.mention_files = Some(collect_workspace_files(
+                    self.tools.workspace(),
+                    MENTION_FILE_WALK_CAP,
+                ));
+            }
+            self.clamp_mention_selection();
+        } else {
+            self.mention_files = None;
+            self.mention_selection = 0;
+        }
+    }
+
+    fn mention_matches(&self) -> Vec<(&str, Vec<usize>)> {
+        if !self.mention_active() {
+            return Vec::new();
+        }
+        let Some((_, _, query)) = self.active_mention_token() else {
+            return Vec::new();
+        };
+        let Some(files) = &self.mention_files else {
+            return Vec::new();
+        };
+
+        let query = query.to_ascii_lowercase();
+        let mut matches = files
+            .iter()
+            .enumerate()
+            .filter_map(|(index, path)| {
+                mention_match(path, &query)
+                    .map(|(score, positions)| (score, index, path.as_str(), positions))
+            })
+            .collect::<Vec<_>>();
+        matches.sort_by_key(|(score, index, _, _)| (*score, *index));
+        matches.truncate(MENTION_MATCH_LIMIT);
+        matches
+            .into_iter()
+            .map(|(_, _, path, positions)| (path, positions))
+            .collect()
+    }
+
+    fn clamp_mention_selection(&mut self) {
+        let count = self.mention_matches().len();
+        if count == 0 {
+            self.mention_selection = 0;
+        } else if self.mention_selection >= count {
+            self.mention_selection = count - 1;
+        }
+    }
+
+    fn move_mention_selection_up(&mut self) {
+        let count = self.mention_matches().len();
+        if count == 0 {
+            return;
+        }
+        self.mention_selection = if self.mention_selection == 0 {
+            count - 1
+        } else {
+            self.mention_selection - 1
+        };
+        self.status_line = "file suggestion".to_string();
+    }
+
+    fn move_mention_selection_down(&mut self) {
+        let count = self.mention_matches().len();
+        if count == 0 {
+            return;
+        }
+        self.mention_selection = (self.mention_selection + 1) % count;
+        self.status_line = "file suggestion".to_string();
+    }
+
+    /// Replace the @token with the selected workspace-relative path (plain
+    /// text — the model reads files itself) plus a trailing space.
+    fn accept_mention_suggestion(&mut self) {
+        let Some(path) = self
+            .mention_matches()
+            .get(self.mention_selection)
+            .map(|(path, _)| (*path).to_string())
+        else {
+            return;
+        };
+        let Some((start, end, _)) = self.active_mention_token() else {
+            return;
+        };
+
+        let start_byte = self.input_byte_index(start);
+        let end_byte = self.input_byte_index(end);
+        self.input
+            .replace_range(start_byte..end_byte, &format!("{path} "));
+        self.input_cursor = start + path.chars().count() + 1;
+        self.mention_selection = 0;
+        self.mention_files = None;
+        self.status_line = format!("mentioned {path}");
+    }
+
+    fn dismiss_mention_picker(&mut self) {
+        self.mention_dismissed = true;
+        self.mention_selection = 0;
+        self.status_line = "file picker closed".to_string();
+    }
+
     fn open_settings_modal(&mut self) {
         self.active_modal = Some(Modal::Settings);
         self.settings_selection = 0;
@@ -2894,9 +3347,29 @@ impl App {
             Some("model") => self.open_models_modal(),
             Some("theme") => self.open_themes_modal(),
             Some("permissions") => self.open_permissions_modal(),
+            Some("bell") => self.toggle_bell_setting(),
             Some(_) | None => {
                 self.status_line = "setting is read-only".to_string();
                 self.toast("Read-only setting", ToastKind::Info);
+            }
+        }
+    }
+
+    fn toggle_bell_setting(&mut self) {
+        self.bell_setting = !self.bell_setting;
+        let label = if self.bell_setting {
+            "Bell on"
+        } else {
+            "Bell off"
+        };
+        match save_bell_preference(self.tools.workspace(), self.bell_setting) {
+            Ok(()) => {
+                self.status_line = label.to_ascii_lowercase();
+                self.toast(label, ToastKind::Info);
+            }
+            Err(error) => {
+                self.status_line = format!("bell preference not saved: {error}");
+                self.toast("Bell preference not saved", ToastKind::Warning);
             }
         }
     }
@@ -3442,7 +3915,10 @@ impl App {
     }
 
     fn handle_decision_key(&mut self, key: KeyEvent) -> bool {
-        if self.pending_decision().is_none() || self.slash_suggestions_active() {
+        if self.pending_decision().is_none()
+            || self.slash_suggestions_active()
+            || self.mention_popup_visible()
+        {
             return false;
         }
 
@@ -3802,9 +4278,25 @@ impl App {
         if task.is_empty() && self.pending_attachments.is_empty() {
             if self.pending_decision().is_some() {
                 self.accept_decision_enter();
+            } else if !self.is_working()
+                && !self.has_active_workflows()
+                && !self.queued_turns.is_empty()
+            {
+                // Prompts kept from a cancelled turn ([21]) run on an explicit
+                // empty submit — never silently auto-launched.
+                self.start_next_queued_turn();
             } else {
                 self.status_line = "Type a task first.".to_string();
             }
+            return;
+        }
+
+        // `# <note>` is quick memory: record it in AGENTS.md instead of
+        // sending a model turn (works even mid-turn or with a decision
+        // pending — a note is never an answer).
+        if let Some(note) = task.strip_prefix("# ") {
+            let note = note.trim().to_string();
+            self.record_quick_memory(&note);
             return;
         }
 
@@ -3820,6 +4312,7 @@ impl App {
         self.attachment_previews.clear();
         self.input.clear();
         self.input_cursor = 0;
+        self.refresh_mention_state();
         if attachments.is_empty() && self.run_local_tool_command(&task) {
             self.persist_session();
             self.scroll_chat_to_bottom();
@@ -3854,6 +4347,38 @@ impl App {
         self.persist_session();
         self.scroll_chat_to_bottom();
         self.start_model_turn(&task);
+    }
+
+    /// Quick memory: append the note under `## Notes` in AGENTS.md and leave
+    /// a muted transcript line. Nothing is sent to the model now — project
+    /// instructions are reloaded from AGENTS.md at the start of every turn,
+    /// so the note applies from the next turn automatically.
+    fn record_quick_memory(&mut self, note: &str) {
+        self.input.clear();
+        self.input_cursor = 0;
+        if note.is_empty() {
+            self.status_line = "empty note".to_string();
+            self.toast("Nothing to note", ToastKind::Warning);
+            return;
+        }
+
+        match append_quick_memory(self.tools.workspace(), note) {
+            Ok(()) => {
+                self.transcript
+                    .push(TranscriptItem::Message(ChatMessage::system(format!(
+                        "noted in AGENTS.md: {note} (applies from next turn)"
+                    ))));
+                self.touch_transcript();
+                self.persist_session();
+                self.scroll_chat_to_bottom();
+                self.status_line = "noted in AGENTS.md".to_string();
+                self.toast("noted in AGENTS.md", ToastKind::Success);
+            }
+            Err(error) => {
+                self.status_line = format!("note failed: {error}");
+                self.toast("Note failed", ToastKind::Error);
+            }
+        }
     }
 
     fn run_local_tool_command(&mut self, task: &str) -> bool {
@@ -3979,6 +4504,39 @@ impl App {
             return true;
         }
 
+        if task == "/rewind" {
+            self.open_rewind_modal();
+            return true;
+        }
+
+        if task == "/edit" {
+            self.open_edit_message_modal();
+            return true;
+        }
+
+        if task == "/review" {
+            self.run_review_command();
+            return true;
+        }
+
+        if task == "/cost" {
+            self.active_modal = Some(Modal::Cost);
+            self.status_line = "token usage opened".to_string();
+            return true;
+        }
+
+        if task == "/context" {
+            self.context_report = Some(self.build_context_report());
+            self.active_modal = Some(Modal::Context);
+            self.status_line = "context breakdown opened".to_string();
+            return true;
+        }
+
+        if task == "/compact" {
+            self.run_compact_command();
+            return true;
+        }
+
         if task == "/clear" {
             self.transcript.clear();
             self.touch_transcript();
@@ -4079,6 +4637,43 @@ impl App {
             self.touch_transcript();
             self.status_line = "skills listed".to_string();
             self.toast("Workspace skills listed", ToastKind::Info);
+            return true;
+        }
+
+        if task == "/agents" {
+            self.agent_registry = AgentRegistry::load(self.tools.workspace()).unwrap_or_default();
+            self.active_modal = Some(Modal::Agents);
+            self.status_line = "named agents".to_string();
+            return true;
+        }
+
+        if task == "/mcp" || task.starts_with("/mcp ") {
+            let args = task.strip_prefix("/mcp").unwrap_or_default().trim();
+            if args.is_empty() {
+                self.mcp_statuses = self.mcp.statuses();
+                self.active_modal = Some(Modal::Mcp);
+                self.status_line = "mcp servers".to_string();
+                return true;
+            }
+            let Some(name) = args.strip_prefix("restart ").map(str::trim) else {
+                self.status_line = "usage: /mcp [restart <server>]".to_string();
+                self.toast("Usage: /mcp [restart <server>]", ToastKind::Warning);
+                return true;
+            };
+            if !self.mcp.has_server(name) {
+                self.status_line = "unknown mcp server".to_string();
+                self.toast(format!("Unknown MCP server: {name}"), ToastKind::Error);
+                return true;
+            }
+            // Restarting spawns and handshakes (seconds); never on the UI
+            // thread. Progress is visible by reopening /mcp.
+            let registry = self.mcp.clone();
+            let server = name.to_string();
+            self.status_line = format!("restarting mcp server {name}");
+            self.toast(format!("Restarting MCP server {name}"), ToastKind::Info);
+            thread::spawn(move || {
+                let _ = registry.restart(&server);
+            });
             return true;
         }
 
@@ -4196,9 +4791,9 @@ impl App {
         self.permission_selection = permission_mode_index(mode);
         self.status_line = format!("permissions: {}", mode.name());
 
-        match save_permission_mode_preference(&workspace, mode)
-            .and_then(|_| ToolRuntime::new(&workspace).map(|runtime| (runtime, ())))
-        {
+        match save_permission_mode_preference(&workspace, mode).and_then(|_| {
+            ToolRuntime::new(&workspace).map(|runtime| (runtime.with_mcp(self.mcp.clone()), ()))
+        }) {
             Ok((runtime, ())) => {
                 self.tools = runtime;
                 self.toast(
@@ -4297,6 +4892,372 @@ impl App {
         }
     }
 
+    fn has_running_background_jobs(&self) -> bool {
+        self.background_jobs
+            .values()
+            .any(|job| job.state == ToolRunState::Running)
+    }
+
+    /// A rewind touches the same files a running turn or background job may
+    /// be writing; refuse instead of racing them.
+    fn rewind_blocked_reason(&self) -> Option<&'static str> {
+        if self.is_working() || self.has_active_workflows() {
+            Some("finish the current turn before rewinding")
+        } else if self.has_running_background_jobs() {
+            Some("stop background jobs before rewinding")
+        } else {
+            None
+        }
+    }
+
+    fn open_rewind_modal(&mut self) {
+        if let Some(reason) = self.rewind_blocked_reason() {
+            self.status_line = reason.to_string();
+            self.toast("Cannot rewind now", ToastKind::Warning);
+            return;
+        }
+
+        let entries = CheckpointStore::open(self.tools.workspace())
+            .and_then(|store| store.list())
+            .unwrap_or_default();
+        if entries.is_empty() {
+            self.status_line = "no checkpoints yet".to_string();
+            self.toast("No checkpoints to rewind to", ToastKind::Info);
+            return;
+        }
+
+        self.rewind_entries = entries;
+        self.rewind_selection = 0;
+        self.rewind_stage = RewindStage::Pick;
+        self.rewind_confirm_selection = 0;
+        self.active_modal = Some(Modal::Rewind);
+        self.status_line = "rewind opened".to_string();
+    }
+
+    fn selected_rewind_entry(&self) -> Option<&CheckpointEntry> {
+        self.rewind_entries.get(self.rewind_selection)
+    }
+
+    /// Fork is only offered for checkpoints from the current session; grafting
+    /// a foreign transcript onto this session would be nonsense.
+    ///
+    /// Session-id equality is necessary but NOT sufficient: `/clear` empties
+    /// the transcript without rotating the session id, so a pre-clear
+    /// checkpoint's `transcript_user_index` no longer maps to its user message.
+    /// Forking on that stale index truncates the live transcript at a
+    /// meaningless row. So also require the recorded index to still point at a
+    /// live user message whose prompt matches the checkpoint's excerpt; if it
+    /// does not, only file-only restore is offered.
+    fn selected_rewind_offers_fork(&self) -> bool {
+        match (self.selected_rewind_entry(), self.session.as_ref()) {
+            (Some(entry), Some(session)) => {
+                entry.session_id == session.current_id() && self.checkpoint_index_is_live(entry)
+            }
+            _ => false,
+        }
+    }
+
+    /// True when the checkpoint's recorded user-message row still exists in the
+    /// current transcript, is a user message, and its prompt still matches the
+    /// checkpoint's excerpt — i.e. forking at that index would land on the
+    /// prompt the checkpoint was taken for, not a post-`/clear` coincidence.
+    fn checkpoint_index_is_live(&self, entry: &CheckpointEntry) -> bool {
+        matches!(
+            self.transcript.get(entry.transcript_user_index),
+            Some(TranscriptItem::Message(message))
+                if message.role == ChatRole::User
+                    && excerpt_for_checkpoint(&message.content) == entry.prompt_excerpt
+        )
+    }
+
+    /// Confirm-screen options: file-only restore is the default; fork is an
+    /// extra option when available; cancel is always last.
+    fn rewind_confirm_options(&self) -> Vec<&'static str> {
+        if self.selected_rewind_offers_fork() {
+            vec![
+                "Restore files",
+                "Restore files + fork conversation",
+                "Cancel",
+            ]
+        } else {
+            vec!["Restore files", "Cancel"]
+        }
+    }
+
+    fn handle_rewind_key(&mut self, key: KeyEvent) {
+        match self.rewind_stage {
+            RewindStage::Pick => match key.code {
+                KeyCode::Esc => self.close_modal(),
+                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.should_quit = true;
+                }
+                KeyCode::Up | KeyCode::BackTab => {
+                    self.rewind_selection = self.rewind_selection.saturating_sub(1);
+                }
+                KeyCode::Down | KeyCode::Tab => {
+                    self.rewind_selection = (self.rewind_selection + 1)
+                        .min(self.rewind_entries.len().saturating_sub(1));
+                }
+                KeyCode::Home => self.rewind_selection = 0,
+                KeyCode::End => {
+                    self.rewind_selection = self.rewind_entries.len().saturating_sub(1);
+                }
+                KeyCode::Enter => {
+                    if self.selected_rewind_entry().is_some() {
+                        self.rewind_stage = RewindStage::Confirm;
+                        self.rewind_confirm_selection = 0;
+                    }
+                }
+                _ => {}
+            },
+            RewindStage::Confirm => match key.code {
+                KeyCode::Esc => {
+                    self.rewind_stage = RewindStage::Pick;
+                }
+                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.should_quit = true;
+                }
+                KeyCode::Up | KeyCode::BackTab => {
+                    self.rewind_confirm_selection = self.rewind_confirm_selection.saturating_sub(1);
+                }
+                KeyCode::Down | KeyCode::Tab => {
+                    self.rewind_confirm_selection = (self.rewind_confirm_selection + 1)
+                        .min(self.rewind_confirm_options().len().saturating_sub(1));
+                }
+                KeyCode::Enter => self.accept_rewind_confirm(),
+                _ => {}
+            },
+        }
+    }
+
+    fn accept_rewind_confirm(&mut self) {
+        let options = self.rewind_confirm_options();
+        let choice = options
+            .get(self.rewind_confirm_selection)
+            .copied()
+            .unwrap_or("Cancel");
+        match choice {
+            "Restore files" => self.execute_rewind_restore(false),
+            "Restore files + fork conversation" => self.execute_rewind_restore(true),
+            _ => {
+                self.rewind_stage = RewindStage::Pick;
+            }
+        }
+    }
+
+    fn execute_rewind_restore(&mut self, fork: bool) {
+        if let Some(reason) = self.rewind_blocked_reason() {
+            self.status_line = reason.to_string();
+            self.toast("Cannot rewind now", ToastKind::Warning);
+            return;
+        }
+        let Some(entry) = self.selected_rewind_entry().cloned() else {
+            self.close_modal();
+            return;
+        };
+
+        let report = match CheckpointStore::open(self.tools.workspace())
+            .and_then(|store| store.restore(&entry.id))
+        {
+            Ok(report) => report,
+            Err(error) => {
+                self.close_modal();
+                self.status_line = format!("rewind failed: {error}");
+                self.toast(format!("Rewind failed: {error}"), ToastKind::Error);
+                return;
+            }
+        };
+
+        self.close_modal();
+        let rewound = report.restored.len() + report.deleted.len();
+        let mut message = format!(
+            "Rewound {rewound} file{}",
+            if rewound == 1 { "" } else { "s" }
+        );
+        if !report.skipped.is_empty() {
+            message.push_str(&format!(
+                " · {} not rewindable (too large or symlink)",
+                report.skipped.len()
+            ));
+        }
+        if !report.refused.is_empty() {
+            message.push_str(&format!(
+                " · {} refused (would escape workspace)",
+                report.refused.len()
+            ));
+        }
+        let toast_kind = if report.refused.is_empty() {
+            ToastKind::Success
+        } else {
+            ToastKind::Error
+        };
+        self.toast(message, toast_kind);
+        self.status_line = format!("rewound to before {}", truncate(&entry.prompt_excerpt, 48));
+
+        if fork {
+            self.fork_transcript_at_checkpoint(&entry);
+        }
+    }
+
+    /// Fork the conversation back to the checkpoint's turn: drop that user
+    /// message and everything after it, fork the session file, and put the
+    /// old prompt back in the composer for editing.
+    ///
+    /// Refuses (leaving files-only restore intact) when the checkpoint's
+    /// recorded index no longer maps to its user message — e.g. after `/clear`
+    /// invalidated all indices without rotating the session id. Forking on a
+    /// stale index would truncate the live transcript at a meaningless row.
+    fn fork_transcript_at_checkpoint(&mut self, entry: &CheckpointEntry) {
+        if !self.checkpoint_index_is_live(entry) {
+            self.status_line = "fork skipped: checkpoint predates the current conversation".into();
+            self.toast(
+                "Files restored; conversation left as-is (checkpoint is from a cleared timeline)",
+                ToastKind::Warning,
+            );
+            return;
+        }
+        if let Some(name) = self.fork_transcript_before(entry.transcript_user_index) {
+            self.status_line = format!("forked {name}");
+            self.toast("Conversation forked at checkpoint", ToastKind::Success);
+        }
+    }
+
+    /// Shared backtrack core: truncate the live transcript to just before
+    /// the user message at `index`, fork the session file so the original
+    /// timeline stays reachable via /tree, and put the dropped prompt back
+    /// in the composer for editing. Returns the forked session name.
+    fn fork_transcript_before(&mut self, index: usize) -> Option<String> {
+        let Some(session) = self.session.as_mut() else {
+            self.toast("No session to fork", ToastKind::Warning);
+            return None;
+        };
+
+        let index = index.min(self.transcript.len());
+        let old_prompt = match self.transcript.get(index) {
+            Some(TranscriptItem::Message(message)) if message.role == ChatRole::User => {
+                message.content.clone()
+            }
+            _ => String::new(),
+        };
+
+        self.transcript.truncate(index);
+        match session.fork(&self.transcript) {
+            Ok(name) => {
+                self.touch_transcript();
+                self.selected_tool = None;
+                self.streaming_message = None;
+                self.context_engine.reset();
+                self.scroll_chat_to_bottom();
+                self.input = old_prompt;
+                self.input_cursor = self.input_len();
+                Some(name)
+            }
+            Err(error) => {
+                self.status_line = format!("fork failed: {error}");
+                self.toast("Fork failed", ToastKind::Error);
+                None
+            }
+        }
+    }
+
+    /// `/edit`: open the backtrack picker over previous user messages.
+    /// Double-Esc on an idle composer is already the quit gesture, so
+    /// backtracking lives on a slash command instead of a key chord.
+    fn open_edit_message_modal(&mut self) {
+        if self.is_working() {
+            self.status_line = "finish the current turn before editing a message".to_string();
+            self.toast("Cannot edit while a turn is running", ToastKind::Warning);
+            return;
+        }
+        let entries = self
+            .transcript
+            .iter()
+            .enumerate()
+            .rev()
+            .filter_map(|(index, item)| match item {
+                TranscriptItem::Message(message) if message.role == ChatRole::User => {
+                    Some(EditPickerEntry {
+                        transcript_index: index,
+                        preview: message_one_liner(&message.content, 60),
+                    })
+                }
+                _ => None,
+            })
+            .take(EDIT_PICKER_LIMIT)
+            .collect::<Vec<_>>();
+        if entries.is_empty() {
+            self.status_line = "no previous messages to edit".to_string();
+            self.toast("Nothing to edit yet", ToastKind::Info);
+            return;
+        }
+        self.edit_picker_entries = entries;
+        self.edit_picker_selection = 0;
+        self.active_modal = Some(Modal::EditMessage);
+        self.status_line = "pick a message to edit".to_string();
+    }
+
+    fn handle_edit_message_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc => self.close_modal(),
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.should_quit = true;
+            }
+            KeyCode::Up | KeyCode::BackTab => {
+                self.edit_picker_selection = self.edit_picker_selection.saturating_sub(1);
+            }
+            KeyCode::Down | KeyCode::Tab => {
+                self.edit_picker_selection = (self.edit_picker_selection + 1)
+                    .min(self.edit_picker_entries.len().saturating_sub(1));
+            }
+            KeyCode::Home => self.edit_picker_selection = 0,
+            KeyCode::End => {
+                self.edit_picker_selection = self.edit_picker_entries.len().saturating_sub(1);
+            }
+            KeyCode::Enter => self.accept_edit_message_selection(),
+            _ => {}
+        }
+    }
+
+    fn accept_edit_message_selection(&mut self) {
+        let Some(index) = self
+            .edit_picker_entries
+            .get(self.edit_picker_selection)
+            .map(|entry| entry.transcript_index)
+        else {
+            self.close_modal();
+            return;
+        };
+        self.active_modal = None;
+        if self.is_working() {
+            self.status_line = "finish the current turn before editing a message".to_string();
+            self.toast("Cannot edit while a turn is running", ToastKind::Warning);
+            return;
+        }
+        if self.fork_transcript_before(index).is_some() {
+            self.status_line =
+                "editing message — enter resends from here (original timeline kept in /tree)"
+                    .to_string();
+            self.toast(
+                "Backtracked — original timeline kept in /tree",
+                ToastKind::Success,
+            );
+        }
+    }
+
+    /// `/review`: seed the composer with a code-review prompt (never
+    /// auto-sent, so scope can be trimmed first). Toasts instead when the
+    /// workspace has no git repo or no pending changes.
+    fn run_review_command(&mut self) {
+        if !(self.review_diff_check)(self.tools.workspace()) {
+            self.status_line = "nothing to review".to_string();
+            self.toast("Nothing to review", ToastKind::Info);
+            return;
+        }
+        self.input = REVIEW_PROMPT_TEMPLATE.to_string();
+        self.input_cursor = self.input_len();
+        self.status_line = "review prompt ready — edit and press enter".to_string();
+    }
+
     fn start_model_turn(&mut self, _task: &str) {
         if !self.model_enabled {
             self.status_line = "queued".to_string();
@@ -4325,13 +5286,51 @@ impl App {
 
         self.denied_this_turn.clear();
         self.denied_edits_this_turn.clear();
+        self.turn_usage = TokenUsage::default();
+        self.turn_requests = 0;
         let backend = self.model.clone();
         let permission_mode = self.permission_mode;
+        // Per-turn checkpoint recorder: mutating file tools capture pre-images
+        // through it, keyed to this turn's user message row.
+        let transcript_user_index = self.transcript[..assistant_index]
+            .iter()
+            .rposition(|item| {
+                matches!(
+                    item,
+                    TranscriptItem::Message(ChatMessage {
+                        role: ChatRole::User,
+                        ..
+                    })
+                )
+            })
+            .unwrap_or(0);
+        let recorder = CheckpointRecorder::new(
+            self.tools.workspace(),
+            CheckpointMeta {
+                session_id: self
+                    .session
+                    .as_ref()
+                    .map(SessionStore::current_id)
+                    .unwrap_or_default(),
+                prompt_excerpt: excerpt_for_checkpoint(_task),
+                transcript_user_index,
+            },
+        );
+        self.active_checkpoint = Some(recorder.clone());
+        let cancel = CancelToken::new();
+        self.turn_cancel = Some(cancel.clone());
+        self.cancel_requested_at = None;
         let tools = self
             .tools
             .clone()
             .with_background_events(self.background_job_sender.clone())
-            .with_approval_handler(self.approval_handler.clone());
+            .with_approval_handler(self.approval_handler.clone())
+            .with_checkpoint_recorder(recorder)
+            .with_cancel_token(cancel.clone());
+        #[cfg(test)]
+        {
+            self.last_turn_runtime = Some(tools.clone());
+        }
         let history = self.conversation_history();
         let context_engine = self.context_engine.clone();
         let plan_mode = self.plan_mode;
@@ -4340,8 +5339,9 @@ impl App {
 
         thread::spawn(move || {
             // Compaction may call the model to summarize old history, so it
-            // runs here on the worker thread, never on the UI thread.
-            let prompt = context_engine.prepare(&history, &backend);
+            // runs here on the worker thread, never on the UI thread. It
+            // shares the turn's cancel token so Esc interrupts it too.
+            let prompt = context_engine.prepare(&history, &backend, &cancel);
             let result = if permission_mode == PermissionMode::Readonly || plan_mode {
                 backend.chat_stream_messages_read_only(&prompt, tools, |event| {
                     sender.send(event).map_err(|error| {
@@ -4362,6 +5362,9 @@ impl App {
                 Ok(event_count) => {
                     let _ = sender.send(ModelStreamEvent::Done { event_count });
                 }
+                Err(error) if error_is_cancellation(&error) => {
+                    let _ = sender.send(ModelStreamEvent::Cancelled);
+                }
                 Err(error) => {
                     let _ = sender.send(ModelStreamEvent::Error(error.to_string()));
                 }
@@ -4373,8 +5376,214 @@ impl App {
         self.model_events.is_some() || self.streaming_message.is_some()
     }
 
+    /// BEL when a long-running turn needs attention (approval prompt) or
+    /// ends (complete/error/cancel); [`should_ring_bell`] holds the gating.
+    fn ring_bell_if_due(&self) {
+        let enabled = bell_enabled(self.bell_setting, env::var("MEDUSA_BELL").ok().as_deref());
+        let working_for = self.turn_started_at.map(|started| started.elapsed());
+        if should_ring_bell(enabled, working_for) {
+            let mut stdout = io::stdout();
+            let _ = stdout.write_all(b"\x07");
+            let _ = stdout.flush();
+        }
+    }
+
+    /// First Esc while working: flip the turn's cancel token and unblock a
+    /// worker that may be parked on an approval prompt by denying everything
+    /// queued. The worker unwinds cooperatively and reports Cancelled.
+    fn request_cancel_turn(&mut self) {
+        if let Some(token) = &self.turn_cancel {
+            token.cancel();
+        }
+        while let Some(pending) = self.approval_queue.pop_front() {
+            let _ = pending.respond.send(ApprovalDecision::Deny);
+        }
+        self.approval_shown_at = None;
+        self.cancel_requested_at = Some(Instant::now());
+        self.status_line = "cancelling… esc again to force-stop".to_string();
+    }
+
+    /// Second Esc while cancelling: stop waiting for the worker. Dropping the
+    /// receiver makes its next send fail, so the thread dies on its own.
+    fn force_abandon_turn(&mut self) {
+        self.model_events = None;
+        self.finalize_cancelled_turn("turn abandoned");
+    }
+
+    /// Close out an interrupted turn: resolve every still-running transcript
+    /// row, leave a muted system note (which also re-enters model history so
+    /// the conversation resumes coherently), and clear all turn state.
+    /// Partial assistant text stays in the transcript.
+    /// Freeze the streaming turn's usage into the last-turn readout. Guarded
+    /// so a turn that failed before any request keeps the previous readout.
+    fn record_turn_usage_totals(&mut self) {
+        if self.turn_requests > 0 {
+            self.last_turn_usage = self.turn_usage;
+            self.last_turn_requests = self.turn_requests;
+        }
+    }
+
+    fn finalize_cancelled_turn(&mut self, status: &str) {
+        self.record_turn_usage_totals();
+        self.ring_bell_if_due();
+        for item in &mut self.transcript {
+            match item {
+                TranscriptItem::Tool(run) if run.state == ToolRunState::Running => {
+                    apply_tool_result_now(
+                        run,
+                        ToolRunState::Failed,
+                        "cancelled".to_string(),
+                        false,
+                    );
+                }
+                TranscriptItem::Workflow(view) => mark_workflow_view_cancelled(view),
+                _ => {}
+            }
+        }
+        // The turn's views are marked cancelled above; actually stop the
+        // background workflow workers so their file-mutating tools bail (their
+        // checkpoints are then finalized when the receiver disconnects).
+        for workflow in &self.workflow_events {
+            workflow.cancel.cancel();
+        }
+        self.transcript
+            .push(TranscriptItem::Message(ChatMessage::system(
+                TURN_INTERRUPTED_NOTE,
+            )));
+        self.touch_transcript();
+        self.stick_chat_to_bottom_if_needed();
+
+        self.streaming_message = None;
+        self.turn_started_at = None;
+        self.turn_cancel = None;
+        self.cancel_requested_at = None;
+        self.status_line = status.to_string();
+        // Keep the follow-up prompts the user explicitly queued (the UI
+        // acknowledged each with "queued: …"). Silently dropping them on cancel
+        // loses text the user believes is pending; instead we hold them and say
+        // so — an empty submit while idle runs the next one.
+        if !self.queued_turns.is_empty() {
+            let count = self.queued_turns.len();
+            self.toast(
+                format!(
+                    "{count} queued prompt{} kept — submit an empty line to run",
+                    if count == 1 { "" } else { "s" }
+                ),
+                ToastKind::Info,
+            );
+        }
+        self.persist_session();
+        self.finish_turn_checkpoint();
+    }
+
     fn has_active_workflows(&self) -> bool {
         !self.workflow_events.is_empty()
+    }
+
+    /// Cancel every background workflow: flip each run's shared cancel token so
+    /// its subagents' model streams and file-mutating tools bail cooperatively,
+    /// and mark the visible workflow rows cancelled now. The workers are
+    /// removed from `workflow_events` once their receivers disconnect
+    /// (`drain_workflow_events`), which also finalizes their checkpoints; the JS
+    /// orchestration loop may run to its next await before it observes the
+    /// token, so the rows show "cancelled" a beat before the thread exits.
+    fn cancel_active_workflows(&mut self) {
+        if self.workflow_events.is_empty() {
+            return;
+        }
+        let count = self.workflow_events.len();
+        for workflow in &self.workflow_events {
+            workflow.cancel.cancel();
+        }
+        for view in &mut self.workflows {
+            mark_workflow_view_cancelled(view);
+        }
+        let mut transcript_changed = false;
+        for item in &mut self.transcript {
+            if let TranscriptItem::Workflow(view) = item {
+                mark_workflow_view_cancelled(view);
+                transcript_changed = true;
+            }
+        }
+        if transcript_changed {
+            self.touch_transcript();
+        }
+        self.status_line = "cancelling background workflow…".to_string();
+        self.toast(
+            format!(
+                "Cancelling {count} background workflow{}",
+                if count == 1 { "" } else { "s" }
+            ),
+            ToastKind::Warning,
+        );
+    }
+
+    /// `/compact`: fold older history into the ContextEngine summary now
+    /// instead of waiting for the budget to force it. Summarization calls the
+    /// model, so it runs on a worker thread; the result lands via
+    /// [`Self::drain_compact_events`].
+    fn run_compact_command(&mut self) {
+        if self.is_working() {
+            self.status_line = "compact unavailable while a turn is running".to_string();
+            self.toast("Cannot compact while a turn is running", ToastKind::Warning);
+            return;
+        }
+        if self.compact_events.is_some() {
+            self.status_line = "compaction already running".to_string();
+            self.toast("Compaction already running", ToastKind::Info);
+            return;
+        }
+        if !self.model_enabled {
+            self.status_line = "compact needs the model backend".to_string();
+            self.toast("Compaction needs the model backend", ToastKind::Warning);
+            return;
+        }
+
+        let history = self.conversation_history();
+        let engine = self.context_engine.clone();
+        let backend = self.model.clone();
+        let (sender, receiver) = mpsc::channel();
+        self.compact_events = Some(receiver);
+        self.status_line = "compacting context…".to_string();
+
+        thread::spawn(move || {
+            let cancel = CancelToken::new();
+            let result = engine
+                .compact_now(&history, &backend, &cancel)
+                .map_err(|error| error.to_string());
+            let _ = sender.send(result);
+        });
+    }
+
+    fn drain_compact_events(&mut self) -> bool {
+        let Some(receiver) = &self.compact_events else {
+            return false;
+        };
+        let outcome = match receiver.try_recv() {
+            Ok(outcome) => outcome,
+            Err(TryRecvError::Empty) => return false,
+            Err(TryRecvError::Disconnected) => Err("compaction worker exited".to_string()),
+        };
+        self.compact_events = None;
+        match outcome {
+            Ok(compaction) => {
+                self.status_line = "context compacted".to_string();
+                self.toast(
+                    format!(
+                        "Compacted: est. {} → {} ({} messages folded)",
+                        format_token_count(compaction.before_tokens as u64),
+                        format_token_count(compaction.after_tokens as u64),
+                        compaction.folded_messages
+                    ),
+                    ToastKind::Success,
+                );
+            }
+            Err(error) => {
+                self.status_line = "compact failed".to_string();
+                self.toast(format!("Compact failed: {error}"), ToastKind::Error);
+            }
+        }
+        true
     }
 
     fn drain_pending_tool_results(&mut self) -> bool {
@@ -4501,11 +5710,10 @@ impl App {
             return;
         }
 
+        let command = format!("/workflow {}", task.trim());
+        let user_index = self.transcript.len();
         self.transcript
-            .push(TranscriptItem::Message(ChatMessage::user(format!(
-                "/workflow {}",
-                task.trim()
-            ))));
+            .push(TranscriptItem::Message(ChatMessage::user(command.clone())));
         self.touch_transcript();
         self.persist_session();
         self.scroll_chat_to_bottom();
@@ -4515,13 +5723,28 @@ impl App {
         self.denied_this_turn.clear();
         self.denied_edits_this_turn.clear();
         let backend = self.model.clone();
+        // Per-run checkpoint recorder + cancel token so subagent file edits are
+        // captured (rewindable) and the run's tools are cancellable — parity
+        // with the model-turn path.
+        let recorder = self.new_workflow_checkpoint(&command, user_index);
+        let cancel = CancelToken::new();
         let tools = self
             .tools
             .clone()
-            .with_approval_handler(self.approval_handler.clone());
+            .with_approval_handler(self.approval_handler.clone())
+            .with_checkpoint_recorder(recorder.clone())
+            .with_cancel_token(cancel.clone());
+        #[cfg(test)]
+        {
+            self.last_workflow_runtime = Some(tools.clone());
+        }
         let task = task.trim().to_string();
         let (sender, receiver) = mpsc::channel();
-        self.workflow_events.push(receiver);
+        self.workflow_events.push(BackgroundWorkflow {
+            events: receiver,
+            checkpoint: recorder,
+            cancel,
+        });
         if !self.is_working() {
             self.status_line = "background workflow starting".to_string();
         }
@@ -4583,11 +5806,13 @@ impl App {
             )
         };
 
+        let command = format!(
+            "/workflow {name}{}{raw_args}",
+            if raw_args.is_empty() { "" } else { " " }
+        );
+        let user_index = self.transcript.len();
         self.transcript
-            .push(TranscriptItem::Message(ChatMessage::user(format!(
-                "/workflow {name}{}{raw_args}",
-                if raw_args.is_empty() { "" } else { " " }
-            ))));
+            .push(TranscriptItem::Message(ChatMessage::user(command.clone())));
         self.touch_transcript();
         self.persist_session();
         self.scroll_chat_to_bottom();
@@ -4597,12 +5822,25 @@ impl App {
         self.denied_this_turn.clear();
         self.denied_edits_this_turn.clear();
         let backend = self.model.clone();
+        // Per-run checkpoint recorder + cancel token: see `start_workflow`.
+        let recorder = self.new_workflow_checkpoint(&command, user_index);
+        let cancel = CancelToken::new();
         let tools = self
             .tools
             .clone()
-            .with_approval_handler(self.approval_handler.clone());
+            .with_approval_handler(self.approval_handler.clone())
+            .with_checkpoint_recorder(recorder.clone())
+            .with_cancel_token(cancel.clone());
+        #[cfg(test)]
+        {
+            self.last_workflow_runtime = Some(tools.clone());
+        }
         let (sender, receiver) = mpsc::channel();
-        self.workflow_events.push(receiver);
+        self.workflow_events.push(BackgroundWorkflow {
+            events: receiver,
+            checkpoint: recorder,
+            cancel,
+        });
         self.status_line = format!("workflow script starting: {name}");
         self.toast("Workflow script started", ToastKind::Info);
 
@@ -4712,21 +5950,63 @@ impl App {
                     self.apply_workflow_event_from_model(event);
                     self.stick_chat_to_bottom_if_needed();
                 }
+                Ok(ModelStreamEvent::Usage(usage)) => {
+                    // One event per model request; a tool-looping turn sends
+                    // several, so sum them for turn and session totals.
+                    changed = true;
+                    self.turn_usage.add(usage);
+                    self.turn_requests += 1;
+                    self.session_usage.add(usage);
+                    self.session_requests += 1;
+                }
                 Ok(ModelStreamEvent::Done { event_count }) => {
                     changed = true;
                     self.flush_stream_delta(&mut delta_buffer);
+                    if self.cancel_requested_at.is_some() {
+                        // Esc raced the natural finish and the user asked to
+                        // stop: honor the stop intent. Finalize as an
+                        // interruption (which keeps queued prompts per [21])
+                        // and — crucially — do NOT set `turn_finished`, so the
+                        // tail never auto-launches the next queued turn. A
+                        // cancel intent must never silently start more work.
+                        self.finalize_cancelled_turn("turn interrupted");
+                        keep_receiver = false;
+                        break;
+                    }
+                    self.record_turn_usage_totals();
                     self.status_line =
                         self.scoped_status(format!("complete ({event_count} events)"));
                     self.stick_chat_to_bottom_if_needed();
                     self.streaming_message = None;
+                    self.ring_bell_if_due();
                     self.turn_started_at.take();
+                    self.turn_cancel = None;
                     keep_receiver = false;
                     turn_finished = true;
+                    break;
+                }
+                Ok(ModelStreamEvent::Cancelled) => {
+                    changed = true;
+                    self.flush_stream_delta(&mut delta_buffer);
+                    self.finalize_cancelled_turn("turn interrupted");
+                    keep_receiver = false;
+                    break;
+                }
+                // Post-cancel socket/send errors are fallout from the user's
+                // own Esc — render them as the interruption they are, never
+                // as a scary failure toast.
+                Ok(ModelStreamEvent::Error(_)) if self.cancel_requested_at.is_some() => {
+                    changed = true;
+                    self.flush_stream_delta(&mut delta_buffer);
+                    self.finalize_cancelled_turn("turn interrupted");
+                    keep_receiver = false;
                     break;
                 }
                 Ok(ModelStreamEvent::Error(error)) => {
                     changed = true;
                     self.flush_stream_delta(&mut delta_buffer);
+                    self.record_turn_usage_totals();
+                    self.ring_bell_if_due();
                     let clean_error = clean_model_error(&error);
                     if let Some(index) = self.streaming_message {
                         if let Some(TranscriptItem::Message(message)) =
@@ -4749,6 +6029,7 @@ impl App {
                     self.status_line = model_error_status(&clean_error).to_string();
                     self.toast(clean_error, ToastKind::Error);
                     self.streaming_message = None;
+                    self.turn_cancel = None;
                     keep_receiver = false;
                     turn_finished = true;
                     break;
@@ -4757,10 +6038,19 @@ impl App {
                 Err(TryRecvError::Disconnected) => {
                     changed = true;
                     self.flush_stream_delta(&mut delta_buffer);
+                    if self.cancel_requested_at.is_some() {
+                        // Worker died mid-cancel without a final event.
+                        self.finalize_cancelled_turn("turn interrupted");
+                        keep_receiver = false;
+                        break;
+                    }
                     if self.streaming_message.is_some() {
                         self.status_line = self.scoped_status("stream ended");
                     }
+                    self.record_turn_usage_totals();
+                    self.ring_bell_if_due();
                     self.streaming_message = None;
+                    self.turn_cancel = None;
                     keep_receiver = false;
                     turn_finished = true;
                     break;
@@ -4783,10 +6073,54 @@ impl App {
         if keep_receiver {
             self.model_events = Some(receiver);
         } else if turn_finished {
+            self.finish_turn_checkpoint();
             self.start_next_queued_turn();
         }
 
         changed
+    }
+
+    /// Build a per-run checkpoint recorder for a background workflow, keyed to
+    /// the workflow command's user-message row. Mirrors the model-turn recorder
+    /// so `/rewind` treats workflow edits exactly like model-turn edits.
+    fn new_workflow_checkpoint(&self, command: &str, user_index: usize) -> CheckpointRecorder {
+        CheckpointRecorder::new(
+            self.tools.workspace(),
+            CheckpointMeta {
+                session_id: self
+                    .session
+                    .as_ref()
+                    .map(SessionStore::current_id)
+                    .unwrap_or_default(),
+                prompt_excerpt: excerpt_for_checkpoint(command),
+                transcript_user_index: user_index,
+            },
+        )
+    }
+
+    /// Close out a checkpoint recorder (model turn or workflow): a quiet
+    /// status-line note when files were captured (never a transcript row),
+    /// then retention pruning. Returns the summary when anything was captured.
+    fn finalize_checkpoint(&mut self, recorder: &CheckpointRecorder) -> Option<CheckpointSummary> {
+        let summary = recorder.finish()?;
+        self.status_line = format!(
+            "checkpoint · {} file{}",
+            summary.file_count,
+            if summary.file_count == 1 { "" } else { "s" }
+        );
+        if let Ok(store) = CheckpointStore::open(self.tools.workspace())
+            && let Err(error) = store.prune(RetentionLimits::from_env())
+        {
+            self.status_line = format!("checkpoint prune failed: {error}");
+        }
+        Some(summary)
+    }
+
+    fn finish_turn_checkpoint(&mut self) {
+        let Some(recorder) = self.active_checkpoint.take() else {
+            return;
+        };
+        self.finalize_checkpoint(&recorder);
     }
 
     fn drain_workflow_events(&mut self) -> bool {
@@ -4794,18 +6128,18 @@ impl App {
             return false;
         };
 
-        let receivers = std::mem::take(&mut self.workflow_events);
-        let mut active_receivers = Vec::new();
+        let workflows = std::mem::take(&mut self.workflow_events);
+        let mut active_workflows = Vec::new();
         let mut any_finished = false;
         let mut changed = false;
 
-        for receiver in receivers {
+        for workflow in workflows {
             let mut keep_receiver = true;
             let mut processed = 0usize;
             let mut finished = false;
 
             while processed < 256 {
-                match receiver.try_recv() {
+                match workflow.events.try_recv() {
                     Ok(event) => {
                         changed = true;
                         finished |= self.apply_workflow_event(event);
@@ -4829,15 +6163,28 @@ impl App {
             }
 
             if keep_receiver && !finished {
-                active_receivers.push(receiver);
+                active_workflows.push(workflow);
             } else if finished {
                 any_finished = true;
+                // The worker thread is gone: close out its checkpoint so the
+                // captured pre-images are pruned like a model turn's. The
+                // manifest was already written on each capture, so /rewind can
+                // undo the run even if this prune never ran.
+                self.finalize_checkpoint(&workflow.checkpoint);
             }
         }
 
-        self.workflow_events = active_receivers;
+        self.workflow_events = active_workflows;
         if any_finished {
             self.persist_session();
+            // A background workflow finishing must also drain the queue —
+            // otherwise turns queued while it ran strand forever (the only
+            // other dequeue site is a model turn's completion). Start the next
+            // queued turn only when the app is fully idle: no streaming model
+            // turn and no remaining background workflow.
+            if !self.is_working() && !self.has_active_workflows() {
+                self.start_next_queued_turn();
+            }
         }
 
         changed
@@ -4869,7 +6216,11 @@ impl App {
                 Ok(pending) => {
                     changed = true;
                     processed += 1;
-                    if let Some(decision) = self.auto_approval_decision(&pending.request) {
+                    if self.cancel_requested_at.is_some() {
+                        // In-flight approval raced the cancel: deny it so the
+                        // parked worker unblocks and sees the token.
+                        let _ = pending.respond.send(ApprovalDecision::Deny);
+                    } else if let Some(decision) = self.auto_approval_decision(&pending.request) {
                         let _ = pending.respond.send(decision);
                     } else {
                         self.approval_queue.push_back(pending);
@@ -4882,6 +6233,7 @@ impl App {
         if changed && !self.approval_queue.is_empty() {
             if self.approval_shown_at.is_none() {
                 self.approval_shown_at = Some(Instant::now());
+                self.ring_bell_if_due();
             }
             let front = &self.approval_queue[0].request;
             self.status_line = format!("approval required: {}", front.tool.label());
@@ -4897,6 +6249,12 @@ impl App {
                 let command = request.command.as_deref().unwrap_or("").trim();
                 if self.denied_this_turn.iter().any(|denied| denied == command) {
                     return Some(ApprovalDecision::Deny);
+                }
+                // Sandbox escalations always need a fresh human decision:
+                // a stored grant covers running the command, never running
+                // it outside the sandbox.
+                if request.sandbox_escalation {
+                    return None;
                 }
                 // Match grants against the command with leading env
                 // assignments stripped, so a grant on `cargo build` still
@@ -4928,6 +6286,30 @@ impl App {
                         .all(|path| edit_grant_matches(&self.session_edit_grants, path));
                 all_granted.then_some(ApprovalDecision::AllowOnce)
             }
+            ApprovalTool::McpTool | ApprovalTool::McpServerLaunch => {
+                // Per-tool always-allow grants (and per-session launch
+                // approvals) live in the core registry, which skips the gate
+                // entirely once granted; here we only auto-deny an identical
+                // request re-asked in the same turn after the user said no.
+                let command = request.command.as_deref().unwrap_or("").trim();
+                if self.denied_this_turn.iter().any(|denied| denied == command) {
+                    return Some(ApprovalDecision::Deny);
+                }
+                None
+            }
+            ApprovalTool::WebFetch | ApprovalTool::WebSearch => {
+                // Once the user always-allows web egress this session, every
+                // later fetch/search resolves silently; otherwise re-asked
+                // denials are honoured and anything new prompts.
+                if self.session_web_egress_allowed {
+                    return Some(ApprovalDecision::AllowOnce);
+                }
+                let command = request.command.as_deref().unwrap_or("").trim();
+                if self.denied_this_turn.iter().any(|denied| denied == command) {
+                    return Some(ApprovalDecision::Deny);
+                }
+                None
+            }
         }
     }
 
@@ -4937,6 +6319,16 @@ impl App {
         };
         // The next queued request must serve its own grace window.
         self.approval_shown_at = None;
+
+        // Defense in depth: even if an always-allow decision reaches an
+        // escalation (the card doesn't offer one), downgrade it to a
+        // one-shot approval so nothing is persisted.
+        let decision =
+            if pending.request.sandbox_escalation && decision == ApprovalDecision::AlwaysAllow {
+                ApprovalDecision::AllowOnce
+            } else {
+                decision
+            };
 
         match decision {
             ApprovalDecision::AlwaysAllow => self.record_always_allow(&pending.request),
@@ -4988,7 +6380,7 @@ impl App {
                     Ok(()) => {
                         // Reload so future turns see the persisted grant.
                         if let Ok(reloaded) = ToolRuntime::new(self.tools.workspace()) {
-                            self.tools = reloaded;
+                            self.tools = reloaded.with_mcp(self.mcp.clone());
                         }
                         self.toast(format!("Always allowing `{prefix}`"), ToastKind::Success);
                     }
@@ -5011,6 +6403,27 @@ impl App {
                     "Always allowing edits there this session",
                     ToastKind::Success,
                 );
+            }
+            ApprovalTool::McpTool => {
+                // The core registry recorded the per-(server, tool) grant when
+                // authorize returned "always allow"; nothing is persisted to
+                // disk for MCP in v1.
+                self.toast(
+                    "Always allowing that MCP tool this session",
+                    ToastKind::Success,
+                );
+            }
+            ApprovalTool::McpServerLaunch => {
+                // The core registry marked the server launch-approved for the
+                // session; the process is spawned on first use.
+                self.toast(
+                    "Allowing that MCP server to launch this session",
+                    ToastKind::Success,
+                );
+            }
+            ApprovalTool::WebFetch | ApprovalTool::WebSearch => {
+                self.session_web_egress_allowed = true;
+                self.toast("Allowing web requests this session", ToastKind::Success);
             }
         }
     }
@@ -5069,6 +6482,7 @@ impl App {
                     background: false,
                     pid: Some(pid),
                     job_id: Some(id.clone()),
+                    sandboxed: false,
                 }));
                 if let Some(job) = self.background_jobs.get_mut(&id) {
                     job.state = state;
@@ -5401,8 +6815,7 @@ impl App {
             .rev()
             .find_map(|item| match item {
                 TranscriptItem::Tool(run)
-                    if run.id.as_deref() == Some(call_id)
-                        && run.state == ToolRunState::Running =>
+                    if run.id.as_deref() == Some(call_id) && run.state == ToolRunState::Running =>
                 {
                     Some(run)
                 }
@@ -5570,6 +6983,7 @@ impl App {
         self.draw_status(frame, sections[4]);
         if self.active_modal.is_none() {
             self.draw_slash_suggestions(frame, shell_area);
+            self.draw_mention_suggestions(frame, shell_area);
         }
         self.draw_modal(frame, shell_area);
         self.draw_approval_prompt(frame, shell_area);
@@ -5711,8 +7125,7 @@ impl App {
             return;
         }
 
-        let mut state =
-            ScrollbarState::new(metrics.max_scroll.max(1)).position(metrics.top_offset);
+        let mut state = ScrollbarState::new(metrics.max_scroll.max(1)).position(metrics.top_offset);
         let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
             .begin_symbol(None)
             .end_symbol(None)
@@ -5887,7 +7300,7 @@ impl App {
                 Constraint::Min(16),
                 Constraint::Min(0),
                 Constraint::Length(10),
-                Constraint::Length(30),
+                Constraint::Length(42),
             ])
             .split(area);
         let status = Paragraph::new(self.status_line_content())
@@ -5901,46 +7314,41 @@ impl App {
     }
 
     fn context_usage_chars(&self) -> usize {
-        self.transcript
+        transcript_char_usage(&self.transcript).total()
+    }
+
+    /// Snapshot for the /context modal: estimated tokens per category, the
+    /// budget, and the compaction state. Uses the same ~4 chars/token
+    /// estimate as the footer gauge and the core context engine.
+    fn build_context_report(&self) -> ContextReport {
+        let chars = transcript_char_usage(&self.transcript);
+        // The header system messages conversation_history() prepends before
+        // the transcript-derived messages (permission context, rolling
+        // session state, optional plan directive).
+        let header_len = 2 + usize::from(self.plan_mode);
+        let system_tokens = self
+            .conversation_history()
             .iter()
-            .filter_map(|item| match item {
-                TranscriptItem::Message(msg) => Some(msg.content.len()),
-                // Tool results are function_call_outputs in model context; they
-                // usually dominate usage, so count them too.
-                TranscriptItem::Tool(run) => Some(run.summary.len() + run.detail.len()),
-                TranscriptItem::Reasoning(trace) => Some(trace.content.len()),
-                TranscriptItem::Plan(plan) => Some(
-                    plan.summary.len()
-                        + plan
-                            .items
-                            .iter()
-                            .map(|item| {
-                                item.text.len()
-                                    + item.evidence.iter().map(String::len).sum::<usize>()
-                            })
-                            .sum::<usize>(),
-                ),
-                TranscriptItem::Decision(decision) => Some(
-                    decision.title.len()
-                        + decision.reason.len()
-                        + decision.answer.as_ref().map_or(0, String::len)
-                        + decision
-                            .answers
-                            .iter()
-                            .map(|(key, value)| key.len() + value.len())
-                            .sum::<usize>()
-                        + decision
-                            .questions
-                            .iter()
-                            .map(|question| {
-                                question.prompt.len()
-                                    + question.options.iter().map(String::len).sum::<usize>()
-                            })
-                            .sum::<usize>(),
-                ),
-                _ => None,
-            })
-            .sum()
+            .take(header_len)
+            .map(medusa_core::context::message_tokens)
+            .sum();
+        let summary = self.context_engine.summary();
+
+        ContextReport {
+            instructions_tokens: medusa_core::context::baseline_instructions_tokens(
+                self.tools.workspace(),
+            ),
+            system_tokens,
+            message_tokens: chars.messages.div_ceil(4),
+            tool_tokens: chars.tool_outputs.div_ceil(4),
+            reasoning_tokens: chars.reasoning.div_ceil(4),
+            plan_tokens: chars.plans.div_ceil(4),
+            budget: medusa_core::context::context_max_tokens(),
+            summary_covers: summary.as_ref().map(|summary| summary.covers),
+            summary_tokens: summary
+                .map(|summary| medusa_core::context::estimate_tokens(&summary.text))
+                .unwrap_or(0),
+        }
     }
 
     fn draw_context_gauge(&self, frame: &mut Frame<'_>, area: Rect) {
@@ -5989,7 +7397,10 @@ impl App {
             .iter()
             .filter(|item| matches!(item, TranscriptItem::Tool(_)))
             .count();
-        let text = format!("tools {tool_count} · jobs {running} · {activity}");
+        let text = format!(
+            "tools {tool_count} · jobs {running} · {} · {activity}",
+            format_token_count(self.session_usage.total())
+        );
         let widget = Paragraph::new(Line::from(Span::styled(text, muted())))
             .alignment(Alignment::Left)
             .style(Style::default().bg(surface()));
@@ -6031,6 +7442,8 @@ impl App {
             UiFocus::Modal => match self.active_modal {
                 Some(Modal::Settings) => "↑/↓ · enter · esc",
                 Some(Modal::Themes) => "↑/↓ · enter · esc",
+                Some(Modal::Rewind) => "↑/↓ · enter · esc",
+                Some(Modal::EditMessage) => "↑/↓ · enter · esc",
                 Some(Modal::Models) => "↑/↓ · enter · esc",
                 Some(Modal::Permissions) => "↑/↓ · enter · esc",
                 Some(Modal::ImagePreview) => "j/k · +/- · d detach · o/y · esc",
@@ -6116,6 +7529,12 @@ impl App {
                     muted(),
                 )));
             }
+            if request.sandbox_escalation {
+                body.push(Line::from(Span::styled(
+                    "    escapes the sandbox: writes outside the workspace and network allowed",
+                    error_style(),
+                )));
+            }
         }
         for path in request.paths.iter().take(6) {
             body.push(Line::from(vec![
@@ -6130,16 +7549,25 @@ impl App {
             )));
         }
         body.push(Line::from(""));
-        body.push(Line::from(vec![
+        let mut keys = vec![
             Span::styled("  y", success_style().add_modifier(Modifier::BOLD)),
             Span::styled(" allow once   ", muted()),
-            Span::styled("a", prompt_style().add_modifier(Modifier::BOLD)),
-            Span::styled(" always allow   ", muted()),
+        ];
+        // Escalations are one-shot by design: no always-allow.
+        if !request.sandbox_escalation {
+            keys.push(Span::styled(
+                "a",
+                prompt_style().add_modifier(Modifier::BOLD),
+            ));
+            keys.push(Span::styled(" always allow   ", muted()));
+        }
+        keys.extend([
             Span::styled("n", error_style().add_modifier(Modifier::BOLD)),
             Span::styled("/", muted()),
             Span::styled("esc", error_style().add_modifier(Modifier::BOLD)),
             Span::styled(" deny", muted()),
-        ]));
+        ]);
+        body.push(Line::from(keys));
 
         let height = (body.len() as u16)
             .saturating_add(2)
@@ -6163,13 +7591,15 @@ impl App {
 
         frame.render_widget(Clear, popup);
         let queued = self.approval_queue.len();
-        let title = if queued > 1 {
-            format!(
-                " Approval required · {} (1/{queued}) ",
-                request.tool.label()
-            )
+        let heading = if request.sandbox_escalation {
+            "Run unsandboxed?"
         } else {
-            format!(" Approval required · {} ", request.tool.label())
+            "Approval required"
+        };
+        let title = if queued > 1 {
+            format!(" {heading} · {} (1/{queued}) ", request.tool.label())
+        } else {
+            format!(" {heading} · {} ", request.tool.label())
         };
         let block = Block::default()
             .borders(Borders::ALL)
@@ -6311,6 +7741,84 @@ impl App {
         frame.render_widget(footer, sections[2]);
     }
 
+    /// @file mention popup: same centered palette surface as the slash
+    /// suggestions, but a single fuzzy-filtered list of workspace paths.
+    fn draw_mention_suggestions(&self, frame: &mut Frame<'_>, shell_area: Rect) {
+        if !self.mention_active() {
+            return;
+        }
+        let matches = self.mention_matches();
+        if matches.is_empty() {
+            return;
+        }
+
+        let area = command_palette_rect(shell_area, matches.len());
+        frame.render_widget(Clear, area);
+        let selected = self.mention_selection.min(matches.len().saturating_sub(1));
+        let query = self
+            .active_mention_token()
+            .map(|(_, _, query)| query)
+            .unwrap_or_default();
+
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(accent_color()))
+            .style(Style::default().bg(surface()).fg(text()))
+            .title(" Files ");
+        frame.render_widget(block, area);
+
+        let inner = area.inner(Margin {
+            horizontal: 2,
+            vertical: 1,
+        });
+        let sections = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(1),
+                Constraint::Min(1),
+                Constraint::Length(1),
+            ])
+            .split(inner);
+
+        let header = Paragraph::new(Line::from(vec![
+            Span::styled("@", prompt_style()),
+            Span::styled(query, prompt_style()),
+            Span::styled("  ", muted()),
+            Span::styled(format!("{} files", matches.len()), muted()),
+        ]))
+        .style(Style::default().bg(surface()).fg(text()));
+        frame.render_widget(header, sections[0]);
+
+        let visible_rows = sections[1].height as usize;
+        let offset = selected
+            .saturating_add(1)
+            .saturating_sub(visible_rows.max(1));
+        let end = offset.saturating_add(visible_rows).min(matches.len());
+        let items = matches[offset..end]
+            .iter()
+            .map(|(path, positions)| ListItem::new(Line::from(mention_path_spans(path, positions))))
+            .collect::<Vec<_>>();
+        let mut state = ListState::default().with_selected(selected.checked_sub(offset));
+        let list = List::new(items)
+            .style(Style::default().bg(surface()).fg(text()))
+            .highlight_style(command_selected_style())
+            .highlight_symbol("▌ ");
+        frame.render_stateful_widget(list, sections[1], &mut state);
+
+        let footer = Paragraph::new(Line::from(vec![
+            Span::styled("↑/↓", prompt_style()),
+            Span::styled(" select  ", muted()),
+            Span::styled("enter/tab", prompt_style()),
+            Span::styled(" insert path  ", muted()),
+            Span::styled("esc", prompt_style()),
+            Span::styled(" close", muted()),
+        ]))
+        .alignment(Alignment::Right)
+        .style(Style::default().bg(surface()));
+        frame.render_widget(footer, sections[2]);
+    }
+
     fn draw_modal(&mut self, frame: &mut Frame<'_>, area: Rect) {
         let Some(modal) = self.active_modal else {
             return;
@@ -6333,6 +7841,12 @@ impl App {
             Modal::SessionTree => 18,
             Modal::Models | Modal::Permissions => 16,
             Modal::Themes => 18,
+            Modal::Rewind => 16,
+            Modal::EditMessage => 18,
+            Modal::Mcp => 20,
+            Modal::Agents => 18,
+            Modal::Cost => 14,
+            Modal::Context => 18,
         });
         let popup = centered_rect(area, popup_width, popup_height);
         frame.render_widget(Clear, popup);
@@ -6349,7 +7863,322 @@ impl App {
             Modal::Models => self.draw_models_modal(frame, popup),
             Modal::Permissions => self.draw_permissions_modal(frame, popup),
             Modal::Themes => self.draw_themes_modal(frame, popup),
+            Modal::Rewind => self.draw_rewind_modal(frame, popup),
+            Modal::EditMessage => self.draw_edit_message_modal(frame, popup),
+            Modal::Mcp => self.draw_mcp_modal(frame, popup),
+            Modal::Agents => self.draw_agents_modal(frame, popup),
+            Modal::Cost => self.draw_cost_modal(frame, popup),
+            Modal::Context => self.draw_context_modal(frame, popup),
         }
+    }
+
+    /// `/agents`: named agents from .medusa/agents captured when the command
+    /// ran. Esc/Enter closes (generic modal keys).
+    fn draw_agents_modal(&self, frame: &mut Frame<'_>, area: Rect) {
+        let mut lines: Vec<Line<'static>> = Vec::new();
+        if self.agent_registry.is_empty() {
+            lines.push(Line::from(Span::styled(
+                "No named agents found in .medusa/agents.",
+                muted(),
+            )));
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                "Define one agent per .md file in .medusa/agents:",
+                value_style(),
+            )));
+            lines.push(Line::from(Span::styled(
+                "  header lines name:, description:, tools: read|shell|edit|verify,",
+                muted(),
+            )));
+            lines.push(Line::from(Span::styled(
+                "  then a blank line, then the body used as the agent's system prompt.",
+                muted(),
+            )));
+        }
+        for agent in self.agent_registry.agents() {
+            lines.push(Line::from(vec![
+                Span::styled(
+                    agent.name.clone(),
+                    value_style().add_modifier(Modifier::BOLD),
+                ),
+                Span::styled("  · ", muted()),
+                Span::styled(agent.tool_policy.label(), prompt_style()),
+            ]));
+            if !agent.description.is_empty() {
+                lines.push(Line::from(Span::styled(
+                    format!("  {}", truncate(&agent.description, 70)),
+                    value_style(),
+                )));
+            }
+            lines.push(Line::from(Span::styled(
+                format!("  {}", truncate(&agent.path.display().to_string(), 70)),
+                muted(),
+            )));
+            lines.push(Line::from(""));
+        }
+        for warning in self.agent_registry.warnings() {
+            lines.push(Line::from(Span::styled(
+                truncate(warning, 74),
+                error_style(),
+            )));
+        }
+
+        let paragraph = Paragraph::new(lines)
+            .block(modal_block(" Named agents "))
+            .style(Style::default().bg(surface()).fg(text()))
+            .wrap(Wrap { trim: false });
+        frame.render_widget(paragraph, area);
+    }
+
+    /// `/cost`: backend-reported token usage for the session and the most
+    /// recent (or streaming) turn. Esc/Enter closes (generic modal keys).
+    fn draw_cost_modal(&self, frame: &mut Frame<'_>, area: Rect) {
+        let usage_line = |usage: TokenUsage| {
+            Line::from(Span::styled(
+                format!(
+                    "  input {} · output {} · cached {}",
+                    format_token_count(usage.input),
+                    format_token_count(usage.output),
+                    format_token_count(usage.cached)
+                ),
+                value_style(),
+            ))
+        };
+        let request_count =
+            |requests: usize| format!("{requests} request{}", if requests == 1 { "" } else { "s" });
+        let (turn_label, turn_usage, turn_requests) = if self.is_working() {
+            ("current turn", self.turn_usage, self.turn_requests)
+        } else {
+            ("last turn", self.last_turn_usage, self.last_turn_requests)
+        };
+
+        let mut lines = vec![
+            Line::from(vec![
+                Span::styled("session", value_style().add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    format!(
+                        "  · {} · {} total",
+                        request_count(self.session_requests),
+                        format_token_count(self.session_usage.total())
+                    ),
+                    muted(),
+                ),
+            ]),
+            usage_line(self.session_usage),
+            Line::from(""),
+            Line::from(vec![
+                Span::styled(turn_label, value_style().add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    format!(
+                        "  · {} · {} total",
+                        request_count(turn_requests),
+                        format_token_count(turn_usage.total())
+                    ),
+                    muted(),
+                ),
+            ]),
+            usage_line(turn_usage),
+            Line::from(""),
+        ];
+        if self.session_requests == 0 {
+            lines.push(Line::from(Span::styled(
+                "No usage reported yet — counts appear after the first model turn.",
+                muted(),
+            )));
+            lines.push(Line::from(""));
+        }
+        lines.push(Line::from(Span::styled(
+            "Counts are backend-reported tokens. What they cost depends on your plan and provider pricing; Medusa does not estimate dollar amounts.",
+            muted(),
+        )));
+
+        let paragraph = Paragraph::new(lines)
+            .block(modal_block(" Token usage "))
+            .style(Style::default().bg(surface()).fg(text()))
+            .wrap(Wrap { trim: false });
+        frame.render_widget(paragraph, area);
+    }
+
+    /// `/context`: the estimated context picture captured when the command
+    /// ran — per-category token estimates, the budget, and compaction state.
+    /// Esc/Enter closes (generic modal keys).
+    fn draw_context_modal(&self, frame: &mut Frame<'_>, area: Rect) {
+        let Some(report) = self.context_report else {
+            return;
+        };
+
+        let category_line = |label: &str, tokens: usize| {
+            Line::from(vec![
+                Span::styled(format!("  {label:<22}"), value_style()),
+                Span::styled(format_token_count(tokens as u64), prompt_style()),
+            ])
+        };
+        let percent = report.percent_used();
+        let percent_style = if percent < 50 {
+            success_style()
+        } else if percent < 80 {
+            prompt_style()
+        } else {
+            error_style()
+        };
+
+        let mut lines = vec![
+            Line::from(vec![
+                Span::styled(
+                    "estimated usage",
+                    value_style().add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!(
+                        "  · {} of {} budget · ",
+                        format_token_count(report.total_tokens() as u64),
+                        format_token_count(report.budget as u64)
+                    ),
+                    muted(),
+                ),
+                Span::styled(format!("{percent}%"), percent_style),
+            ]),
+            Line::from(""),
+            category_line("system prompt (est)", report.instructions_tokens),
+            category_line("session headers", report.system_tokens),
+            category_line("messages", report.message_tokens),
+            category_line("tool outputs", report.tool_tokens),
+            category_line("reasoning", report.reasoning_tokens),
+            category_line("plans & decisions", report.plan_tokens),
+            Line::from(""),
+        ];
+        match report.summary_covers {
+            Some(covers) => lines.push(Line::from(vec![
+                Span::styled("compaction  ", value_style().add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    format!(
+                        "summary active · covers {covers} older messages · ~{}",
+                        format_token_count(report.summary_tokens as u64)
+                    ),
+                    success_style(),
+                ),
+            ])),
+            None => lines.push(Line::from(vec![
+                Span::styled("compaction  ", value_style().add_modifier(Modifier::BOLD)),
+                Span::styled("none — run /compact to fold older history early", muted()),
+            ])),
+        }
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "Estimates use ~4 characters per token; the backend's own count is what /cost reports.",
+            muted(),
+        )));
+
+        let paragraph = Paragraph::new(lines)
+            .block(modal_block(" Context "))
+            .style(Style::default().bg(surface()).fg(text()))
+            .wrap(Wrap { trim: false });
+        frame.render_widget(paragraph, area);
+    }
+
+    /// `/mcp`: the snapshot captured when the command ran — servers, states,
+    /// tools, and the config hint. Esc/Enter closes (generic modal keys).
+    fn draw_mcp_modal(&self, frame: &mut Frame<'_>, area: Rect) {
+        let mut lines: Vec<Line<'static>> = Vec::new();
+        if self.mcp_statuses.is_empty() {
+            lines.push(Line::from(Span::styled(
+                "No MCP servers configured.",
+                muted(),
+            )));
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                "Declare stdio servers in .medusa/mcp.json:",
+                value_style(),
+            )));
+            lines.push(Line::from(Span::styled(
+                r#"  {"servers": {"docs": {"command": "npx", "args": ["-y", "some-mcp-server"]}}}"#,
+                muted(),
+            )));
+            lines.push(Line::from(Span::styled(
+                r#"  Add "readOnly": true to allow a side-effect-free server in readonly mode."#,
+                muted(),
+            )));
+        }
+        for status in &self.mcp_statuses {
+            let (state_text, state_style) = match &status.state {
+                McpServerStateLabel::Idle => ("not started".to_string(), muted()),
+                McpServerStateLabel::Connecting => ("connecting…".to_string(), prompt_style()),
+                McpServerStateLabel::Ready => (
+                    format!(
+                        "ready · {} tool{}",
+                        status.tools.len(),
+                        if status.tools.len() == 1 { "" } else { "s" }
+                    ),
+                    success_style(),
+                ),
+                McpServerStateLabel::Disconnected => ("disconnected".to_string(), error_style()),
+                McpServerStateLabel::Failed(error) => {
+                    (format!("failed · {}", truncate(error, 64)), error_style())
+                }
+            };
+            let mut header = vec![
+                Span::styled(
+                    status.name.clone(),
+                    value_style().add_modifier(Modifier::BOLD),
+                ),
+                Span::styled("  ", muted()),
+                Span::styled(state_text, state_style),
+            ];
+            if status.read_only {
+                header.push(Span::styled("  · read-only", muted()));
+            }
+            if status.restarts > 0 {
+                header.push(Span::styled(
+                    format!("  · {} restart(s)", status.restarts),
+                    muted(),
+                ));
+            }
+            lines.push(Line::from(header));
+            lines.push(Line::from(vec![
+                Span::styled("  $ ", prompt_style()),
+                Span::styled(truncate(&status.command_line, 68), muted()),
+            ]));
+            for tool in status.tools.iter().take(6) {
+                lines.push(Line::from(Span::styled(
+                    format!("    {tool}"),
+                    value_style(),
+                )));
+            }
+            if status.tools.len() > 6 {
+                lines.push(Line::from(Span::styled(
+                    format!("    … +{} more tools", status.tools.len() - 6),
+                    muted(),
+                )));
+            }
+            if let Some(tail) = &status.stderr_tail
+                && matches!(
+                    status.state,
+                    McpServerStateLabel::Failed(_) | McpServerStateLabel::Disconnected
+                )
+            {
+                let recent: Vec<&str> = tail.lines().rev().take(3).collect();
+                for line in recent.into_iter().rev() {
+                    lines.push(Line::from(Span::styled(
+                        format!("    stderr: {}", truncate(line, 64)),
+                        error_style(),
+                    )));
+                }
+            }
+            lines.push(Line::from(""));
+        }
+        lines.push(Line::from(vec![
+            Span::styled("config ", muted()),
+            Span::styled(".medusa/mcp.json", prompt_style()),
+            Span::styled("  ·  ", muted()),
+            Span::styled("/mcp restart <server>", prompt_style()),
+            Span::styled(" reconnects a failed server", muted()),
+        ]));
+
+        let paragraph = Paragraph::new(lines)
+            .block(modal_block(" MCP servers "))
+            .style(Style::default().bg(surface()).fg(text()))
+            .wrap(Wrap { trim: false });
+        frame.render_widget(paragraph, area);
     }
 
     fn draw_image_preview_modal(&mut self, frame: &mut Frame<'_>, area: Rect) {
@@ -7135,6 +8964,257 @@ impl App {
         frame.render_widget(table, area);
     }
 
+    fn draw_rewind_modal(&self, frame: &mut Frame<'_>, area: Rect) {
+        match self.rewind_stage {
+            RewindStage::Pick => self.draw_rewind_pick(frame, area),
+            RewindStage::Confirm => self.draw_rewind_confirm(frame, area),
+        }
+    }
+
+    fn draw_rewind_pick(&self, frame: &mut Frame<'_>, area: Rect) {
+        frame.render_widget(modal_block(" Rewind "), area);
+        let inner = area.inner(Margin {
+            horizontal: 2,
+            vertical: 1,
+        });
+        let sections = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(2),
+                Constraint::Min(4),
+                Constraint::Length(1),
+            ])
+            .split(inner);
+
+        let current_session = self
+            .session
+            .as_ref()
+            .map(SessionStore::current_id)
+            .unwrap_or_default();
+        let header = Paragraph::new(vec![
+            Line::from(Span::styled(
+                "Restore files to the state before a turn",
+                accent().add_modifier(Modifier::BOLD),
+            )),
+            Line::from(Span::styled(
+                "Edit/patch tool changes only — shell-command changes are not rewound.",
+                muted(),
+            )),
+        ])
+        .style(Style::default().bg(surface()).fg(text()));
+        frame.render_widget(header, sections[0]);
+
+        let rows = self
+            .rewind_entries
+            .iter()
+            .map(|entry| {
+                let prompt = if entry.prompt_excerpt.is_empty() {
+                    "(no prompt)".to_string()
+                } else {
+                    truncate(&entry.prompt_excerpt, 40)
+                };
+                let session_tag = if entry.session_id == current_session {
+                    "this session".to_string()
+                } else {
+                    compact_session_id(&entry.session_id)
+                };
+                ListItem::new(Line::from(vec![
+                    Span::styled(format!("{:>8}", time_ago_ms(entry.created_at_ms)), muted()),
+                    Span::styled("  ", muted()),
+                    Span::styled(format!("{prompt:<43}"), value_style()),
+                    Span::styled(
+                        format!(
+                            "{} file{}",
+                            entry.files.len(),
+                            if entry.files.len() == 1 { "" } else { "s" }
+                        ),
+                        prompt_style(),
+                    ),
+                    Span::styled("  ", muted()),
+                    Span::styled(session_tag, muted()),
+                ]))
+            })
+            .collect::<Vec<_>>();
+        let mut state = ListState::default().with_selected(Some(self.rewind_selection));
+        let list = List::new(rows)
+            .style(Style::default().bg(surface()).fg(text()))
+            .highlight_style(command_selected_style())
+            .highlight_symbol("▌ ");
+        frame.render_stateful_widget(list, sections[1], &mut state);
+
+        let footer = Paragraph::new(Line::from(vec![
+            Span::styled("↑/↓", prompt_style()),
+            Span::styled(" select  ", muted()),
+            Span::styled("enter", prompt_style()),
+            Span::styled(" review  ", muted()),
+            Span::styled("esc", prompt_style()),
+            Span::styled(" close", muted()),
+        ]))
+        .alignment(Alignment::Right)
+        .style(Style::default().bg(surface()));
+        frame.render_widget(footer, sections[2]);
+    }
+
+    fn draw_rewind_confirm(&self, frame: &mut Frame<'_>, area: Rect) {
+        frame.render_widget(modal_block(" Rewind · Confirm "), area);
+        let inner = area.inner(Margin {
+            horizontal: 2,
+            vertical: 1,
+        });
+        let Some(entry) = self.selected_rewind_entry() else {
+            return;
+        };
+        let sections = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(6),
+                Constraint::Min(2),
+                Constraint::Length(1),
+            ])
+            .split(inner);
+
+        let skipped_too_large = entry
+            .files
+            .iter()
+            .filter(|file| {
+                matches!(
+                    file.pre,
+                    medusa_core::checkpoint::PreImageKind::SkippedTooLarge
+                        | medusa_core::checkpoint::PreImageKind::SkippedSymlink
+                )
+            })
+            .count();
+        let mut summary_lines = vec![
+            Line::from(vec![
+                Span::styled("Rewind to before: ", muted()),
+                Span::styled(truncate(&entry.prompt_excerpt, 56), prompt_style()),
+            ]),
+            Line::from(vec![Span::styled(
+                format!(
+                    "{} · {} file{}",
+                    time_ago_ms(entry.created_at_ms),
+                    entry.files.len(),
+                    if entry.files.len() == 1 { "" } else { "s" }
+                ),
+                value_style(),
+            )]),
+            Line::from(Span::styled(
+                "Restores files changed by edit/patch tools in this and all newer turns.",
+                muted(),
+            )),
+            Line::from(Span::styled(
+                "Shell-command changes are NOT rewound and may leave mixed state.",
+                error_preview_style(),
+            )),
+            Line::from(Span::styled(
+                "A pre-rewind safety checkpoint is created first, so rewind is undoable.",
+                muted(),
+            )),
+        ];
+        if skipped_too_large > 0 {
+            summary_lines.push(Line::from(Span::styled(
+                format!("{skipped_too_large} file(s) could not be captured (too large or symlink) and will not be rewound."),
+                error_preview_style(),
+            )));
+        }
+        let summary = Paragraph::new(summary_lines)
+            .style(Style::default().bg(surface()).fg(text()))
+            .wrap(Wrap { trim: true });
+        frame.render_widget(summary, sections[0]);
+
+        let rows = self
+            .rewind_confirm_options()
+            .into_iter()
+            .map(|option| ListItem::new(Line::from(Span::styled(option, value_style()))))
+            .collect::<Vec<_>>();
+        let mut state = ListState::default().with_selected(Some(self.rewind_confirm_selection));
+        let list = List::new(rows)
+            .style(Style::default().bg(surface()).fg(text()))
+            .highlight_style(command_selected_style())
+            .highlight_symbol("▌ ");
+        frame.render_stateful_widget(list, sections[1], &mut state);
+
+        let footer = Paragraph::new(Line::from(vec![
+            Span::styled("↑/↓", prompt_style()),
+            Span::styled(" choose  ", muted()),
+            Span::styled("enter", prompt_style()),
+            Span::styled(" confirm  ", muted()),
+            Span::styled("esc", prompt_style()),
+            Span::styled(" back", muted()),
+        ]))
+        .alignment(Alignment::Right)
+        .style(Style::default().bg(surface()));
+        frame.render_widget(footer, sections[2]);
+    }
+
+    /// `/edit`: pick a previous user message to backtrack to. The current
+    /// timeline is forked into the session tree before truncation, so
+    /// nothing is lost — /tree can revisit it.
+    fn draw_edit_message_modal(&self, frame: &mut Frame<'_>, area: Rect) {
+        frame.render_widget(modal_block(" Edit previous message "), area);
+        let inner = area.inner(Margin {
+            horizontal: 2,
+            vertical: 1,
+        });
+        let sections = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(2),
+                Constraint::Min(4),
+                Constraint::Length(1),
+            ])
+            .split(inner);
+
+        let header = Paragraph::new(vec![
+            Line::from(Span::styled(
+                "Resend the conversation from an earlier message",
+                accent().add_modifier(Modifier::BOLD),
+            )),
+            Line::from(Span::styled(
+                "The current timeline is kept as a fork — browse it later with /tree.",
+                muted(),
+            )),
+        ])
+        .style(Style::default().bg(surface()).fg(text()));
+        frame.render_widget(header, sections[0]);
+
+        let rows = self
+            .edit_picker_entries
+            .iter()
+            .enumerate()
+            .map(|(ordinal, entry)| {
+                let age = if ordinal == 0 {
+                    "latest".to_string()
+                } else {
+                    format!("{} back", ordinal + 1)
+                };
+                ListItem::new(Line::from(vec![
+                    Span::styled(format!("{age:>8}"), muted()),
+                    Span::styled("  ", muted()),
+                    Span::styled(entry.preview.clone(), value_style()),
+                ]))
+            })
+            .collect::<Vec<_>>();
+        let mut state = ListState::default().with_selected(Some(self.edit_picker_selection));
+        let list = List::new(rows)
+            .style(Style::default().bg(surface()).fg(text()))
+            .highlight_style(command_selected_style())
+            .highlight_symbol("▌ ");
+        frame.render_stateful_widget(list, sections[1], &mut state);
+
+        let footer = Paragraph::new(Line::from(vec![
+            Span::styled("↑/↓", prompt_style()),
+            Span::styled(" select  ", muted()),
+            Span::styled("enter", prompt_style()),
+            Span::styled(" edit & resend  ", muted()),
+            Span::styled("esc", prompt_style()),
+            Span::styled(" close", muted()),
+        ]))
+        .alignment(Alignment::Right)
+        .style(Style::default().bg(surface()));
+        frame.render_widget(footer, sections[2]);
+    }
+
     fn settings_rows(&self) -> Vec<(&'static str, String)> {
         self.settings_items()
             .into_iter()
@@ -7163,6 +9243,13 @@ impl App {
                 value: self.permission_mode.name().to_string(),
                 description: "Preset controlling terminal commands and file mutation tools.",
                 action: "enter opens permission mode picker",
+                editable: true,
+            },
+            SettingsItem {
+                key: "bell",
+                value: if self.bell_setting { "on" } else { "off" }.to_string(),
+                description: "Terminal bell when a long turn finishes or needs approval (MEDUSA_BELL=off overrides).",
+                action: "enter toggles",
                 editable: true,
             },
             SettingsItem {
@@ -7355,6 +9442,7 @@ impl App {
             command: command.to_string(),
             cwd: None,
             background,
+            unsandboxed: false,
         };
         match self
             .user_tools()
@@ -7442,6 +9530,107 @@ fn queue_count_suffix(count: usize) -> String {
     }
 }
 
+/// Character counts per transcript category, mirroring what each item
+/// contributes to model context (messages, tool outputs, reasoning, and
+/// plan/decision state).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct TranscriptCharUsage {
+    messages: usize,
+    tool_outputs: usize,
+    reasoning: usize,
+    plans: usize,
+}
+
+impl TranscriptCharUsage {
+    fn total(&self) -> usize {
+        self.messages + self.tool_outputs + self.reasoning + self.plans
+    }
+}
+
+fn transcript_char_usage(transcript: &[TranscriptItem]) -> TranscriptCharUsage {
+    let mut usage = TranscriptCharUsage::default();
+    for item in transcript {
+        match item {
+            TranscriptItem::Message(msg) => usage.messages += msg.content.len(),
+            // Tool results are function_call_outputs in model context; they
+            // usually dominate usage, so count them too.
+            TranscriptItem::Tool(run) => usage.tool_outputs += run.summary.len() + run.detail.len(),
+            TranscriptItem::Reasoning(trace) => usage.reasoning += trace.content.len(),
+            TranscriptItem::Plan(plan) => {
+                usage.plans += plan.summary.len()
+                    + plan
+                        .items
+                        .iter()
+                        .map(|item| {
+                            item.text.len() + item.evidence.iter().map(String::len).sum::<usize>()
+                        })
+                        .sum::<usize>();
+            }
+            TranscriptItem::Decision(decision) => {
+                usage.plans += decision.title.len()
+                    + decision.reason.len()
+                    + decision.answer.as_ref().map_or(0, String::len)
+                    + decision
+                        .answers
+                        .iter()
+                        .map(|(key, value)| key.len() + value.len())
+                        .sum::<usize>()
+                    + decision
+                        .questions
+                        .iter()
+                        .map(|question| {
+                            question.prompt.len()
+                                + question.options.iter().map(String::len).sum::<usize>()
+                        })
+                        .sum::<usize>();
+            }
+            TranscriptItem::Workflow(_) => {}
+        }
+    }
+    usage
+}
+
+/// Estimated context composition captured when /context ran.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ContextReport {
+    instructions_tokens: usize,
+    system_tokens: usize,
+    message_tokens: usize,
+    tool_tokens: usize,
+    reasoning_tokens: usize,
+    plan_tokens: usize,
+    budget: usize,
+    summary_covers: Option<usize>,
+    summary_tokens: usize,
+}
+
+impl ContextReport {
+    fn total_tokens(&self) -> usize {
+        self.instructions_tokens
+            + self.system_tokens
+            + self.message_tokens
+            + self.tool_tokens
+            + self.reasoning_tokens
+            + self.plan_tokens
+    }
+
+    fn percent_used(&self) -> usize {
+        self.total_tokens() * 100 / self.budget.max(1)
+    }
+}
+
+/// Compact token count for footers and toasts: "812 tok", "1.23k tok",
+/// "2.05M tok".
+fn format_token_count(tokens: u64) -> String {
+    if tokens >= 1_000_000 {
+        format!("{:.2}M tok", tokens as f64 / 1_000_000.0)
+    } else if tokens >= 1_000 {
+        format!("{:.2}k tok", tokens as f64 / 1_000.0)
+    } else {
+        format!("{tokens} tok")
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct SlashCommand {
     name: &'static str,
@@ -7524,10 +9713,46 @@ const SLASH_COMMANDS: &[SlashCommand] = &[
         description: "Fork the current session before risky work",
     },
     SlashCommand {
+        name: "/rewind",
+        args: "",
+        category: "session",
+        description: "Restore files to the state before a previous turn",
+    },
+    SlashCommand {
+        name: "/edit",
+        args: "",
+        category: "session",
+        description: "Edit a previous message and resend from there (forks the timeline)",
+    },
+    SlashCommand {
+        name: "/review",
+        args: "",
+        category: "tools",
+        description: "Seed the composer with a code-review prompt for pending changes",
+    },
+    SlashCommand {
         name: "/clear",
         args: "",
         category: "session",
         description: "Clear the current transcript",
+    },
+    SlashCommand {
+        name: "/cost",
+        args: "",
+        category: "context",
+        description: "Show session and last-turn token usage",
+    },
+    SlashCommand {
+        name: "/context",
+        args: "",
+        category: "context",
+        description: "Show estimated context usage against the token budget",
+    },
+    SlashCommand {
+        name: "/compact",
+        args: "",
+        category: "context",
+        description: "Summarize older history now to free context",
     },
     SlashCommand {
         name: "/theme",
@@ -7546,6 +9771,18 @@ const SLASH_COMMANDS: &[SlashCommand] = &[
         args: "",
         category: "context",
         description: "List workspace skills",
+    },
+    SlashCommand {
+        name: "/agents",
+        args: "",
+        category: "context",
+        description: "List named agents defined in .medusa/agents",
+    },
+    SlashCommand {
+        name: "/mcp",
+        args: "[restart <server>]",
+        category: "tools",
+        description: "List MCP servers and their tools, or restart one",
     },
     SlashCommand {
         name: "/auth",
@@ -7744,6 +9981,135 @@ fn slash_match(command: &SlashCommand, query: &str) -> Option<(u8, Vec<usize>)> 
     }
 }
 
+/// Score a workspace path against an @mention query (already lowercased).
+/// Lower scores rank first: 0 file-name prefix, 1 any path-segment prefix,
+/// 2 substring, 3 subsequence. Matched byte positions index the full path.
+fn mention_match(path: &str, query: &str) -> Option<(u8, Vec<usize>)> {
+    if query.is_empty() {
+        return Some((4, Vec::new()));
+    }
+
+    let lower = path.to_ascii_lowercase();
+    let name_start = lower.rfind('/').map(|index| index + 1).unwrap_or(0);
+    if lower[name_start..].starts_with(query) {
+        return Some((0, (name_start..name_start + query.len()).collect()));
+    }
+    for (index, _) in lower.match_indices('/') {
+        let segment_start = index + 1;
+        if lower[segment_start..].starts_with(query) {
+            return Some((1, (segment_start..segment_start + query.len()).collect()));
+        }
+    }
+    if lower.starts_with(query) {
+        return Some((1, (0..query.len()).collect()));
+    }
+    if let Some(start) = lower.find(query) {
+        return Some((2, (start..start + query.len()).collect()));
+    }
+    subsequence_positions(&lower, query).map(|positions| (3, positions))
+}
+
+/// Breadth-first workspace file walk for the mention picker: relative paths
+/// with '/' separators, junk directories skipped, capped at `max` entries.
+/// Breadth-first order means shallow files survive the cap in big trees.
+fn collect_workspace_files(root: &Path, max: usize) -> Vec<String> {
+    let mut files = Vec::new();
+    let mut queue = VecDeque::from([root.to_path_buf()]);
+    while let Some(dir) = queue.pop_front() {
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        let mut entries = entries.flatten().collect::<Vec<_>>();
+        entries.sort_by_key(|entry| entry.file_name());
+        for entry in entries {
+            if files.len() >= max {
+                return files;
+            }
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            let name = entry.file_name().to_string_lossy().to_string();
+            if file_type.is_dir() {
+                if !MENTION_SKIP_DIRS.contains(&name.as_str()) {
+                    queue.push_back(entry.path());
+                }
+            } else if file_type.is_file()
+                && name != ".DS_Store"
+                && let Ok(relative) = entry.path().strip_prefix(root)
+            {
+                files.push(relative.to_string_lossy().replace('\\', "/"));
+            }
+        }
+    }
+    files
+}
+
+/// Append `- <note>` under the `## Notes` section of AGENTS.md at the
+/// workspace root, creating the file or the section when missing. The model
+/// sees the note automatically on the next turn: project instructions are
+/// reloaded from AGENTS.md at the start of every turn.
+fn append_quick_memory(workspace: &Path, note: &str) -> Result<()> {
+    let path = workspace.join("AGENTS.md");
+    let existing = if path.exists() {
+        fs::read_to_string(&path).wrap_err_with(|| format!("failed to read {}", path.display()))?
+    } else {
+        String::new()
+    };
+    let updated = quick_memory_content(&existing, note);
+    fs::write(&path, updated).wrap_err_with(|| format!("failed to write {}", path.display()))
+}
+
+/// Collapse a quick-memory note to a single safe line so it can never forge a
+/// new AGENTS.md section. Embedded newlines (and the whitespace around them)
+/// fold into single spaces, and a leading `#` run is stripped — a multi-line
+/// paste like `deploy\n## Deploy\nrun` becomes one bullet, and the insert-point
+/// scan (which breaks on any line starting with `#`) always steps over it.
+fn sanitize_quick_memory_note(note: &str) -> String {
+    let collapsed = note
+        .split(['\n', '\r'])
+        .map(str::trim)
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    collapsed.trim_start_matches('#').trim_start().to_string()
+}
+
+/// Pure content transform behind [`append_quick_memory`]: the note lands at
+/// the end of the `## Notes` section (before any following heading),
+/// creating the file skeleton or the section when absent.
+fn quick_memory_content(existing: &str, note: &str) -> String {
+    let note = sanitize_quick_memory_note(note);
+    let bullet = format!("- {note}");
+    if existing.trim().is_empty() {
+        return format!("{QUICK_MEMORY_HEADER}\n\n{QUICK_MEMORY_SECTION}\n\n{bullet}\n");
+    }
+
+    let mut lines = existing.lines().map(str::to_string).collect::<Vec<_>>();
+    let Some(section) = lines
+        .iter()
+        .position(|line| line.trim() == QUICK_MEMORY_SECTION)
+    else {
+        let mut result = existing.trim_end().to_string();
+        result.push_str(&format!("\n\n{QUICK_MEMORY_SECTION}\n\n{bullet}\n"));
+        return result;
+    };
+
+    let mut insert_at = lines.len();
+    for (index, line) in lines.iter().enumerate().skip(section + 1) {
+        if line.trim_start().starts_with('#') {
+            insert_at = index;
+            break;
+        }
+    }
+    while insert_at > section + 1 && lines[insert_at - 1].trim().is_empty() {
+        insert_at -= 1;
+    }
+    lines.insert(insert_at, bullet);
+    let mut result = lines.join("\n");
+    result.push('\n');
+    result
+}
+
 /// Fuzzy subsequence match: every query character appears in order in the
 /// name (so "wf" matches "workflow"). Returns matched byte positions.
 fn subsequence_positions(name: &str, query: &str) -> Option<Vec<usize>> {
@@ -7762,6 +10128,20 @@ fn subsequence_positions(name: &str, query: &str) -> Option<Vec<usize>> {
         }
     }
     Some(positions)
+}
+
+/// Render a workspace path with fuzzy-matched bytes highlighted.
+fn mention_path_spans(path: &str, positions: &[usize]) -> Vec<Span<'static>> {
+    path.char_indices()
+        .map(|(index, ch)| {
+            let style = if positions.contains(&index) {
+                accent().add_modifier(Modifier::BOLD)
+            } else {
+                value_style()
+            };
+            Span::styled(ch.to_string(), style)
+        })
+        .collect()
 }
 
 /// Render a command name with matched characters highlighted, padded to
@@ -7992,7 +10372,14 @@ fn append_decision_rows(
             ("? ", prompt_style())
         };
         rows.push(TranscriptRow::text(Line::from(vec![
-            Span::styled(if index == last { "  └─ " } else { "  ├─ " }, muted()),
+            Span::styled(
+                if index == last {
+                    "  └─ "
+                } else {
+                    "  ├─ "
+                },
+                muted(),
+            ),
             Span::styled(marker, marker_style),
             Span::styled(
                 truncate(&question.prompt, 120),
@@ -8016,7 +10403,11 @@ fn append_decision_rows(
                     ),
                     Span::styled(
                         truncate(option, 100),
-                        if picked { success_style() } else { value_style() },
+                        if picked {
+                            success_style()
+                        } else {
+                            value_style()
+                        },
                     ),
                 ];
                 if recommended {
@@ -9807,8 +12198,7 @@ fn append_tool_group_lines(
         first = false;
 
         if matched.len() > 1 {
-            let selected =
-                matches!(selected_tool, Some(sel) if sel >= index && sel < cursor);
+            let selected = matches!(selected_tool, Some(sel) if sel >= index && sel < cursor);
             append_coalesced_tool_lines(lines, &matched, selected, context);
             index = cursor;
         } else {
@@ -10002,6 +12392,8 @@ fn tool_display_name(name: &str) -> &str {
         "terminal.exec" => "terminal",
         "file.edit" => "edit",
         "file.patch" => "patch",
+        "web.fetch" => "fetch",
+        "web.search" => "web",
         "task.update" => "status",
         other => other,
     }
@@ -10213,6 +12605,45 @@ fn attachment_label(attachment: &ImageAttachment) -> String {
     )
 }
 
+/// Prompt seeded into the composer by /review. Never auto-sent: the user
+/// can trim scope or add focus areas before pressing enter.
+const REVIEW_PROMPT_TEMPLATE: &str = "\
+Review the pending changes in this workspace.
+
+1. Run `git status`, then `git diff` and `git diff --staged`, to see every pending change.
+2. Review for correctness bugs first: logic errors, broken edge cases, races, and regressions.
+3. Only then look for simplifications: dead code, duplication, and needless complexity.
+4. Verify every claim by reading the surrounding code before reporting it — no guesses.
+5. Report each finding as file:line with a one-sentence explanation, most severe first.";
+
+/// True when the workspace is inside a git repo with pending changes
+/// (staged, unstaged, or untracked — `git status --porcelain` shows all
+/// three). The default probe behind /review's App-injectable check.
+fn workspace_has_reviewable_diff(workspace: &Path) -> bool {
+    let inside_repo = std::process::Command::new("git")
+        .args(["rev-parse", "--is-inside-work-tree"])
+        .current_dir(workspace)
+        .output()
+        .map(|output| output.status.success())
+        .unwrap_or(false);
+    if !inside_repo {
+        return false;
+    }
+    std::process::Command::new("git")
+        .args(["status", "--porcelain"])
+        .current_dir(workspace)
+        .output()
+        .map(|output| output.status.success() && !output.stdout.is_empty())
+        .unwrap_or(false)
+}
+
+/// Single-line picker preview: whitespace (including newlines) collapsed,
+/// then char-truncated.
+fn message_one_liner(content: &str, max_chars: usize) -> String {
+    let flat = content.split_whitespace().collect::<Vec<_>>().join(" ");
+    truncate(&flat, max_chars)
+}
+
 fn truncate(value: &str, max_chars: usize) -> String {
     let mut chars = value.chars();
     let truncated = chars.by_ref().take(max_chars).collect::<String>();
@@ -10221,6 +12652,35 @@ fn truncate(value: &str, max_chars: usize) -> String {
         format!("{truncated}...")
     } else {
         truncated
+    }
+}
+
+/// Prompt excerpt stored in checkpoint manifests: first line, ≤80 chars.
+fn excerpt_for_checkpoint(task: &str) -> String {
+    task.lines()
+        .next()
+        .unwrap_or("")
+        .trim()
+        .chars()
+        .take(80)
+        .collect()
+}
+
+/// Compact "3m ago"-style label for checkpoint rows.
+fn time_ago_ms(created_at_ms: u64) -> String {
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let seconds = now_ms.saturating_sub(created_at_ms) / 1000;
+    if seconds < 60 {
+        "now".to_string()
+    } else if seconds < 3_600 {
+        format!("{}m ago", seconds / 60)
+    } else if seconds < 86_400 {
+        format!("{}h ago", seconds / 3_600)
+    } else {
+        format!("{}d ago", seconds / 86_400)
     }
 }
 
@@ -10844,6 +13304,15 @@ fn transcript_conversation_message(item: &TranscriptItem) -> Option<Conversation
             ChatRole::Assistant if !message.content.trim().is_empty() => {
                 Some(ConversationMessage {
                     role: "assistant".to_string(),
+                    content: message.content.clone(),
+                    attachments: Vec::new(),
+                })
+            }
+            // The interruption note re-enters model history so a resumed
+            // conversation knows the previous turn was cut short.
+            ChatRole::System if message.content == TURN_INTERRUPTED_NOTE => {
+                Some(ConversationMessage {
+                    role: "system".to_string(),
                     content: message.content.clone(),
                     attachments: Vec::new(),
                 })
@@ -11543,6 +14012,16 @@ mod tests {
         App::with_model_backend(false)
     }
 
+    /// Wrap a raw workflow-event receiver into a `BackgroundWorkflow` for tests
+    /// that push directly onto `app.workflow_events`.
+    fn background_workflow(app: &App, events: Receiver<WorkflowEvent>) -> BackgroundWorkflow {
+        BackgroundWorkflow {
+            events,
+            checkpoint: app.new_workflow_checkpoint("/workflow test", 0),
+            cancel: CancelToken::new(),
+        }
+    }
+
     fn line_text(line: &Line<'_>) -> String {
         line.spans
             .iter()
@@ -11588,11 +14067,11 @@ mod tests {
     }
 
     fn temp_workspace() -> PathBuf {
-        let suffix = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let path = env::temp_dir().join(format!("medusa-tui-test-{suffix}"));
+        // pid + atomic counter: unique across parallel test threads and
+        // concurrent test processes (a bare timestamp raced in the past).
+        static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let suffix = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path = env::temp_dir().join(format!("medusa-tui-test-{}-{suffix}", std::process::id()));
         fs::create_dir_all(&path).unwrap();
         path.canonicalize().unwrap()
     }
@@ -11625,12 +14104,16 @@ mod tests {
         let workspace = temp_workspace();
         save_theme_preference(&workspace, ThemeKind::Gruvbox).unwrap();
 
-        unsafe { env::set_var("MEDUSA_THEME", "nord") };
+        // Pass the override explicitly instead of mutating process-global env:
+        // `set_var("MEDUSA_THEME", …)` races the parallel test harness's
+        // getenv-backed readers (UB) and its sibling `from_workspace_settings`
+        // callers (flaky logic race).
         assert_eq!(
-            ThemeKind::from_workspace_settings(&workspace),
+            ThemeKind::resolve(Some("nord"), &workspace),
             ThemeKind::Nord
         );
-        unsafe { env::remove_var("MEDUSA_THEME") };
+        // With no override the persisted workspace setting wins.
+        assert_eq!(ThemeKind::resolve(None, &workspace), ThemeKind::Gruvbox);
     }
 
     #[test]
@@ -11712,7 +14195,10 @@ mod tests {
 
         app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
         app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
-        assert_eq!(app.input_cursor, "first line\nsecond\nthird ".chars().count());
+        assert_eq!(
+            app.input_cursor,
+            "first line\nsecond\nthird ".chars().count()
+        );
     }
 
     #[test]
@@ -12292,6 +14778,438 @@ mod tests {
     }
 
     #[test]
+    fn slash_prefix_suggests_rewind() {
+        let mut app = app();
+
+        app.input = "/re".to_string();
+        app.input_cursor = 3;
+
+        let matches = app.slash_matches();
+        assert!(matches.iter().any(|(command, _)| command.name == "/rewind"));
+    }
+
+    fn checkpoint_in(workspace: &Path, prompt: &str, user_index: usize) -> String {
+        let recorder = CheckpointRecorder::new(
+            workspace,
+            CheckpointMeta {
+                session_id: "session-elsewhere.json".to_string(),
+                prompt_excerpt: prompt.to_string(),
+                transcript_user_index: user_index,
+            },
+        );
+        fs::write(workspace.join("tracked.txt"), format!("{prompt}\n")).unwrap();
+        recorder.capture(&["tracked.txt".to_string()]).unwrap();
+        fs::write(workspace.join("tracked.txt"), "mutated\n").unwrap();
+        recorder.finish().unwrap().id
+    }
+
+    #[test]
+    fn rewind_opens_modal_with_entries_newest_first() {
+        let mut app = app();
+        let workspace = app.tools.workspace().to_path_buf();
+        let first = checkpoint_in(&workspace, "first turn", 0);
+        let second = checkpoint_in(&workspace, "second turn", 2);
+
+        assert!(app.run_local_tool_command("/rewind"));
+
+        assert_eq!(app.active_modal, Some(Modal::Rewind));
+        assert_eq!(app.rewind_stage, RewindStage::Pick);
+        assert_eq!(app.rewind_entries.len(), 2);
+        assert_eq!(app.rewind_entries[0].id, second);
+        assert_eq!(app.rewind_entries[1].id, first);
+        assert_eq!(app.rewind_entries[0].prompt_excerpt, "second turn");
+    }
+
+    #[test]
+    fn rewind_without_checkpoints_stays_closed() {
+        let mut app = app();
+
+        assert!(app.run_local_tool_command("/rewind"));
+
+        assert_eq!(app.active_modal, None);
+        assert_eq!(app.status_line, "no checkpoints yet");
+    }
+
+    #[test]
+    fn rewind_is_refused_while_a_turn_is_streaming() {
+        let mut app = app();
+        let workspace = app.tools.workspace().to_path_buf();
+        checkpoint_in(&workspace, "some turn", 0);
+        let (_sender, receiver) = mpsc::channel::<ModelStreamEvent>();
+        app.model_events = Some(receiver);
+
+        assert!(app.run_local_tool_command("/rewind"));
+
+        assert_eq!(app.active_modal, None);
+        assert_eq!(app.status_line, "finish the current turn before rewinding");
+    }
+
+    #[test]
+    fn rewind_restore_rewinds_files_and_closes_modal() {
+        let mut app = app();
+        let workspace = app.tools.workspace().to_path_buf();
+        let id = checkpoint_in(&workspace, "edit tracked", 0);
+        assert_eq!(
+            fs::read_to_string(workspace.join("tracked.txt")).unwrap(),
+            "mutated\n"
+        );
+
+        assert!(app.run_local_tool_command("/rewind"));
+        assert_eq!(app.rewind_entries[0].id, id);
+        // Pick the checkpoint, then confirm the default "Restore files".
+        app.handle_rewind_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.rewind_stage, RewindStage::Confirm);
+        // Foreign-session checkpoint: no fork option offered.
+        assert_eq!(
+            app.rewind_confirm_options(),
+            vec!["Restore files", "Cancel"]
+        );
+        app.handle_rewind_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert_eq!(app.active_modal, None);
+        assert_eq!(
+            fs::read_to_string(workspace.join("tracked.txt")).unwrap(),
+            "edit tracked\n"
+        );
+    }
+
+    #[test]
+    fn rewind_fork_truncates_transcript_and_prefills_composer() {
+        let mut app = app();
+        let workspace = app.tools.workspace().to_path_buf();
+        let session = SessionStore::open(&workspace, SessionOpenMode::New).unwrap();
+        let original_id = session.current_id();
+        session.save_transcript(&[]).unwrap();
+        app.session = Some(session);
+        app.transcript = vec![
+            TranscriptItem::Message(ChatMessage::user("first prompt")),
+            TranscriptItem::Message(ChatMessage::assistant("first answer")),
+            TranscriptItem::Message(ChatMessage::user("second prompt")),
+            TranscriptItem::Message(ChatMessage::assistant("second answer")),
+        ];
+        let entry = CheckpointEntry {
+            id: "cp-test".to_string(),
+            session_id: original_id.clone(),
+            created_at_ms: 0,
+            prompt_excerpt: "second prompt".to_string(),
+            transcript_user_index: 2,
+            parent_id: None,
+            note: String::new(),
+            files: Vec::new(),
+        };
+
+        app.fork_transcript_at_checkpoint(&entry);
+
+        assert_eq!(app.transcript.len(), 2);
+        assert!(matches!(
+            &app.transcript[1],
+            TranscriptItem::Message(message) if message.content == "first answer"
+        ));
+        assert_eq!(app.input, "second prompt");
+        let forked_id = app.session.as_ref().unwrap().current_id();
+        assert_ne!(forked_id, original_id);
+        assert_eq!(
+            app.session.as_ref().unwrap().parent_id(),
+            Some(original_id.as_str())
+        );
+    }
+
+    /// Finding [20]: `/clear` empties the transcript without rotating the
+    /// session id, so a pre-clear checkpoint's `transcript_user_index` is now
+    /// stale. Session-id equality alone must NOT offer fork.
+    #[test]
+    fn rewind_hides_fork_for_stale_index_after_clear() {
+        let mut app = app();
+        let workspace = app.tools.workspace().to_path_buf();
+        let session = SessionStore::open(&workspace, SessionOpenMode::New).unwrap();
+        let session_id = session.current_id();
+        app.session = Some(session);
+        // Same session id, index 8 recorded before /clear.
+        app.rewind_entries = vec![CheckpointEntry {
+            id: "cp-stale".to_string(),
+            session_id: session_id.clone(),
+            created_at_ms: 1,
+            prompt_excerpt: "old prompt".to_string(),
+            transcript_user_index: 8,
+            parent_id: None,
+            note: String::new(),
+            files: Vec::new(),
+        }];
+        app.rewind_selection = 0;
+        // /clear then one fresh turn: the transcript no longer has row 8.
+        app.transcript = vec![
+            TranscriptItem::Message(ChatMessage::user("brand new prompt")),
+            TranscriptItem::Message(ChatMessage::assistant("answer")),
+        ];
+
+        assert!(
+            !app.selected_rewind_offers_fork(),
+            "stale index must not offer fork even though session id still matches"
+        );
+        assert_eq!(
+            app.rewind_confirm_options(),
+            vec!["Restore files", "Cancel"]
+        );
+    }
+
+    /// Finding [20]: even if the confirm option is reached directly, forking on
+    /// a stale index must not truncate the live transcript, overwrite the
+    /// composer, rotate the session, or toast a false success.
+    #[test]
+    fn fork_at_checkpoint_refuses_stale_index_and_leaves_conversation_intact() {
+        let mut app = app();
+        let workspace = app.tools.workspace().to_path_buf();
+        let session = SessionStore::open(&workspace, SessionOpenMode::New).unwrap();
+        let original_id = session.current_id();
+        session.save_transcript(&[]).unwrap();
+        app.session = Some(session);
+        app.transcript = vec![
+            TranscriptItem::Message(ChatMessage::user("brand new prompt")),
+            TranscriptItem::Message(ChatMessage::assistant("answer")),
+        ];
+        app.input = "unsent draft".to_string();
+        let entry = CheckpointEntry {
+            id: "cp-stale".to_string(),
+            session_id: original_id.clone(),
+            created_at_ms: 1,
+            prompt_excerpt: "old prompt".to_string(),
+            transcript_user_index: 8,
+            parent_id: None,
+            note: String::new(),
+            files: Vec::new(),
+        };
+
+        app.fork_transcript_at_checkpoint(&entry);
+
+        // Transcript untouched, draft preserved, session NOT forked.
+        assert_eq!(app.transcript.len(), 2);
+        assert_eq!(app.input, "unsent draft");
+        assert_eq!(app.session.as_ref().unwrap().current_id(), original_id);
+    }
+
+    /// Finding [20] guardrail: a genuinely-live checkpoint (index maps to its
+    /// user message, excerpt still matches) still offers and applies fork.
+    #[test]
+    fn rewind_still_offers_fork_for_live_checkpoint() {
+        let mut app = app();
+        let workspace = app.tools.workspace().to_path_buf();
+        let session = SessionStore::open(&workspace, SessionOpenMode::New).unwrap();
+        let session_id = session.current_id();
+        app.session = Some(session);
+        app.transcript = vec![
+            TranscriptItem::Message(ChatMessage::user("first prompt")),
+            TranscriptItem::Message(ChatMessage::assistant("first answer")),
+            TranscriptItem::Message(ChatMessage::user("second prompt")),
+            TranscriptItem::Message(ChatMessage::assistant("second answer")),
+        ];
+        app.rewind_entries = vec![CheckpointEntry {
+            id: "cp-live".to_string(),
+            session_id,
+            created_at_ms: 1,
+            prompt_excerpt: "second prompt".to_string(),
+            transcript_user_index: 2,
+            parent_id: None,
+            note: String::new(),
+            files: Vec::new(),
+        }];
+        app.rewind_selection = 0;
+
+        assert!(app.selected_rewind_offers_fork());
+        assert!(
+            app.rewind_confirm_options()
+                .contains(&"Restore files + fork conversation")
+        );
+    }
+
+    #[test]
+    fn edit_command_opens_picker_newest_first() {
+        let mut app = app();
+        app.transcript = vec![
+            TranscriptItem::Message(ChatMessage::user("first prompt")),
+            TranscriptItem::Message(ChatMessage::assistant("first answer")),
+            TranscriptItem::Message(ChatMessage::user("second\nprompt with lines")),
+            TranscriptItem::Message(ChatMessage::assistant("second answer")),
+        ];
+
+        assert!(app.run_local_tool_command("/edit"));
+
+        assert_eq!(app.active_modal, Some(Modal::EditMessage));
+        assert_eq!(app.edit_picker_selection, 0);
+        assert_eq!(app.edit_picker_entries.len(), 2);
+        assert_eq!(app.edit_picker_entries[0].transcript_index, 2);
+        assert_eq!(
+            app.edit_picker_entries[0].preview,
+            "second prompt with lines"
+        );
+        assert_eq!(app.edit_picker_entries[1].transcript_index, 0);
+        assert_eq!(app.edit_picker_entries[1].preview, "first prompt");
+    }
+
+    #[test]
+    fn edit_picker_caps_at_twenty_messages() {
+        let mut app = app();
+        app.transcript = (0..25)
+            .map(|index| TranscriptItem::Message(ChatMessage::user(format!("prompt {index}"))))
+            .collect();
+
+        assert!(app.run_local_tool_command("/edit"));
+
+        assert_eq!(app.edit_picker_entries.len(), EDIT_PICKER_LIMIT);
+        assert_eq!(app.edit_picker_entries[0].preview, "prompt 24");
+    }
+
+    #[test]
+    fn edit_without_user_messages_stays_closed() {
+        let mut app = app();
+        app.transcript = vec![TranscriptItem::Message(ChatMessage::assistant("hi"))];
+
+        assert!(app.run_local_tool_command("/edit"));
+
+        assert_eq!(app.active_modal, None);
+        assert_eq!(app.status_line, "no previous messages to edit");
+    }
+
+    #[test]
+    fn edit_is_refused_while_a_turn_is_streaming() {
+        let mut app = app();
+        app.transcript = vec![TranscriptItem::Message(ChatMessage::user("prompt"))];
+        let (_sender, receiver) = mpsc::channel::<ModelStreamEvent>();
+        app.model_events = Some(receiver);
+
+        assert!(app.run_local_tool_command("/edit"));
+
+        assert_eq!(app.active_modal, None);
+        assert_eq!(
+            app.status_line,
+            "finish the current turn before editing a message"
+        );
+    }
+
+    #[test]
+    fn edit_selection_forks_session_truncates_transcript_and_prefills_composer() {
+        let mut app = app();
+        let workspace = app.tools.workspace().to_path_buf();
+        let session = SessionStore::open(&workspace, SessionOpenMode::New).unwrap();
+        let original_id = session.current_id();
+        let transcript = vec![
+            TranscriptItem::Message(ChatMessage::user("first prompt")),
+            TranscriptItem::Message(ChatMessage::assistant("first answer")),
+            TranscriptItem::Message(ChatMessage::user("second prompt")),
+            TranscriptItem::Message(ChatMessage::assistant("second answer")),
+        ];
+        session.save_transcript(&transcript).unwrap();
+        app.session = Some(session);
+        app.transcript = transcript;
+
+        assert!(app.run_local_tool_command("/edit"));
+        assert_eq!(app.active_modal, Some(Modal::EditMessage));
+        // Newest first: selection 0 is "second prompt" at transcript index 2.
+        app.handle_edit_message_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert_eq!(app.active_modal, None);
+        assert_eq!(app.transcript.len(), 2);
+        assert!(matches!(
+            &app.transcript[1],
+            TranscriptItem::Message(message) if message.content == "first answer"
+        ));
+        assert_eq!(app.input, "second prompt");
+        assert_eq!(app.input_cursor, app.input_len());
+        assert!(app.status_line.starts_with("editing message"));
+
+        // The session tree gained a fork: the live session is a new child
+        // of the original, and the original file still holds the full
+        // four-item timeline.
+        let session = app.session.as_ref().unwrap();
+        let forked_id = session.current_id();
+        assert_ne!(forked_id, original_id);
+        assert_eq!(session.parent_id(), Some(original_id.as_str()));
+        let original_path = workspace
+            .join(".medusa")
+            .join("sessions")
+            .join(&original_id);
+        let original: medusa_core::session::LoadedSessionFile<TranscriptItem> =
+            read_session_file(&original_path).unwrap();
+        assert_eq!(original.transcript.len(), 4);
+    }
+
+    #[test]
+    fn edit_selection_is_refused_when_a_turn_starts_while_picker_is_open() {
+        let mut app = app();
+        let workspace = app.tools.workspace().to_path_buf();
+        let session = SessionStore::open(&workspace, SessionOpenMode::New).unwrap();
+        app.session = Some(session);
+        app.transcript = vec![TranscriptItem::Message(ChatMessage::user("prompt"))];
+
+        assert!(app.run_local_tool_command("/edit"));
+        let (_sender, receiver) = mpsc::channel::<ModelStreamEvent>();
+        app.model_events = Some(receiver);
+        app.handle_edit_message_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert_eq!(app.active_modal, None);
+        assert_eq!(app.transcript.len(), 1);
+        assert!(app.input.is_empty());
+        assert_eq!(
+            app.status_line,
+            "finish the current turn before editing a message"
+        );
+    }
+
+    #[test]
+    fn review_seeds_composer_without_sending() {
+        let mut app = app();
+        app.review_diff_check = |_| true;
+
+        assert!(app.run_local_tool_command("/review"));
+
+        assert_eq!(app.input, REVIEW_PROMPT_TEMPLATE);
+        assert_eq!(app.input_cursor, app.input_len());
+        assert!(app.input.contains("git status"));
+        assert!(app.input.contains("git diff"));
+        assert!(app.input.contains("correctness bugs first"));
+        assert!(app.input.contains("file:line"));
+        // Seeded only — nothing was sent and no turn started.
+        assert!(app.transcript.is_empty());
+        assert!(app.model_events.is_none());
+        assert_eq!(
+            app.status_line,
+            "review prompt ready — edit and press enter"
+        );
+    }
+
+    #[test]
+    fn review_toasts_when_nothing_to_review() {
+        let mut app = app();
+        app.review_diff_check = |_| false;
+
+        assert!(app.run_local_tool_command("/review"));
+
+        assert!(app.input.is_empty());
+        assert_eq!(app.status_line, "nothing to review");
+        assert_eq!(app.toast.as_ref().unwrap().message, "Nothing to review");
+    }
+
+    #[test]
+    fn reviewable_diff_probe_reports_repo_and_diff_state() {
+        // Not a git repo: nothing to review.
+        let bare = temp_workspace();
+        assert!(!workspace_has_reviewable_diff(&bare));
+
+        // Fresh repo with no changes at all: still nothing to review.
+        let repo = temp_workspace();
+        let init = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&repo)
+            .status()
+            .unwrap();
+        assert!(init.success());
+        assert!(!workspace_has_reviewable_diff(&repo));
+
+        // A pending (untracked) file makes the workspace reviewable.
+        fs::write(repo.join("pending.txt"), "change\n").unwrap();
+        assert!(workspace_has_reviewable_diff(&repo));
+    }
+
+    #[test]
     fn slash_prefix_suggests_resume() {
         let mut app = app();
 
@@ -12768,6 +15686,124 @@ mod tests {
     }
 
     #[test]
+    fn agents_command_opens_modal_with_workspace_agents() {
+        let workspace = temp_workspace();
+        let dir = workspace.join(".medusa/agents");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("reviewer.md"),
+            "name: reviewer\ndescription: Review diffs\ntools: read\n\nAlways lead with findings.",
+        )
+        .unwrap();
+        let session = SessionStore::open(&workspace, SessionOpenMode::New).unwrap();
+        let mut app = App::build(false, Some(session));
+        app.tools = ToolRuntime::new(&workspace).unwrap();
+
+        app.input = "/agents".to_string();
+        app.input_cursor = app.input_len();
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert_eq!(app.active_modal, Some(Modal::Agents));
+        assert_eq!(app.status_line, "named agents");
+        assert_eq!(app.agent_registry.agents().len(), 1);
+        assert_eq!(app.agent_registry.agents()[0].name, "reviewer");
+        assert_eq!(
+            app.agent_registry.agents()[0].tool_policy,
+            SubagentToolPolicy::ReadOnly
+        );
+
+        // Esc closes through the generic modal fallback.
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(app.active_modal, None);
+    }
+
+    #[test]
+    fn agents_command_shows_empty_state_when_unconfigured() {
+        let mut app = app();
+
+        app.input = "/agents".to_string();
+        app.input_cursor = app.input_len();
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert_eq!(app.active_modal, Some(Modal::Agents));
+        assert!(app.agent_registry.is_empty());
+    }
+
+    #[test]
+    fn slash_prefix_suggests_mcp_command() {
+        let mut app = app();
+
+        app.input = "/mc".to_string();
+        app.input_cursor = 3;
+
+        let matches = app.slash_matches();
+        assert!(matches.iter().any(|(command, _)| command.name == "/mcp"));
+    }
+
+    #[test]
+    fn mcp_command_opens_modal_with_config_hint_when_unconfigured() {
+        let mut app = app();
+
+        app.input = "/mcp".to_string();
+        app.input_cursor = app.input_len();
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert_eq!(app.active_modal, Some(Modal::Mcp));
+        assert!(app.mcp_statuses.is_empty());
+        assert_eq!(app.status_line, "mcp servers");
+
+        // Esc closes through the generic modal fallback.
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(app.active_modal, None);
+    }
+
+    #[test]
+    fn mcp_command_snapshots_configured_servers_without_starting_them() {
+        let workspace = temp_workspace();
+        fs::create_dir_all(workspace.join(".medusa")).unwrap();
+        fs::write(
+            workspace.join(".medusa/mcp.json"),
+            r#"{"servers":{"docs":{"command":"python3","args":["server.py"],"readOnly":true}}}"#,
+        )
+        .unwrap();
+        let session = SessionStore::open(&workspace, SessionOpenMode::New).unwrap();
+        let mut app = App::build(false, Some(session));
+        app.mcp = McpRegistry::load(&workspace).unwrap();
+        app.tools = ToolRuntime::new(&workspace)
+            .unwrap()
+            .with_mcp(app.mcp.clone());
+
+        app.input = "/mcp".to_string();
+        app.input_cursor = app.input_len();
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert_eq!(app.active_modal, Some(Modal::Mcp));
+        assert_eq!(app.mcp_statuses.len(), 1);
+        assert_eq!(app.mcp_statuses[0].name, "docs");
+        assert_eq!(app.mcp_statuses[0].state, McpServerStateLabel::Idle);
+        assert!(app.mcp_statuses[0].read_only);
+        assert_eq!(app.mcp_statuses[0].command_line, "python3 server.py");
+    }
+
+    #[test]
+    fn mcp_restart_validates_the_server_name() {
+        let mut app = app();
+
+        app.input = "/mcp restart nope".to_string();
+        app.input_cursor = app.input_len();
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert_eq!(app.status_line, "unknown mcp server");
+        assert_eq!(app.active_modal, None);
+
+        app.input = "/mcp bogus".to_string();
+        app.input_cursor = app.input_len();
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert_eq!(app.status_line, "usage: /mcp [restart <server>]");
+    }
+
+    #[test]
     fn unknown_slash_command_does_not_hit_model() {
         let mut app = app();
 
@@ -12985,7 +16021,8 @@ mod tests {
     fn active_workflow_does_not_block_model_turn_but_blocks_reload() {
         let mut app = App::with_model_backend(true);
         let (_sender, receiver) = mpsc::channel();
-        app.workflow_events.push(receiver);
+        let workflow = background_workflow(&app, receiver);
+        app.workflow_events.push(workflow);
 
         assert!(!app.is_working());
         assert!(app.has_active_workflows());
@@ -13000,6 +16037,105 @@ mod tests {
 
         assert!(!app.should_quit);
         assert_eq!(app.status_line, "reload blocked: work is still running");
+    }
+
+    /// Finding [23]: the real turn-start path must hand the worker a
+    /// `ToolRuntime` carrying the checkpoint recorder AND the turn's cancel
+    /// token — deleting any of that wiring must fail this test.
+    #[test]
+    fn start_model_turn_wires_recorder_and_cancel_onto_worker_runtime() {
+        let mut app = App::with_model_backend(true);
+        app.transcript
+            .push(TranscriptItem::Message(ChatMessage::user("edit the file")));
+
+        app.start_model_turn("edit the file");
+
+        // App-side wiring (guards `self.active_checkpoint` / `self.turn_cancel`).
+        assert!(
+            app.active_checkpoint.is_some(),
+            "turn must own a checkpoint recorder for finish/prune"
+        );
+        let turn_cancel = app
+            .turn_cancel
+            .clone()
+            .expect("turn must own a cancel token");
+
+        // Worker-side wiring: the exact runtime handed to the worker must carry
+        // the recorder and the SAME cancel token (App-side state cannot prove
+        // the `.with_checkpoint_recorder` / `.with_cancel_token` calls).
+        let runtime = app
+            .last_turn_runtime
+            .as_ref()
+            .expect("worker runtime should be captured");
+        assert!(
+            runtime.has_checkpoint_recorder(),
+            "worker runtime must carry the checkpoint recorder"
+        );
+        assert!(!runtime.cancel_token().is_cancelled());
+        turn_cancel.cancel();
+        assert!(
+            runtime.cancel_token().is_cancelled(),
+            "worker runtime must share the turn's cancel token"
+        );
+    }
+
+    /// Finding [12]: background workflow tools must carry a checkpoint recorder
+    /// (and a cancel token) so subagent file edits are rewindable.
+    #[test]
+    fn start_workflow_wires_recorder_and_cancel_onto_worker_runtime() {
+        let mut app = App::with_model_backend(true);
+
+        app.start_workflow("refactor auth");
+
+        let runtime = app
+            .last_workflow_runtime
+            .as_ref()
+            .expect("workflow worker runtime should be captured");
+        assert!(
+            runtime.has_checkpoint_recorder(),
+            "workflow subagent edits must be checkpointed so /rewind can undo them"
+        );
+        let workflow = app.workflow_events.last().expect("workflow registered");
+        assert!(!workflow.cancel.is_cancelled());
+        // A turn cancel stops the background workflow's tools.
+        app.finalize_cancelled_turn("interrupted");
+        assert!(
+            app.workflow_events.iter().all(|w| w.cancel.is_cancelled()),
+            "cancel must reach the background workflow so its tools bail"
+        );
+    }
+
+    /// Finding [12] end-to-end: a file mutated during a workflow run lands in a
+    /// checkpoint that `/rewind` can list and restore.
+    #[test]
+    fn workflow_file_edits_are_captured_in_a_rewindable_checkpoint() {
+        let mut app = App::with_model_backend(true);
+        let workspace = app.tools.workspace().to_path_buf();
+        fs::write(workspace.join("auth.rs"), "old\n").unwrap();
+
+        app.start_workflow("refactor auth");
+        // A subagent edits a file through the run's shared recorder (the
+        // worker's ToolRuntime holds a clone of this exact recorder).
+        let recorder = app.workflow_events.last().unwrap().checkpoint.clone();
+        recorder.capture(&["auth.rs".to_string()]).unwrap();
+        fs::write(workspace.join("auth.rs"), "new\n").unwrap();
+
+        let entries = CheckpointStore::open(&workspace)
+            .and_then(|store| store.list())
+            .unwrap();
+        let entry = entries
+            .iter()
+            .find(|entry| entry.prompt_excerpt == "/workflow refactor auth")
+            .expect("workflow run must produce a rewindable checkpoint");
+
+        // And it actually restores the pre-edit content.
+        CheckpointStore::open(&workspace)
+            .and_then(|store| store.restore(&entry.id))
+            .unwrap();
+        assert_eq!(
+            fs::read_to_string(workspace.join("auth.rs")).unwrap(),
+            "old\n"
+        );
     }
 
     #[test]
@@ -13028,8 +16164,10 @@ mod tests {
             })
             .unwrap();
         drop(finished_sender);
-        app.workflow_events.push(finished_receiver);
-        app.workflow_events.push(active_receiver);
+        let finished = background_workflow(&app, finished_receiver);
+        let active = background_workflow(&app, active_receiver);
+        app.workflow_events.push(finished);
+        app.workflow_events.push(active);
 
         app.drain_workflow_events();
 
@@ -13041,6 +16179,44 @@ mod tests {
             Some(TranscriptItem::Message(ChatMessage { role: ChatRole::Assistant, content, .. }))
                 if content == "workflow completed"
         ));
+    }
+
+    /// [7]: a turn queued while a background workflow runs must start when the
+    /// workflow finishes — the only other dequeue site is a model turn's
+    /// completion, so without this the prompt strands forever.
+    #[test]
+    fn finished_background_workflow_starts_queued_turn() {
+        let mut app = app(); // model disabled: no worker thread, fully offline
+        let (sender, receiver) = mpsc::channel::<WorkflowEvent>();
+        app.workflow_events
+            .push(background_workflow(&app, receiver));
+        app.queued_turns
+            .push_back("fix the failing test".to_string());
+
+        // The workflow completes and its channel disconnects.
+        sender
+            .send(WorkflowEvent::RunFinished {
+                run_id: "workflow-test".to_string(),
+                status: WorkflowStatus::Succeeded,
+                summary: "done".to_string(),
+            })
+            .unwrap();
+        drop(sender);
+
+        app.drain_workflow_events();
+
+        assert!(
+            app.queued_turns.is_empty(),
+            "workflow completion must drain the queued turn"
+        );
+        assert!(
+            app.transcript.iter().any(|item| matches!(
+                item,
+                TranscriptItem::Message(ChatMessage { role: ChatRole::User, content, .. })
+                    if content == "fix the failing test"
+            )),
+            "the queued turn must actually be started (its user message appended)"
+        );
     }
 
     #[test]
@@ -13739,10 +16915,7 @@ mod tests {
 
     #[test]
     fn unknown_language_code_blocks_fall_back_to_plain_style() {
-        let lines = markdown_content_lines(
-            "```notalanguage\nsome text\n```",
-            ChatRole::Assistant,
-        );
+        let lines = markdown_content_lines("```notalanguage\nsome text\n```", ChatRole::Assistant);
         assert_eq!(lines.len(), 1);
         assert_eq!(lines[0].spans.len(), 2);
     }
@@ -13917,6 +17090,14 @@ mod tests {
     }
 
     fn queue_approval(app: &mut App, command: &str) -> mpsc::Receiver<ApprovalDecision> {
+        queue_approval_kind(app, command, false)
+    }
+
+    fn queue_approval_kind(
+        app: &mut App,
+        command: &str,
+        sandbox_escalation: bool,
+    ) -> mpsc::Receiver<ApprovalDecision> {
         let (respond, decision) = mpsc::channel();
         app.approval_queue.push_back(PendingApproval {
             request: ApprovalRequest {
@@ -13924,6 +17105,7 @@ mod tests {
                 command: Some(command.to_string()),
                 paths: Vec::new(),
                 background: false,
+                sandbox_escalation,
             },
             respond,
         });
@@ -13959,6 +17141,7 @@ mod tests {
                 command: Some("touch scary.txt".to_string()),
                 paths: Vec::new(),
                 background: false,
+                sandbox_escalation: false,
             }),
             Some(ApprovalDecision::Deny)
         );
@@ -13977,6 +17160,582 @@ mod tests {
         // The armed-quit state was reset: next Esc only arms.
         app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         assert!(!app.should_quit);
+    }
+
+    fn running_tool_row(name: &str) -> TranscriptItem {
+        TranscriptItem::Tool(ToolRun {
+            id: Some("call_running".to_string()),
+            started_at: Instant::now(),
+            pending_result: None,
+            name: name.to_string(),
+            summary: format!("$ {name}"),
+            state: ToolRunState::Running,
+            detail: String::new(),
+            expanded: false,
+            group_expanded: false,
+        })
+    }
+
+    /// App in the "worker streaming" state with an attached cancel token.
+    fn working_app() -> (App, mpsc::Sender<ModelStreamEvent>, CancelToken) {
+        let mut app = app();
+        let (sender, receiver) = mpsc::channel::<ModelStreamEvent>();
+        app.model_events = Some(receiver);
+        let token = CancelToken::new();
+        app.turn_cancel = Some(token.clone());
+        app.turn_started_at = Some(Instant::now());
+        (app, sender, token)
+    }
+
+    #[test]
+    fn escape_while_working_requests_cancel_instead_of_arming_quit() {
+        let (mut app, _sender, token) = working_app();
+
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+
+        assert!(!app.should_quit);
+        assert!(token.is_cancelled());
+        assert!(app.cancel_requested_at.is_some());
+        assert!(
+            app.status_line.contains("cancelling"),
+            "{}",
+            app.status_line
+        );
+        // Cancelling must not arm double-esc quit, and the receiver stays
+        // attached so the worker can still report Cancelled.
+        assert!(app.last_escape_at.is_none());
+        assert!(app.model_events.is_some());
+    }
+
+    #[test]
+    fn second_escape_force_abandons_the_turn() {
+        let (mut app, _sender, _token) = working_app();
+        app.transcript.push(running_tool_row("terminal.exec"));
+
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+
+        assert!(!app.should_quit);
+        assert!(app.model_events.is_none());
+        assert!(app.turn_cancel.is_none());
+        assert!(app.cancel_requested_at.is_none());
+        assert_eq!(app.status_line, "turn abandoned");
+        assert!(matches!(
+            &app.transcript[0],
+            TranscriptItem::Tool(run)
+                if run.state == ToolRunState::Failed && run.detail == "cancelled"
+        ));
+
+        // Idle again: the classic arm-then-quit gesture still works.
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(!app.should_quit);
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.should_quit);
+    }
+
+    #[test]
+    fn escape_clears_input_before_cancelling_a_working_turn() {
+        let (mut app, _sender, token) = working_app();
+        app.input = "half-typed follow-up".to_string();
+        app.input_cursor = app.input_len();
+
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.input.is_empty());
+        assert!(!token.is_cancelled());
+
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(token.is_cancelled());
+        assert!(!app.should_quit);
+    }
+
+    #[test]
+    fn request_cancel_denies_every_queued_approval() {
+        let (mut app, _sender, token) = working_app();
+        let first = queue_approval(&mut app, "cargo build");
+        let second = queue_approval(&mut app, "cargo test");
+
+        app.request_cancel_turn();
+
+        assert!(token.is_cancelled());
+        assert!(app.approval_queue.is_empty());
+        assert_eq!(first.try_recv().unwrap(), ApprovalDecision::Deny);
+        assert_eq!(second.try_recv().unwrap(), ApprovalDecision::Deny);
+    }
+
+    #[test]
+    fn approvals_arriving_after_cancel_are_denied_and_unblock_the_worker() {
+        let mut app = app();
+        app.cancel_requested_at = Some(Instant::now());
+
+        // A tool worker parked in the approval handler, its request racing
+        // the cancel: the drain must answer it with Deny, never queue it.
+        let handler = app.approval_handler.clone();
+        let worker = thread::spawn(move || {
+            handler(ApprovalRequest {
+                tool: ApprovalTool::TerminalExec,
+                command: Some("cargo build".to_string()),
+                paths: Vec::new(),
+                background: false,
+                sandbox_escalation: false,
+            })
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !app.drain_approval_requests() {
+            assert!(Instant::now() < deadline, "approval request never arrived");
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        assert!(app.approval_queue.is_empty());
+        assert_eq!(worker.join().unwrap(), ApprovalDecision::Deny);
+    }
+
+    #[test]
+    fn cancelled_event_finalizes_the_turn_and_preserves_partial_text() {
+        let (mut app, sender, _token) = working_app();
+        app.cancel_requested_at = Some(Instant::now());
+        app.transcript
+            .push(TranscriptItem::Message(ChatMessage::user("do the thing")));
+        app.transcript
+            .push(TranscriptItem::Message(ChatMessage::assistant(
+                "partial answer",
+            )));
+        app.streaming_message = Some(1);
+        app.transcript.push(running_tool_row("terminal.exec"));
+        app.queued_turns.push_back("queued task".to_string());
+
+        sender.send(ModelStreamEvent::Cancelled).unwrap();
+        app.drain_model_events();
+
+        assert!(app.model_events.is_none());
+        assert!(app.turn_cancel.is_none());
+        assert!(app.cancel_requested_at.is_none());
+        assert!(app.streaming_message.is_none());
+        // [21]: the acknowledged queued prompt is kept, not silently dropped.
+        assert_eq!(
+            app.queued_turns
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            vec!["queued task"],
+        );
+        assert_eq!(app.status_line, "turn interrupted");
+        assert!(matches!(
+            &app.transcript[2],
+            TranscriptItem::Tool(run)
+                if run.state == ToolRunState::Failed && run.detail == "cancelled"
+        ));
+        assert!(matches!(
+            app.transcript.last(),
+            Some(TranscriptItem::Message(message))
+                if message.role == ChatRole::System && message.content == TURN_INTERRUPTED_NOTE
+        ));
+
+        // Resumability: history keeps the partial assistant text, gains the
+        // interruption note, and the app is idle so a fresh turn (with a
+        // fresh token) can start.
+        let history = app.conversation_history();
+        assert!(
+            history
+                .iter()
+                .any(|message| message.role == "assistant" && message.content == "partial answer")
+        );
+        assert!(
+            history
+                .iter()
+                .any(|message| message.role == "system"
+                    && message.content == TURN_INTERRUPTED_NOTE)
+        );
+        assert!(!app.is_working());
+    }
+
+    #[test]
+    fn error_event_while_cancelling_renders_as_interruption_not_failure() {
+        let (mut app, sender, _token) = working_app();
+        app.cancel_requested_at = Some(Instant::now());
+
+        sender
+            .send(ModelStreamEvent::Error(
+                "failed to send stream event: receiving on a closed channel".to_string(),
+            ))
+            .unwrap();
+        app.drain_model_events();
+
+        assert!(
+            app.toast.is_none(),
+            "user-initiated stop must not toast an error"
+        );
+        assert_eq!(app.status_line, "turn interrupted");
+        assert!(app.cancel_requested_at.is_none());
+        assert!(matches!(
+            app.transcript.last(),
+            Some(TranscriptItem::Message(message))
+                if message.content == TURN_INTERRUPTED_NOTE
+        ));
+    }
+
+    /// [8]: Esc raced a natural finish — the worker's Done is already in the
+    /// channel when the user asks to stop. The stop intent must win: the turn
+    /// finalizes as an interruption, never as a clean completion.
+    #[test]
+    fn done_racing_esc_stops_the_turn_instead_of_finalizing_normally() {
+        let (mut app, sender, token) = working_app();
+        token.cancel();
+        app.cancel_requested_at = Some(Instant::now());
+
+        sender
+            .send(ModelStreamEvent::Done { event_count: 3 })
+            .unwrap();
+        app.drain_model_events();
+
+        assert!(app.turn_cancel.is_none());
+        assert!(app.cancel_requested_at.is_none());
+        assert!(!app.is_working());
+        assert_eq!(app.status_line, "turn interrupted");
+        assert!(
+            app.transcript.iter().any(|item| matches!(
+                item,
+                TranscriptItem::Message(message) if message.content == TURN_INTERRUPTED_NOTE
+            )),
+            "a stopped turn must leave the interruption note"
+        );
+    }
+
+    /// [8] + [21]: Esc racing the natural Done through the real key path must
+    /// stop the turn and NEVER launch a queued follow-up; the queued prompts
+    /// are kept for the user.
+    #[test]
+    fn esc_racing_done_stops_and_keeps_queued_turns() {
+        let (mut app, sender, _token) = working_app();
+        app.queued_turns.push_back("queued task one".to_string());
+        app.queued_turns.push_back("queued task two".to_string());
+
+        // Worker already finished: Done is sitting in the channel, but the
+        // UI has not drained it yet, so is_working() is still true.
+        sender
+            .send(ModelStreamEvent::Done { event_count: 3 })
+            .unwrap();
+        assert!(app.is_working());
+
+        // User presses Esc to stop everything (real key path).
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(app.status_line, "cancelling… esc again to force-stop");
+        assert!(app.cancel_requested_at.is_some());
+
+        // Next frame drains the channel and hits the Done event.
+        app.drain_model_events();
+
+        // [8]: the cancel intent wins — the turn stops.
+        assert!(app.cancel_requested_at.is_none());
+        assert_eq!(app.status_line, "turn interrupted");
+        // [8]: no queued turn was launched — its user message never entered
+        // the transcript.
+        assert!(
+            !app.transcript.iter().any(|item| matches!(
+                item,
+                TranscriptItem::Message(message)
+                    if message.role == ChatRole::User && message.content == "queued task one"
+            )),
+            "a cancel intent must never silently launch the next queued turn"
+        );
+        // [21]: both queued prompts are kept, in order, not discarded.
+        assert_eq!(
+            app.queued_turns
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            vec!["queued task one", "queued task two"],
+        );
+    }
+
+    /// [5]: Esc while a background workflow runs (no model turn streaming) must
+    /// cancel the workflow, never fall through to the double-esc quit arm that
+    /// would kill subagents mid file_edit/file_patch.
+    #[test]
+    fn escape_cancels_background_workflow_instead_of_quitting() {
+        let mut app = app();
+        let (_sender, receiver) = mpsc::channel::<WorkflowEvent>();
+        let workflow = background_workflow(&app, receiver);
+        let token = workflow.cancel.clone();
+        app.workflow_events.push(workflow);
+        let view = WorkflowRunView {
+            id: "workflow-test".to_string(),
+            title: "refactor auth".to_string(),
+            task: "refactor auth".to_string(),
+            status: WorkflowViewState::Running,
+            phases: Vec::new(),
+            summary: String::new(),
+            expanded: false,
+        };
+        app.workflows.push(view.clone());
+        app.transcript.push(TranscriptItem::Workflow(view));
+
+        // A background workflow makes is_working() false but keeps work active.
+        assert!(!app.is_working());
+        assert!(app.has_active_workflows());
+
+        // First Esc: cancel the workflow, mark its row, never arm quit.
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(!app.should_quit);
+        assert!(
+            token.is_cancelled(),
+            "workflow cancel token must be flipped"
+        );
+        assert!(
+            app.last_escape_at.is_none(),
+            "cancelling a workflow must not arm the double-esc quit"
+        );
+        assert_eq!(app.workflows[0].status, WorkflowViewState::Failed);
+
+        // Second Esc while the worker is still attached must still not quit.
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(
+            !app.should_quit,
+            "double-esc must never quit while a workflow is active"
+        );
+    }
+
+    /// [21]: cancelling a turn must keep the queued follow-up prompts (the UI
+    /// acknowledged each) and tell the user — never silently discard them.
+    #[test]
+    fn cancelling_a_turn_keeps_queued_prompts_and_tells_the_user() {
+        let (mut app, _sender, _token) = working_app();
+        app.queued_turns
+            .push_back("also update the changelog".to_string());
+
+        app.finalize_cancelled_turn("turn interrupted");
+
+        assert_eq!(
+            app.queued_turns
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            vec!["also update the changelog"],
+        );
+        assert!(
+            app.toast
+                .as_ref()
+                .is_some_and(|toast| toast.message.contains("kept")),
+            "user must be told the queued prompt was kept: {:?}",
+            app.toast.as_ref().map(|toast| &toast.message)
+        );
+    }
+
+    /// [21]: kept queued prompts run on an explicit empty submit while idle,
+    /// never a silent auto-launch.
+    #[test]
+    fn empty_submit_runs_kept_queued_prompt_when_idle() {
+        let mut app = app();
+        app.queued_turns
+            .push_back("run the kept prompt".to_string());
+
+        app.submit_input(); // empty composer
+
+        assert!(
+            app.queued_turns.is_empty(),
+            "empty submit must run the kept prompt"
+        );
+        assert!(
+            app.transcript.iter().any(|item| matches!(
+                item,
+                TranscriptItem::Message(ChatMessage { role: ChatRole::User, content, .. })
+                    if content == "run the kept prompt"
+            )),
+            "the kept prompt must be started"
+        );
+    }
+
+    #[test]
+    fn usage_events_accumulate_across_requests_within_a_turn() {
+        let (mut app, sender, _token) = working_app();
+
+        // A tool-looping turn makes one request per iteration; each reports
+        // its own usage and the TUI must count all of them.
+        sender
+            .send(ModelStreamEvent::Usage(TokenUsage {
+                input: 100,
+                output: 10,
+                cached: 40,
+            }))
+            .unwrap();
+        sender
+            .send(ModelStreamEvent::Usage(TokenUsage {
+                input: 250,
+                output: 30,
+                cached: 200,
+            }))
+            .unwrap();
+        sender
+            .send(ModelStreamEvent::Done { event_count: 5 })
+            .unwrap();
+        app.drain_model_events();
+
+        let expected = TokenUsage {
+            input: 350,
+            output: 40,
+            cached: 240,
+        };
+        assert_eq!(app.session_usage, expected);
+        assert_eq!(app.session_requests, 2);
+        assert_eq!(app.last_turn_usage, expected);
+        assert_eq!(app.last_turn_requests, 2);
+    }
+
+    #[test]
+    fn cancelled_turn_still_freezes_last_turn_usage() {
+        let (mut app, sender, _token) = working_app();
+
+        sender
+            .send(ModelStreamEvent::Usage(TokenUsage {
+                input: 10,
+                output: 2,
+                cached: 0,
+            }))
+            .unwrap();
+        sender.send(ModelStreamEvent::Cancelled).unwrap();
+        app.drain_model_events();
+
+        assert_eq!(app.last_turn_requests, 1);
+        assert_eq!(app.last_turn_usage.input, 10);
+        assert_eq!(app.session_requests, 1);
+    }
+
+    #[test]
+    fn token_counts_format_compactly() {
+        assert_eq!(format_token_count(0), "0 tok");
+        assert_eq!(format_token_count(812), "812 tok");
+        assert_eq!(format_token_count(1_234), "1.23k tok");
+        assert_eq!(format_token_count(60_000), "60.00k tok");
+        assert_eq!(format_token_count(2_050_000), "2.05M tok");
+    }
+
+    #[test]
+    fn context_report_categories_sum_to_total_estimate() {
+        let mut app = app();
+        app.transcript = vec![
+            TranscriptItem::Message(ChatMessage::user("write the missing tests")),
+            TranscriptItem::Reasoning(ReasoningTrace {
+                content: "inspecting the test module first".to_string(),
+                expanded: false,
+            }),
+            TranscriptItem::Plan(PlanView {
+                summary: "test plan".to_string(),
+                items: vec![PlanItemView {
+                    text: "add coverage".to_string(),
+                    status: PlanItemStatus::Pending,
+                    evidence: Vec::new(),
+                }],
+                expanded: false,
+            }),
+        ];
+        app.push_tool_start("file_read".to_string(), "src/main.rs".to_string());
+
+        let chars = transcript_char_usage(&app.transcript);
+        assert_eq!(chars.total(), app.context_usage_chars());
+        assert!(chars.messages > 0);
+        assert!(chars.tool_outputs > 0);
+        assert!(chars.reasoning > 0);
+        assert!(chars.plans > 0);
+
+        let report = app.build_context_report();
+        // Transcript categories reuse the same ~4 chars/token estimate.
+        assert_eq!(report.message_tokens, chars.messages.div_ceil(4));
+        assert_eq!(report.tool_tokens, chars.tool_outputs.div_ceil(4));
+        assert_eq!(report.reasoning_tokens, chars.reasoning.div_ceil(4));
+        assert_eq!(report.plan_tokens, chars.plans.div_ceil(4));
+        // The report's total is exactly the sum of its categories.
+        assert_eq!(
+            report.total_tokens(),
+            report.instructions_tokens
+                + report.system_tokens
+                + report.message_tokens
+                + report.tool_tokens
+                + report.reasoning_tokens
+                + report.plan_tokens
+        );
+        assert!(
+            report.instructions_tokens > 0,
+            "system prompt estimate missing"
+        );
+        assert!(report.system_tokens > 0, "session header estimate missing");
+        assert!(report.budget >= 1_000);
+        assert!(report.summary_covers.is_none());
+        assert_eq!(report.summary_tokens, 0);
+    }
+
+    #[test]
+    fn cost_and_context_commands_open_modals() {
+        let mut app = app();
+
+        assert!(app.run_local_tool_command("/cost"));
+        assert_eq!(app.active_modal, Some(Modal::Cost));
+
+        app.active_modal = None;
+        assert!(app.run_local_tool_command("/context"));
+        assert_eq!(app.active_modal, Some(Modal::Context));
+        assert!(app.context_report.is_some());
+    }
+
+    #[test]
+    fn compact_refuses_while_a_turn_is_streaming() {
+        let (mut app, _sender, _token) = working_app();
+
+        assert!(app.run_local_tool_command("/compact"));
+
+        assert!(app.compact_events.is_none(), "no compact worker may start");
+        assert!(matches!(
+            app.toast,
+            Some(Toast {
+                kind: ToastKind::Warning,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn compact_result_lands_as_success_toast_with_before_and_after() {
+        let mut app = app();
+        let (sender, receiver) = mpsc::channel();
+        app.compact_events = Some(receiver);
+        sender
+            .send(Ok(ManualCompaction {
+                before_tokens: 12_000,
+                after_tokens: 3_000,
+                folded_messages: 14,
+            }))
+            .unwrap();
+
+        assert!(app.drain_compact_events());
+
+        assert!(app.compact_events.is_none());
+        let toast = app.toast.clone().expect("compact toast");
+        assert_eq!(toast.kind, ToastKind::Success);
+        assert!(toast.message.contains("12.00k tok"), "{}", toast.message);
+        assert!(toast.message.contains("3.00k tok"), "{}", toast.message);
+        assert!(
+            toast.message.contains("14 messages folded"),
+            "{}",
+            toast.message
+        );
+    }
+
+    #[test]
+    fn compact_failure_lands_as_error_toast() {
+        let mut app = app();
+        let (sender, receiver) = mpsc::channel();
+        app.compact_events = Some(receiver);
+        sender.send(Err("backend offline".to_string())).unwrap();
+
+        assert!(app.drain_compact_events());
+
+        assert!(app.compact_events.is_none());
+        let toast = app.toast.clone().expect("compact toast");
+        assert_eq!(toast.kind, ToastKind::Error);
+        assert!(
+            toast.message.contains("backend offline"),
+            "{}",
+            toast.message
+        );
     }
 
     #[test]
@@ -14020,6 +17779,7 @@ mod tests {
                 command: Some("cargo build".to_string()),
                 paths: Vec::new(),
                 background: false,
+                sandbox_escalation: false,
             },
             respond,
         });
@@ -14050,6 +17810,65 @@ mod tests {
     }
 
     #[test]
+    fn sandbox_escalations_never_settle_against_stored_grants() {
+        let mut app = app();
+        app.session_terminal_grants.push("cargo build".to_string());
+
+        // The very same command settles from the grant when sandboxed...
+        assert_eq!(
+            app.auto_approval_decision(&ApprovalRequest {
+                tool: ApprovalTool::TerminalExec,
+                command: Some("cargo build".to_string()),
+                paths: Vec::new(),
+                background: false,
+                sandbox_escalation: false,
+            }),
+            Some(ApprovalDecision::AllowOnce)
+        );
+        // ...but an escalation of it must always reach a human.
+        assert_eq!(
+            app.auto_approval_decision(&ApprovalRequest {
+                tool: ApprovalTool::TerminalExec,
+                command: Some("cargo build".to_string()),
+                paths: Vec::new(),
+                background: false,
+                sandbox_escalation: true,
+            }),
+            None
+        );
+    }
+
+    #[test]
+    fn always_allow_key_cannot_decide_a_sandbox_escalation() {
+        let mut app = app();
+        let decision = queue_approval_kind(&mut app, "cargo build", true);
+
+        // 'a' is not offered on escalation cards and must be inert.
+        app.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
+        assert!(decision.try_recv().is_err());
+        assert_eq!(app.approval_queue.len(), 1);
+        assert!(app.session_terminal_grants.is_empty());
+
+        // Allow-once still resolves it without recording any grant.
+        app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+        assert_eq!(decision.try_recv().unwrap(), ApprovalDecision::AllowOnce);
+        assert!(app.session_terminal_grants.is_empty());
+    }
+
+    #[test]
+    fn escalation_always_allow_decision_downgrades_to_allow_once() {
+        let mut app = app();
+        let decision = queue_approval_kind(&mut app, "cargo build", true);
+
+        // Even if an AlwaysAllow decision reaches an escalation through some
+        // other path, nothing may be persisted.
+        app.resolve_pending_approval(ApprovalDecision::AlwaysAllow);
+
+        assert_eq!(decision.try_recv().unwrap(), ApprovalDecision::AllowOnce);
+        assert!(app.session_terminal_grants.is_empty());
+    }
+
+    #[test]
     fn env_prefixed_commands_settle_against_grants() {
         let mut app = app();
         app.session_terminal_grants.push("cargo build".to_string());
@@ -14060,6 +17879,7 @@ mod tests {
                 command: Some("FOO=bar cargo build --release".to_string()),
                 paths: Vec::new(),
                 background: false,
+                sandbox_escalation: false,
             }),
             Some(ApprovalDecision::AllowOnce)
         );
@@ -14077,6 +17897,7 @@ mod tests {
                 command: None,
                 paths: vec![p.to_string()],
                 background: false,
+                sandbox_escalation: false,
             }) == Some(ApprovalDecision::AllowOnce)
         };
 
@@ -14096,6 +17917,7 @@ mod tests {
                 command: None,
                 paths: vec!["src/secret.rs".to_string()],
                 background: false,
+                sandbox_escalation: false,
             },
             respond,
         });
@@ -14109,6 +17931,7 @@ mod tests {
                 command: None,
                 paths: vec!["src/secret.rs".to_string()],
                 background: false,
+                sandbox_escalation: false,
             }),
             Some(ApprovalDecision::Deny)
         );
@@ -14245,7 +18068,10 @@ mod tests {
         assert!(strip.iter().any(|line| line.contains("✓ 4 done")));
         assert!(strip.iter().any(|line| line.contains("step 5")));
         assert!(!strip.iter().any(|line| line.contains("step 1 ")));
-        assert!(strip.last().unwrap().contains("… "), "tail folds: {strip:?}");
+        assert!(
+            strip.last().unwrap().contains("… "),
+            "tail folds: {strip:?}"
+        );
     }
 
     #[test]
@@ -14439,13 +18265,24 @@ mod tests {
         };
 
         let mut first = Vec::new();
-        append_tool_call_lines(&mut first, &run, false, RenderContext { animation_tick: 0, ..Default::default() });
+        append_tool_call_lines(
+            &mut first,
+            &run,
+            false,
+            RenderContext {
+                animation_tick: 0,
+                ..Default::default()
+            },
+        );
         let mut second = Vec::new();
         append_tool_call_lines(
             &mut second,
             &run,
             false,
-            RenderContext { animation_tick: 12, ..Default::default() },
+            RenderContext {
+                animation_tick: 12,
+                ..Default::default()
+            },
         );
 
         let first_text = first.iter().map(line_text).collect::<Vec<_>>();
@@ -14667,12 +18504,17 @@ mod tests {
         let lines = visible_transcript_lines(&transcript, None, None);
         let text = lines.iter().map(line_text).collect::<Vec<_>>();
 
-        assert!(text.iter().any(|line| {
-            line.contains("read src/main.rs, src/tools.rs, src/wire.rs +1 more")
-        }));
+        assert!(
+            text.iter().any(|line| {
+                line.contains("read src/main.rs, src/tools.rs, src/wire.rs +1 more")
+            })
+        );
         assert!(text.iter().any(|line| line.contains("⎿ 4 calls")));
         // The lone terminal call renders as a normal block.
-        assert!(text.iter().any(|line| line.contains("terminal $ cargo check")));
+        assert!(
+            text.iter()
+                .any(|line| line.contains("terminal $ cargo check"))
+        );
         assert!(!text.iter().any(|line| line.contains("read src/tools.rs\n")));
     }
 
@@ -14721,10 +18563,7 @@ mod tests {
             "edited src/a.rs (1 replacement)\n- fn old() {}\n+ fn new() {}\n  shared".to_string();
         let mut second = finished_tool("file.edit", "edit src/b.rs", ToolRunState::Succeeded);
         second.detail = "edited src/b.rs (1 replacement)\n- x\n+ y".to_string();
-        let transcript = vec![
-            TranscriptItem::Tool(first),
-            TranscriptItem::Tool(second),
-        ];
+        let transcript = vec![TranscriptItem::Tool(first), TranscriptItem::Tool(second)];
 
         let lines = visible_transcript_lines(&transcript, None, None);
         let text = lines.iter().map(line_text).collect::<Vec<_>>();
@@ -14984,5 +18823,322 @@ mod tests {
         let text = lines.iter().map(line_text).collect::<Vec<_>>();
         assert!(text.iter().any(|line| line.contains("⎿ 29 passed")));
         assert!(text.iter().any(|line| line.contains("2 ignored")));
+    }
+
+    fn type_chars(app: &mut App, text: &str) {
+        for ch in text.chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+        }
+    }
+
+    #[test]
+    fn collect_workspace_files_skips_junk_dirs_and_respects_cap() {
+        let workspace = temp_workspace();
+        fs::create_dir_all(workspace.join("src")).unwrap();
+        fs::create_dir_all(workspace.join(".git")).unwrap();
+        fs::create_dir_all(workspace.join("target/debug")).unwrap();
+        fs::create_dir_all(workspace.join("node_modules/pkg")).unwrap();
+        fs::write(workspace.join("README.md"), "x").unwrap();
+        fs::write(workspace.join("src/main.rs"), "x").unwrap();
+        fs::write(workspace.join(".git/config"), "x").unwrap();
+        fs::write(workspace.join("target/debug/junk"), "x").unwrap();
+        fs::write(workspace.join("node_modules/pkg/index.js"), "x").unwrap();
+
+        let files = collect_workspace_files(&workspace, MENTION_FILE_WALK_CAP);
+        assert_eq!(
+            files,
+            vec!["README.md".to_string(), "src/main.rs".to_string()]
+        );
+
+        for index in 0..10 {
+            fs::write(workspace.join(format!("file{index}.txt")), "x").unwrap();
+        }
+        assert_eq!(collect_workspace_files(&workspace, 3).len(), 3);
+    }
+
+    #[test]
+    fn mention_match_prefers_file_name_then_segment_then_substring() {
+        let (name_score, positions) =
+            mention_match("crates/medusa-tui/src/main.rs", "main").unwrap();
+        assert_eq!(name_score, 0);
+        assert_eq!(positions, (22..26).collect::<Vec<_>>());
+
+        let (segment_score, _) = mention_match("crates/medusa-tui/src/main.rs", "medusa").unwrap();
+        assert_eq!(segment_score, 1);
+
+        let (substring_score, _) = mention_match("docs/comments.md", "men").unwrap();
+        assert_eq!(substring_score, 2);
+
+        let (subsequence_score, _) = mention_match("src/handlers.rs", "hdl").unwrap();
+        assert_eq!(subsequence_score, 3);
+
+        assert!(mention_match("src/lib.rs", "zzz").is_none());
+    }
+
+    #[test]
+    fn typing_at_token_opens_mention_picker_and_enter_inserts_path() {
+        let (mut app, workspace) = app_in_workspace();
+        fs::create_dir_all(workspace.join("src")).unwrap();
+        fs::write(workspace.join("src/lib.rs"), "x").unwrap();
+        fs::write(workspace.join("README.md"), "x").unwrap();
+
+        type_chars(&mut app, "look at @li");
+        assert!(app.mention_popup_visible());
+        let matches = app.mention_matches();
+        assert_eq!(matches[0].0, "src/lib.rs");
+
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.input, "look at src/lib.rs ");
+        assert_eq!(app.input_cursor, app.input_len());
+        assert!(!app.mention_popup_visible());
+        // The transcript got no user message: Enter completed, not submitted.
+        assert!(app.transcript.is_empty());
+    }
+
+    #[test]
+    fn tab_completes_mention_and_up_down_navigate() {
+        let mut app = app();
+        // Pre-seeding the candidate list keeps the walk out of this test:
+        // refresh_mention_state only loads files when none are cached.
+        app.mention_files = Some(vec![
+            "src/alpha.rs".to_string(),
+            "src/alpine.rs".to_string(),
+        ]);
+        type_chars(&mut app, "@alp");
+        assert!(app.mention_popup_visible());
+        assert_eq!(app.mention_selection, 0);
+
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(app.mention_selection, 1);
+        app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(app.mention_selection, 0);
+
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(app.input, "src/alpha.rs ");
+    }
+
+    #[test]
+    fn escape_dismisses_mention_picker_without_clearing_input() {
+        let (mut app, workspace) = app_in_workspace();
+        fs::write(workspace.join("notes.txt"), "x").unwrap();
+
+        type_chars(&mut app, "@not");
+        assert!(app.mention_popup_visible());
+
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(!app.mention_popup_visible());
+        assert_eq!(app.input, "@not");
+
+        // Typing again reopens the picker.
+        type_chars(&mut app, "e");
+        assert!(app.mention_popup_visible());
+    }
+
+    #[test]
+    fn mention_picker_defers_to_slash_suggestions() {
+        let mut app = app();
+        app.mention_files = Some(vec!["help.md".to_string()]);
+        type_chars(&mut app, "/he");
+        assert!(app.slash_suggestions_active());
+        assert!(!app.mention_popup_visible());
+        assert!(app.mention_matches().is_empty());
+    }
+
+    #[test]
+    fn mention_picker_wins_over_decision_until_dismissed() {
+        let (mut app, workspace) = app_in_workspace();
+        fs::write(workspace.join("plan.md"), "x").unwrap();
+        app.apply_decision_request_output(
+            r#"{"title":"pick","reason":"","questions":[{"id":"q1","prompt":"which?","kind":"text"}]}"#,
+        )
+        .unwrap();
+        assert!(app.pending_decision().is_some());
+
+        type_chars(&mut app, "@pla");
+        assert!(app.mention_popup_visible());
+
+        // Enter completes the mention, not the decision answer.
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.input, "plan.md ");
+        assert!(app.pending_decision().is_some());
+
+        // With the picker gone, Enter answers the decision with the text.
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.pending_decision().is_none());
+    }
+
+    #[test]
+    fn mention_picker_leaves_multiline_navigation_alone() {
+        let (mut app, workspace) = app_in_workspace();
+        fs::write(workspace.join("data.csv"), "x").unwrap();
+
+        app.input = "first\nsecond".to_string();
+        app.input_cursor = app.input_len();
+        assert!(!app.mention_popup_visible());
+        app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(app.input_cursor, 5); // moved to line 1, column 5
+
+        // With an active mention token, Up drives the picker instead.
+        app.input_cursor = app.input_len();
+        type_chars(&mut app, " @dat");
+        assert!(app.mention_popup_visible());
+        let cursor_before = app.input_cursor;
+        app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(app.input_cursor, cursor_before);
+    }
+
+    #[test]
+    fn quick_memory_content_creates_file_section_and_appends() {
+        let created = quick_memory_content("", "use rg not grep");
+        assert_eq!(
+            created,
+            "# Project notes\n\n## Notes\n\n- use rg not grep\n"
+        );
+
+        let appended = quick_memory_content(&created, "tests live in-module");
+        assert_eq!(
+            appended,
+            "# Project notes\n\n## Notes\n\n- use rg not grep\n- tests live in-module\n"
+        );
+
+        let with_following_section =
+            "# Repo\n\n## Notes\n\n- old note\n\n## Commands\n\ncargo test\n";
+        let inserted = quick_memory_content(with_following_section, "new note");
+        assert_eq!(
+            inserted,
+            "# Repo\n\n## Notes\n\n- old note\n- new note\n\n## Commands\n\ncargo test\n"
+        );
+
+        let no_section = "# Repo\n\nSome intro.\n";
+        let grown = quick_memory_content(no_section, "first note");
+        assert_eq!(grown, "# Repo\n\nSome intro.\n\n## Notes\n\n- first note\n");
+    }
+
+    /// [22]: a multi-line quick-memory note containing a markdown heading must
+    /// not forge a new AGENTS.md section or scramble later insertions.
+    #[test]
+    fn quick_memory_neutralizes_multiline_heading_notes() {
+        let existing = "# Repo\n\n## Notes\n\n- old note\n";
+        let note = "deploy steps\n## Deploy\nrun make ship";
+        let content = quick_memory_content(existing, note);
+
+        // No line inside the file is a forged heading carrying the pasted text.
+        assert!(
+            !content
+                .lines()
+                .any(|line| line.trim_start().starts_with('#') && line.contains("Deploy")),
+            "pasted heading forged a section:\n{content}"
+        );
+        // The note collapsed to a single bullet under Notes.
+        assert!(
+            content.contains("- deploy steps ## Deploy run make ship"),
+            "note not collapsed to one bullet:\n{content}"
+        );
+
+        // A later note still lands under the same Notes section, in order, and
+        // no rogue standalone "## Deploy" heading exists to break the scan.
+        let next = quick_memory_content(&content, "second note");
+        let notes_at = next.find("## Notes").unwrap();
+        let old_at = next.find("- old note").unwrap();
+        let first_at = next.find("- deploy steps").unwrap();
+        let second_at = next.find("- second note").unwrap();
+        assert!(
+            notes_at < old_at && old_at < first_at && first_at < second_at,
+            "later note escaped the Notes section:\n{next}"
+        );
+        assert!(
+            !next.lines().any(|line| line.trim() == "## Deploy"),
+            "a standalone Deploy heading was forged:\n{next}"
+        );
+    }
+
+    /// [22]: a note that *starts* with a heading marker has it neutralized so
+    /// the bullet can never itself read as a heading.
+    #[test]
+    fn quick_memory_strips_leading_heading_marker() {
+        let content = quick_memory_content("", "## Deploy\nrun make ship");
+        assert!(
+            content.contains("- Deploy run make ship"),
+            "leading heading marker not neutralized:\n{content}"
+        );
+        assert!(
+            !content.lines().any(|line| line.trim() == "## Deploy"),
+            "leading heading marker forged a section:\n{content}"
+        );
+    }
+
+    #[test]
+    fn hash_note_writes_agents_md_without_sending_a_turn() {
+        let (mut app, workspace) = app_in_workspace();
+        app.input = "# always run clippy before finishing".to_string();
+        app.input_cursor = app.input_len();
+
+        app.submit_input();
+
+        let content = fs::read_to_string(workspace.join("AGENTS.md")).unwrap();
+        assert!(content.contains("## Notes"));
+        assert!(content.contains("- always run clippy before finishing"));
+
+        // Nothing went to the model: no user message, no worker channel.
+        assert!(app.model_events.is_none());
+        assert!(!app.transcript.iter().any(|item| matches!(
+            item,
+            TranscriptItem::Message(ChatMessage {
+                role: ChatRole::User,
+                ..
+            })
+        )));
+
+        // Muted system line explains when the note takes effect.
+        let Some(TranscriptItem::Message(message)) = app.transcript.last() else {
+            panic!("expected transcript line");
+        };
+        assert_eq!(message.role, ChatRole::System);
+        assert!(message.content.contains("applies from next turn"));
+
+        assert_eq!(app.input, "");
+        let toast = app.toast.as_ref().expect("toast");
+        assert_eq!(toast.message, "noted in AGENTS.md");
+        assert_eq!(toast.kind, ToastKind::Success);
+
+        // The per-turn project-instructions loader picks the note up, which
+        // is what carries it to the model next turn.
+        let context = medusa_core::project::project_instructions_context(&workspace).unwrap();
+        assert!(context.contains("always run clippy before finishing"));
+
+        // A second note appends instead of duplicating the section.
+        app.input = "# prefer eyre::Result".to_string();
+        app.input_cursor = app.input_len();
+        app.submit_input();
+        let content = fs::read_to_string(workspace.join("AGENTS.md")).unwrap();
+        assert_eq!(content.matches("## Notes").count(), 1);
+        assert!(content.contains("- prefer eyre::Result"));
+    }
+
+    #[test]
+    fn bell_gating_requires_enabled_and_long_turn() {
+        assert!(!should_ring_bell(true, None));
+        assert!(!should_ring_bell(true, Some(Duration::from_secs(3))));
+        assert!(!should_ring_bell(false, Some(Duration::from_secs(30))));
+        assert!(should_ring_bell(true, Some(Duration::from_secs(11))));
+    }
+
+    #[test]
+    fn bell_env_override_beats_setting() {
+        assert!(bell_enabled(true, None));
+        assert!(!bell_enabled(false, None));
+        assert!(!bell_enabled(true, Some("off")));
+        assert!(!bell_enabled(true, Some("OFF")));
+        assert!(!bell_enabled(true, Some("0")));
+        assert!(bell_enabled(false, Some("on")));
+        assert!(bell_enabled(true, Some("unrecognized")));
+    }
+
+    #[test]
+    fn bell_preference_round_trips_through_settings() {
+        let workspace = temp_workspace();
+        save_bell_preference(&workspace, false).unwrap();
+        let settings = load_app_settings(&workspace).unwrap();
+        assert_eq!(settings.bell, Some(false));
     }
 }

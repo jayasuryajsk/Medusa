@@ -18,7 +18,13 @@ use crate::tools::{
 pub(crate) fn tool_call_is_read_only(name: &str) -> bool {
     matches!(
         name,
-        "file_read" | "file_search" | "file_glob" | "fs_list" | "explore_batch"
+        "file_read"
+            | "file_search"
+            | "file_glob"
+            | "fs_list"
+            | "explore_batch"
+            | "web_fetch"
+            | "web_search"
     )
 }
 
@@ -255,6 +261,15 @@ pub(crate) fn execute_tool_call(
         }
     };
 
+    // MCP tools are resolved through the registry's full-name map, never by
+    // parsing the namespaced string. They may have side effects, so they run
+    // as serial barriers (deliberately absent from tool_call_is_read_only)
+    // and are unavailable to read-only turns unless the user marked the
+    // server "readOnly": true.
+    if let Some((server, tool)) = tools.mcp_lookup(&call.name) {
+        return execute_mcp_tool(tools, &call.name, &server, &tool, &args, tool_policy);
+    }
+
     match call.name.as_str() {
         "file_read" => execute_file_read(tools, &args),
         "file_search" => execute_file_search(tools, &args),
@@ -268,9 +283,50 @@ pub(crate) fn execute_tool_call(
         "plan_update" => execute_plan_update(tools, &args),
         "decision_request" => execute_decision_request(tools, &args),
         "question" => execute_question(tools, &args),
+        "web_fetch" => execute_web_fetch(tools, &args),
+        "web_search" => execute_web_search(tools, &args),
         other => ToolExecution {
             failed: true,
             output: format!("error: unknown Medusa tool: {other}"),
+        },
+    }
+}
+
+fn execute_mcp_tool(
+    tools: &ToolRuntime,
+    namespaced: &str,
+    server: &str,
+    tool: &str,
+    args: &Value,
+    tool_policy: ToolLoopPolicy,
+) -> ToolExecution {
+    let read_only_server = tools
+        .mcp()
+        .is_some_and(|registry| registry.server_marked_read_only(server));
+    if !tool_policy.allow_mutation() && !read_only_server {
+        return ToolExecution {
+            failed: true,
+            output: format!(
+                "error: {namespaced} is unavailable here: MCP tools may have side effects and are disabled for read-only turns (mark the server \"readOnly\": true in .medusa/mcp.json if it is safe)"
+            ),
+        };
+    }
+
+    match tools.mcp_call(namespaced, args) {
+        Ok(outcome) if outcome.is_error => ToolExecution {
+            failed: true,
+            output: format!(
+                "error: MCP tool {server}:{tool} reported an error:\n{}",
+                outcome.text
+            ),
+        },
+        Ok(outcome) => ToolExecution {
+            failed: false,
+            output: outcome.text,
+        },
+        Err(error) => ToolExecution {
+            failed: true,
+            output: format!("error: {error}"),
         },
     }
 }
@@ -503,6 +559,7 @@ fn execute_terminal_exec(tools: &ToolRuntime, args: &Value) -> ToolExecution {
         command: command.to_string(),
         cwd: optional_path(args, "cwd"),
         background: bool_arg(args, "background", "background").unwrap_or(false),
+        unsandboxed: args.get("sandbox").and_then(Value::as_bool) == Some(false),
     };
 
     match tools.terminal_exec(request) {
@@ -517,7 +574,26 @@ fn execute_terminal_exec(tools: &ToolRuntime, args: &Value) -> ToolExecution {
                     ),
                 };
             }
+            let failed = result.code != Some(0);
             let mut output = format!("exit: {}\n", result.code.unwrap_or(-1));
+            // Harness notes live between the exit line and the stdout marker
+            // so the stdout/stderr sections stay pure command output.
+            if result.sandboxed && failed {
+                output.push_str(
+                    "sandbox: ran under macOS Seatbelt (writes confined to workspace/temp; network denied unless enabled)\n",
+                );
+                if crate::sandbox::looks_sandbox_denied(&result.stderr, result.code) {
+                    output.push_str(
+                        "hint: if the sandbox caused this failure, retry with \"sandbox\": false and explain why; the user must approve every unsandboxed run\n",
+                    );
+                }
+            }
+            if !result.sandboxed
+                && tools.sandbox_policy().should_sandbox()
+                && let Some(notice) = crate::sandbox::take_unavailability_notice()
+            {
+                output.push_str(&format!("note: {notice}\n"));
+            }
             if result.stdout.is_empty() {
                 output.push_str("stdout: <empty>\n");
             } else {
@@ -534,10 +610,7 @@ fn execute_terminal_exec(tools: &ToolRuntime, args: &Value) -> ToolExecution {
                     output.push('\n');
                 }
             }
-            ToolExecution {
-                failed: result.code != Some(0),
-                output,
-            }
+            ToolExecution { failed, output }
         }
         Err(error) => ToolExecution {
             failed: true,
@@ -763,6 +836,58 @@ fn execute_question(tools: &ToolRuntime, args: &Value) -> ToolExecution {
         Ok(result) => ToolExecution {
             failed: false,
             output: format!("question for user: {}", result.question),
+        },
+        Err(error) => ToolExecution {
+            failed: true,
+            output: format!("error: {error}"),
+        },
+    }
+}
+
+fn execute_web_fetch(tools: &ToolRuntime, args: &Value) -> ToolExecution {
+    let Some(url) = args.get("url").and_then(Value::as_str) else {
+        return ToolExecution {
+            failed: true,
+            output: "error: web_fetch.url is required".to_string(),
+        };
+    };
+
+    let request = crate::web::WebFetchRequest {
+        url: url.to_string(),
+        max_chars: optional_usize(args, "max_chars"),
+    };
+
+    // Routed through the runtime so outbound egress passes the permission gate
+    // (auto-allowed in Open, approval-gated in Guarded/Ask/Readonly).
+    match tools.web_fetch(request) {
+        Ok(output) => ToolExecution {
+            failed: false,
+            output,
+        },
+        Err(error) => ToolExecution {
+            failed: true,
+            output: format!("error: {error}"),
+        },
+    }
+}
+
+fn execute_web_search(tools: &ToolRuntime, args: &Value) -> ToolExecution {
+    let Some(query) = args.get("query").and_then(Value::as_str) else {
+        return ToolExecution {
+            failed: true,
+            output: "error: web_search.query is required".to_string(),
+        };
+    };
+
+    let request = crate::web::WebSearchRequest {
+        query: query.to_string(),
+        count: optional_usize(args, "count"),
+    };
+
+    match tools.web_search(request) {
+        Ok(output) => ToolExecution {
+            failed: false,
+            output,
         },
         Err(error) => ToolExecution {
             failed: true,
@@ -1012,11 +1137,19 @@ pub(crate) fn summarize_tool_call(call: &ToolCall) -> String {
                 .map_or(0, Vec::len);
             format!("explore {goal} · {count} probes")
         }
-        "terminal_exec" => args
-            .get("command")
-            .and_then(Value::as_str)
-            .map(|command| format!("$ {command}"))
-            .unwrap_or_else(|| "run command".to_string()),
+        "terminal_exec" => {
+            let unsandboxed = args.get("sandbox").and_then(Value::as_bool) == Some(false);
+            args.get("command")
+                .and_then(Value::as_str)
+                .map(|command| {
+                    if unsandboxed {
+                        format!("$ {command} · unsandboxed")
+                    } else {
+                        format!("$ {command}")
+                    }
+                })
+                .unwrap_or_else(|| "run command".to_string())
+        }
         "workflow_run" => args
             .get("goal")
             .and_then(Value::as_str)
@@ -1084,6 +1217,26 @@ pub(crate) fn summarize_tool_call(call: &ToolCall) -> String {
             .and_then(Value::as_str)
             .map(ToString::to_string)
             .unwrap_or_else(|| "ask user".to_string()),
+        "web_fetch" => args
+            .get("url")
+            .and_then(Value::as_str)
+            .map(|url| format!("fetch {}", compact(url, 120)))
+            .unwrap_or_else(|| "fetch url".to_string()),
+        "web_search" => args
+            .get("query")
+            .and_then(Value::as_str)
+            .map(|query| format!("web {query:?}"))
+            .unwrap_or_else(|| "search the web".to_string()),
+        // Namespaced MCP tools (dynamic names; prefix check is display-only —
+        // dispatch resolves through the registry map).
+        other if other.starts_with("mcp_") => {
+            let preview = compact(call.arguments.trim(), 100);
+            if preview.is_empty() || preview == "{}" {
+                other.to_string()
+            } else {
+                format!("{other} {preview}")
+            }
+        }
         other => other.to_string(),
     }
 }
@@ -1120,9 +1273,8 @@ pub(crate) fn compact_tool_context_output(call: &ToolCall, execution: &ToolExecu
     }
 
     match call.name.as_str() {
-        "file_read" | "file_search" | "file_glob" | "fs_list" | "explore_batch" => {
-            compact(&execution.output, 20_000)
-        }
+        "file_read" | "file_search" | "file_glob" | "fs_list" | "explore_batch" | "web_fetch"
+        | "web_search" => compact(&execution.output, 20_000),
         "terminal_exec" => compact_terminal_context_output(&execution.output, 6000),
         "workflow_run" => compact(&execution.output, 8000),
         // Short confirmations only: the model already produced the edit content,
@@ -1150,6 +1302,9 @@ pub(crate) fn compact_tool_context_output(call: &ToolCall, execution: &ToolExecu
         "plan_update" => execution.output.clone(),
         "decision_request" => execution.output.clone(),
         "question" => execution.output.clone(),
+        // MCP results can be large documents; cap harder than generic tools
+        // but keep enough for the model to actually use them.
+        name if name.starts_with("mcp_") => compact(&execution.output, 8000),
         _ => compact(&execution.output, 4000),
     }
 }
@@ -1165,6 +1320,8 @@ pub(crate) fn summarize_tool_result(call: &ToolCall, execution: &ToolExecution) 
         "file_glob" => summarize_file_glob_output(&execution.output),
         "fs_list" => summarize_fs_list_output(&execution.output),
         "explore_batch" => summarize_explore_batch_output(&execution.output),
+        "web_fetch" => summarize_web_fetch_output(&execution.output),
+        "web_search" => summarize_web_search_output(&execution.output),
         "terminal_exec" => summarize_terminal_output(&execution.output),
         "file_edit" => {
             let (base, verify) = split_verify_section(&execution.output);
@@ -1270,10 +1427,7 @@ fn file_edit_display_diff(call: &ToolCall) -> Option<String> {
                 similar::ChangeTag::Delete => '-',
                 similar::ChangeTag::Equal => ' ',
             };
-            lines.push(format!(
-                "{sign} {}",
-                change.value().trim_end_matches('\n')
-            ));
+            lines.push(format!("{sign} {}", change.value().trim_end_matches('\n')));
         }
     }
     if lines.is_empty() {
@@ -1387,6 +1541,38 @@ fn summarize_explore_batch_output(output: &str) -> String {
     format!("evidence • {}", compact(probes, 180))
 }
 
+fn summarize_web_fetch_output(output: &str) -> String {
+    let url = output
+        .lines()
+        .find_map(|line| line.strip_prefix("url: "))
+        .unwrap_or("");
+    let status = output
+        .lines()
+        .find_map(|line| line.strip_prefix("status: "))
+        .unwrap_or("fetched");
+    if url.is_empty() {
+        format!("fetched • {status}")
+    } else {
+        format!("{status} • {}", compact(url, 160))
+    }
+}
+
+fn summarize_web_search_output(output: &str) -> String {
+    let query = output
+        .lines()
+        .find_map(|line| line.strip_prefix("query: "))
+        .unwrap_or("");
+    let results = output
+        .lines()
+        .find_map(|line| line.strip_prefix("results: "))
+        .unwrap_or("0");
+    if query.is_empty() {
+        format!("results {results}")
+    } else {
+        format!("results {results} • {}", compact(query, 120))
+    }
+}
+
 fn summarize_terminal_output(output: &str) -> String {
     let exit = output
         .lines()
@@ -1403,9 +1589,13 @@ fn summarize_terminal_output(output: &str) -> String {
         &stderr
     };
 
-    let preview = summarize_command_text(&strip_ansi(combined))
-        .unwrap_or_else(|| "no output".to_string());
+    let preview =
+        summarize_command_text(&strip_ansi(combined)).unwrap_or_else(|| "no output".to_string());
     let mut result = format!("{exit} • {}", compact(&preview, 240));
+    for note in terminal_header_notes(output) {
+        result.push('\n');
+        result.push_str(note);
+    }
 
     // Tail of the raw output for the transcript's expanded view. ANSI codes
     // stay intact here — the UI renders them as colors; the model context
@@ -1418,6 +1608,21 @@ fn summarize_terminal_output(output: &str) -> String {
         }
     }
     result
+}
+
+/// Harness-generated note lines (`sandbox:`, `hint:`, `note:`) that
+/// execute_terminal_exec places between the exit line and the stdout marker.
+/// They must survive both the transcript summary and the model-context
+/// compaction, which otherwise only keep the stdout/stderr sections.
+fn terminal_header_notes(output: &str) -> Vec<&str> {
+    output
+        .lines()
+        .skip(1)
+        .take_while(|line| !line.starts_with("stdout:"))
+        .filter(|line| {
+            line.starts_with("sandbox:") || line.starts_with("hint:") || line.starts_with("note:")
+        })
+        .collect()
 }
 
 /// The last `limit` non-empty output lines, preserving indentation.
@@ -1456,6 +1661,10 @@ fn compact_terminal_context_output(output: &str, max_chars: usize) -> String {
 
     let mut result = String::new();
     result.push_str(exit);
+    for note in terminal_header_notes(output) {
+        result.push('\n');
+        result.push_str(note);
+    }
     if let Some(summary) = summarize_command_text(source) {
         result.push_str("\nsummary: ");
         result.push_str(&summary);
@@ -1564,6 +1773,8 @@ pub(crate) fn display_tool_name(name: &str) -> &str {
         "plan_update" => "plan.update",
         "decision_request" => "decision.request",
         "question" => "question",
+        "web_fetch" => "web.fetch",
+        "web_search" => "web.search",
         other => other,
     }
 }

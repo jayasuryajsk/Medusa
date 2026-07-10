@@ -8,26 +8,31 @@
 //! and silent when no verifier applies. Disable with `MEDUSA_VERIFY=off`.
 
 use std::{
-    io::Read,
     path::{Path, PathBuf},
-    process::{Command, Stdio},
-    thread,
+    process::Command,
     time::{Duration, Instant},
 };
+
+use crate::cancel::CancelToken;
 
 const DEFAULT_TIMEOUT_SECS: u64 = 90;
 const MAX_DETAIL_LINES: usize = 15;
 const MAX_DETAIL_CHARS: usize = 2_400;
 
 /// Formatted `verify:` block to append to a mutation's tool output, or None
-/// when verification is disabled, no verifier applies, or the changed files
-/// aren't relevant to the detected project type.
-pub fn verify_after_mutation(workspace: &Path, changed_files: &[String]) -> Option<String> {
-    if verification_disabled() {
+/// when verification is disabled, the turn was cancelled, no verifier
+/// applies, or the changed files aren't relevant to the detected project
+/// type.
+pub fn verify_after_mutation(
+    workspace: &Path,
+    changed_files: &[String],
+    cancel: &CancelToken,
+) -> Option<String> {
+    if verification_disabled() || cancel.is_cancelled() {
         return None;
     }
     let verifier = detect_verifier(workspace, changed_files)?;
-    Some(run_verifier(workspace, &verifier))
+    Some(run_verifier(workspace, &verifier, cancel))
 }
 
 fn verification_disabled() -> bool {
@@ -88,7 +93,8 @@ pub(crate) fn detect_verifier(workspace: &Path, changed_files: &[String]) -> Opt
         });
     }
 
-    if workspace.join("go.mod").is_file() && changed_with_extension(changed_files, &[".go", "go.mod"])
+    if workspace.join("go.mod").is_file()
+        && changed_with_extension(changed_files, &[".go", "go.mod"])
     {
         return Some(Verifier {
             label: "go build".to_string(),
@@ -127,19 +133,22 @@ pub(crate) fn detect_verifier(workspace: &Path, changed_files: &[String]) -> Opt
     None
 }
 
-fn run_verifier(workspace: &Path, verifier: &Verifier) -> String {
+fn run_verifier(workspace: &Path, verifier: &Verifier, cancel: &CancelToken) -> String {
     let timeout = verify_timeout();
     let started = Instant::now();
     let mut command = Command::new(&verifier.program);
     command.args(&verifier.args).current_dir(workspace);
 
-    match run_with_timeout(command, timeout) {
+    match crate::proc::run_command(command, Some(timeout), cancel) {
         Err(_) => {
             // Tool missing or unspawnable — verification is best-effort.
             format!("verify: {} unavailable (skipped)", verifier.label)
         }
         Ok(outcome) => {
             let elapsed = format_elapsed(started.elapsed());
+            if outcome.cancelled {
+                return format!("verify: {} cancelled (turn interrupted)", verifier.label);
+            }
             if outcome.timed_out {
                 return format!(
                     "verify: {} timed out after {}s (run it manually if needed)",
@@ -185,7 +194,13 @@ fn failure_details(stdout: &str, stderr: &str) -> String {
         .filter(|line| line.contains("error"))
         .collect();
     let selected: Vec<&str> = if error_lines.is_empty() {
-        lines.iter().rev().take(MAX_DETAIL_LINES).rev().copied().collect()
+        lines
+            .iter()
+            .rev()
+            .take(MAX_DETAIL_LINES)
+            .rev()
+            .copied()
+            .collect()
     } else {
         error_lines.into_iter().take(MAX_DETAIL_LINES).collect()
     };
@@ -200,60 +215,6 @@ fn failure_details(stdout: &str, stderr: &str) -> String {
         details.push('…');
     }
     details
-}
-
-struct CommandOutcome {
-    success: bool,
-    timed_out: bool,
-    stdout: String,
-    stderr: String,
-}
-
-/// Run to completion or kill at the deadline. Output is drained on reader
-/// threads so a chatty child can never deadlock against a full pipe.
-fn run_with_timeout(mut command: Command, timeout: Duration) -> std::io::Result<CommandOutcome> {
-    command
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let mut child = command.spawn()?;
-
-    let mut stdout_pipe = child.stdout.take();
-    let stdout_reader = thread::spawn(move || {
-        let mut buffer = String::new();
-        if let Some(pipe) = stdout_pipe.as_mut() {
-            let _ = pipe.read_to_string(&mut buffer);
-        }
-        buffer
-    });
-    let mut stderr_pipe = child.stderr.take();
-    let stderr_reader = thread::spawn(move || {
-        let mut buffer = String::new();
-        if let Some(pipe) = stderr_pipe.as_mut() {
-            let _ = pipe.read_to_string(&mut buffer);
-        }
-        buffer
-    });
-
-    let deadline = Instant::now() + timeout;
-    let (success, timed_out) = loop {
-        match child.try_wait()? {
-            Some(status) => break (status.success(), false),
-            None if Instant::now() >= deadline => {
-                let _ = child.kill();
-                let _ = child.wait();
-                break (false, true);
-            }
-            None => thread::sleep(Duration::from_millis(40)),
-        }
-    };
-
-    Ok(CommandOutcome {
-        success,
-        timed_out,
-        stdout: stdout_reader.join().unwrap_or_default(),
-        stderr: stderr_reader.join().unwrap_or_default(),
-    })
 }
 
 #[cfg(test)]
@@ -297,23 +258,24 @@ mod tests {
         let dir = temp_dir("py-e2e");
         fs::write(dir.join("good.py"), "x = 1\n").unwrap();
         fs::write(dir.join("bad.py"), "def broken(:\n").unwrap();
+        let cancel = CancelToken::default();
 
-        let ok = verify_after_mutation(&dir, &["good.py".to_string()]).unwrap();
+        let ok = verify_after_mutation(&dir, &["good.py".to_string()], &cancel).unwrap();
         assert!(ok.starts_with("verify: python py_compile ok"), "{ok}");
 
-        let failed = verify_after_mutation(&dir, &["bad.py".to_string()]).unwrap();
+        let failed = verify_after_mutation(&dir, &["bad.py".to_string()], &cancel).unwrap();
         assert!(failed.contains("FAILED"), "{failed}");
         assert!(failed.to_lowercase().contains("error"), "{failed}");
     }
 
     #[test]
-    fn run_with_timeout_kills_hung_commands() {
-        let mut command = Command::new("sh");
-        command.arg("-c").arg("sleep 30");
-        let started = Instant::now();
-        let outcome = run_with_timeout(command, Duration::from_millis(300)).unwrap();
-        assert!(outcome.timed_out);
-        assert!(started.elapsed() < Duration::from_secs(5));
+    fn cancelled_turns_skip_verification_entirely() {
+        let dir = temp_dir("py-cancel");
+        fs::write(dir.join("bad.py"), "def broken(:\n").unwrap();
+        let cancel = CancelToken::new();
+        cancel.cancel();
+
+        assert!(verify_after_mutation(&dir, &["bad.py".to_string()], &cancel).is_none());
     }
 
     #[test]

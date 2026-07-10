@@ -1,13 +1,17 @@
 use std::{
     collections::BTreeMap,
     fs,
-    io::{BufRead, BufReader},
+    io::{BufRead, BufReader, Read},
+    sync::mpsc::{Receiver, RecvTimeoutError, sync_channel},
+    thread,
+    time::Duration,
 };
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use color_eyre::eyre::{Result, WrapErr, bail};
 use serde_json::{Value, json};
 
+use crate::cancel::CancelToken;
 use crate::model::types::*;
 
 pub(crate) fn conversation_message_json(message: &ConversationMessage) -> Value {
@@ -208,21 +212,74 @@ pub(crate) fn compact_conversation_context(
     compacted
 }
 
-pub(crate) fn read_sse_response<F>(
-    response: reqwest::blocking::Response,
+/// The blocking SSE read can't be interrupted in place, so a pump thread
+/// owns the body and forwards lines over a bounded channel; the parse loop
+/// polls the cancel token while the stream is quiet. After cancellation the
+/// pump dies on its next send failure (bounded by the HTTP client timeout).
+fn spawn_sse_line_pump<R>(source: R) -> Receiver<std::io::Result<String>>
+where
+    R: Read + Send + 'static,
+{
+    let (sender, receiver) = sync_channel(64);
+    thread::spawn(move || {
+        for line in BufReader::new(source).lines() {
+            let failed = line.is_err();
+            if sender.send(line).is_err() || failed {
+                return;
+            }
+        }
+    });
+    receiver
+}
+
+/// Next line from the pump, or None at end of stream. Timeouts poll the
+/// cancel token, so Esc interrupts a stalled read within ~100ms.
+fn next_pumped_line(
+    lines: &Receiver<std::io::Result<String>>,
+    cancel: &CancelToken,
+    context: &'static str,
+) -> Result<Option<String>> {
+    loop {
+        match lines.recv_timeout(Duration::from_millis(100)) {
+            Ok(Ok(line)) => return Ok(Some(line)),
+            Ok(Err(error)) => return Err(error).wrap_err(context),
+            Err(RecvTimeoutError::Timeout) => cancel.bail_if_cancelled()?,
+            // Pump thread finished and hung up: EOF.
+            Err(RecvTimeoutError::Disconnected) => return Ok(None),
+        }
+    }
+}
+
+pub(crate) fn read_sse_response<R, F>(
+    response: R,
+    cancel: &CancelToken,
+    on_event: &mut F,
+) -> Result<TurnOutcome>
+where
+    R: Read + Send + 'static,
+    F: FnMut(ModelStreamEvent) -> Result<()>,
+{
+    let lines = spawn_sse_line_pump(response);
+    read_sse_lines(
+        &mut || next_pumped_line(&lines, cancel, "failed to read SSE line"),
+        on_event,
+    )
+}
+
+fn read_sse_lines<F>(
+    next_line: &mut dyn FnMut() -> Result<Option<String>>,
     on_event: &mut F,
 ) -> Result<TurnOutcome>
 where
     F: FnMut(ModelStreamEvent) -> Result<()>,
 {
-    let reader = BufReader::new(response);
     let mut emitted_text = false;
     let mut completed_text = String::new();
     let mut event_count = 0;
     let mut tool_calls = Vec::new();
+    let mut usage = None;
 
-    for line in reader.lines() {
-        let line = line.wrap_err("failed to read SSE line")?;
+    while let Some(line) = next_line()? {
         let Some(payload) = line.strip_prefix("data: ") else {
             continue;
         };
@@ -251,6 +308,12 @@ where
                 }
             }
             Some("response.completed") => {
+                usage = event
+                    .get("response")
+                    .and_then(|response| response.get("usage"))
+                    .or_else(|| event.get("usage"))
+                    .and_then(parse_token_usage);
+
                 for call in extract_completed_tool_calls(&event) {
                     if !tool_calls
                         .iter()
@@ -298,20 +361,29 @@ where
     Ok(TurnOutcome {
         event_count,
         tool_calls,
+        usage,
     })
 }
 
-pub(crate) fn read_chat_completions_sse_response<F>(
-    response: reqwest::blocking::Response,
+pub(crate) fn read_chat_completions_sse_response<R, F>(
+    response: R,
+    cancel: &CancelToken,
     on_event: &mut F,
 ) -> Result<TurnOutcome>
 where
+    R: Read + Send + 'static,
     F: FnMut(ModelStreamEvent) -> Result<()>,
 {
-    let reader = BufReader::new(response);
-    read_chat_completions_sse_reader(reader, on_event)
+    let lines = spawn_sse_line_pump(response);
+    read_chat_completions_sse_lines(
+        &mut || next_pumped_line(&lines, cancel, "failed to read chat SSE line"),
+        on_event,
+    )
 }
 
+/// BufRead-based variant kept so fixture tests can drive the parser from a
+/// Cursor without a pump thread (not cancellable mid-read).
+#[cfg(test)]
 pub(crate) fn read_chat_completions_sse_reader<R, F>(
     reader: R,
     on_event: &mut F,
@@ -320,12 +392,29 @@ where
     R: BufRead,
     F: FnMut(ModelStreamEvent) -> Result<()>,
 {
+    let mut lines = reader.lines();
+    read_chat_completions_sse_lines(
+        &mut || match lines.next() {
+            Some(line) => line.map(Some).wrap_err("failed to read chat SSE line"),
+            None => Ok(None),
+        },
+        on_event,
+    )
+}
+
+fn read_chat_completions_sse_lines<F>(
+    next_line: &mut dyn FnMut() -> Result<Option<String>>,
+    on_event: &mut F,
+) -> Result<TurnOutcome>
+where
+    F: FnMut(ModelStreamEvent) -> Result<()>,
+{
     let mut event_count = 0;
     let mut reasoning_content = String::new();
     let mut tool_calls: BTreeMap<usize, PartialChatToolCall> = BTreeMap::new();
+    let mut usage = None;
 
-    for line in reader.lines() {
-        let line = line.wrap_err("failed to read chat SSE line")?;
+    while let Some(line) = next_line()? {
         let Some(payload) = line.strip_prefix("data: ") else {
             continue;
         };
@@ -338,6 +427,12 @@ where
         let event = parse_sse_payload(payload)?;
         if let Some(error) = event.get("error") {
             bail!("{}", chat_backend_error_message(error));
+        }
+
+        // Usage rides on the final chunk (usually with an empty choices
+        // array); keep the last one seen.
+        if let Some(parsed) = event.get("usage").and_then(parse_token_usage) {
+            usage = Some(parsed);
         }
 
         let Some(choices) = event.get("choices").and_then(Value::as_array) else {
@@ -425,6 +520,38 @@ where
     Ok(TurnOutcome {
         event_count,
         tool_calls,
+        usage,
+    })
+}
+
+/// Parse a usage object from either wire dialect: Responses-style
+/// (input_tokens/output_tokens + input_tokens_details.cached_tokens) or
+/// chat-completions-style (prompt_tokens/completion_tokens +
+/// prompt_tokens_details.cached_tokens).
+pub(crate) fn parse_token_usage(value: &Value) -> Option<TokenUsage> {
+    let input = value
+        .get("input_tokens")
+        .or_else(|| value.get("prompt_tokens"))
+        .and_then(Value::as_u64);
+    let output = value
+        .get("output_tokens")
+        .or_else(|| value.get("completion_tokens"))
+        .and_then(Value::as_u64);
+    if input.is_none() && output.is_none() {
+        return None;
+    }
+
+    let cached = value
+        .get("input_tokens_details")
+        .or_else(|| value.get("prompt_tokens_details"))
+        .and_then(|details| details.get("cached_tokens"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+
+    Some(TokenUsage {
+        input: input.unwrap_or(0),
+        output: output.unwrap_or(0),
+        cached,
     })
 }
 

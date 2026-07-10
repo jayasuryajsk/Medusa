@@ -9,6 +9,10 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone)]
 pub struct PermissionPolicy {
     config: PermissionConfig,
+    /// Workspace root, used to downgrade auto-allowed reads that reference a
+    /// path outside the workspace (an absolute/escaping `cat`/`ls`/… must
+    /// prompt instead of silently reading arbitrary host files).
+    workspace: PathBuf,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -64,10 +68,19 @@ impl PermissionMode {
             Self::Readonly => "Allow common inspection commands and block file edits/patches.",
         }
     }
+
+    /// Whether terminal commands run inside the macOS Seatbelt sandbox by
+    /// default in this mode. Open is explicitly trusted (full access); every
+    /// other mode confines writes and network unless overridden.
+    pub fn sandboxes_by_default(self) -> bool {
+        !matches!(self, Self::Open)
+    }
 }
 
-/// Three-state permission outcome. `NeedsApproval` is only produced in Ask
-/// mode; callers without an approval channel must treat it as a denial.
+/// Three-state permission outcome. `NeedsApproval` is produced in Ask mode
+/// and when an otherwise auto-allowed read (Ask safe-reads, Readonly
+/// allowlist) references a path outside the workspace; callers without an
+/// approval channel must treat it as a denial.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PermissionCheck {
     Allow,
@@ -83,6 +96,8 @@ struct PermissionConfig {
     terminal: TerminalPermissionConfig,
     #[serde(default)]
     patch: PatchPermissionConfig,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    sandbox: Option<SandboxSettings>,
 }
 
 impl PermissionConfig {
@@ -109,6 +124,20 @@ struct PatchPermissionConfig {
     deny_prefixes: Vec<String>,
 }
 
+/// User-facing `sandbox` section of `.medusa/permissions.json`. `enabled`
+/// overrides the mode default in either direction; `writable_roots` adds
+/// extra writable subtrees (e.g. `~/.cargo/registry`); `allow_network`
+/// permits outbound network inside the sandbox.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct SandboxSettings {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    #[serde(default)]
+    pub writable_roots: Vec<String>,
+    #[serde(default)]
+    pub allow_network: bool,
+}
+
 impl PermissionPolicy {
     pub fn load(workspace: impl Into<PathBuf>) -> Result<Self> {
         let workspace = workspace.into();
@@ -122,7 +151,7 @@ impl PermissionPolicy {
             PermissionConfig::default()
         };
 
-        Ok(Self { config })
+        Ok(Self { config, workspace })
     }
 
     pub fn write_mode(workspace: impl AsRef<Path>, mode: PermissionMode) -> Result<()> {
@@ -130,28 +159,36 @@ impl PermissionPolicy {
         let path = workspace.join(".medusa").join("permissions.json");
         let mut config = config_for_mode(mode);
 
-        // Ask mode is the only mode where allow_prefixes is an additive grant
-        // list; in Open/Guarded a non-empty allow_prefixes becomes an
-        // exclusive allowlist, so carrying grants there would deny everything
-        // else. Preserve accumulated grants only when writing Ask mode AND the
-        // previous config was itself Ask — otherwise Readonly's inspection
-        // allowlist (sed, find, …) would be injected as silent Ask grants.
-        if mode == PermissionMode::Ask
-            && path.exists()
-            && let Ok(text) = fs::read_to_string(&path)
-            && let Ok(existing) = serde_json::from_str::<PermissionConfig>(&text)
-            && existing.ask()
-        {
-            for prefix in existing.terminal.allow_prefixes {
-                let prefix = prefix.trim().to_string();
-                if !prefix.is_empty()
-                    && !config
-                        .terminal
-                        .allow_prefixes
-                        .iter()
-                        .any(|entry| entry.trim() == prefix)
-                {
-                    config.terminal.allow_prefixes.push(prefix);
+        let existing = path
+            .exists()
+            .then(|| fs::read_to_string(&path).ok())
+            .flatten()
+            .and_then(|text| serde_json::from_str::<PermissionConfig>(&text).ok());
+
+        if let Some(existing) = existing {
+            // The sandbox section is orthogonal to the mode; a mode switch
+            // must never wipe user-configured writable roots or network.
+            config.sandbox = existing.sandbox.clone();
+
+            // Ask mode is the only mode where allow_prefixes is an additive
+            // grant list; in Open/Guarded a non-empty allow_prefixes becomes
+            // an exclusive allowlist, so carrying grants there would deny
+            // everything else. Preserve accumulated grants only when writing
+            // Ask mode AND the previous config was itself Ask — otherwise
+            // Readonly's inspection allowlist (sed, find, …) would be
+            // injected as silent Ask grants.
+            if mode == PermissionMode::Ask && existing.ask() {
+                for prefix in existing.terminal.allow_prefixes {
+                    let prefix = prefix.trim().to_string();
+                    if !prefix.is_empty()
+                        && !config
+                            .terminal
+                            .allow_prefixes
+                            .iter()
+                            .any(|entry| entry.trim() == prefix)
+                    {
+                        config.terminal.allow_prefixes.push(prefix);
+                    }
                 }
             }
         }
@@ -186,6 +223,34 @@ impl PermissionPolicy {
         }
     }
 
+    /// The mode this config represents. Configs written by [`write_mode`]
+    /// carry an explicit mode name; older or hand-written configs fall back
+    /// to shape inference so sandbox defaults stay sensible for them.
+    pub fn effective_mode(&self) -> PermissionMode {
+        if let Some(mode) = self
+            .config
+            .mode
+            .as_deref()
+            .and_then(PermissionMode::from_name)
+        {
+            return mode;
+        }
+        if self.config.terminal.read_only {
+            return PermissionMode::Readonly;
+        }
+        if !self.config.terminal.deny_contains.is_empty()
+            || !self.config.patch.deny_prefixes.is_empty()
+        {
+            return PermissionMode::Guarded;
+        }
+        PermissionMode::Open
+    }
+
+    /// The user's `sandbox` config section (defaults when absent).
+    pub fn sandbox_settings(&self) -> SandboxSettings {
+        self.config.sandbox.clone().unwrap_or_default()
+    }
+
     pub fn evaluate_terminal_command(&self, command: &str) -> PermissionCheck {
         let command = command.trim_start();
 
@@ -208,7 +273,7 @@ impl PermissionPolicy {
             if terminal_command_is_safe_readonly(command)
                 || (allowlisted && !contains_shell_control_tokens(command))
             {
-                return PermissionCheck::Allow;
+                return self.downgrade_if_reads_outside_workspace(command);
             }
             return PermissionCheck::NeedsApproval;
         }
@@ -226,7 +291,38 @@ impl PermissionPolicy {
             return PermissionCheck::Deny(error.to_string());
         }
 
+        // Readonly mode auto-allows its inspection allowlist (cat/head/ls/…).
+        // A read of an absolute or escaping path is still an unapproved
+        // out-of-tree read, so make it prompt rather than run silently.
+        if self.config.terminal.read_only {
+            return self.downgrade_if_reads_outside_workspace(command);
+        }
+
         PermissionCheck::Allow
+    }
+
+    /// The auto-allow read lanes (Ask safe-reads, Readonly allowlist) must not
+    /// silently read files outside the workspace. When a would-be-`Allow`
+    /// command references an absolute/home/escaping path, downgrade it to
+    /// `NeedsApproval` so a human approves the out-of-tree read. In-workspace
+    /// relative reads (`cat Cargo.toml`, `ls src`) stay auto-allowed.
+    ///
+    /// Best-effort shell parsing only — see
+    /// [`crate::tools::command_paths_outside_workspace`]; it does not see
+    /// through command substitution or variable expansion.
+    fn downgrade_if_reads_outside_workspace(&self, command: &str) -> PermissionCheck {
+        // Shell expansion ($HOME, $(...), backticks) makes a path
+        // statically unresolvable, so it can't be proven in-workspace —
+        // `cat $HOME/.ssh/id_rsa` reads a host file the lexical scanner
+        // sees as in-tree. Any control token forces a prompt.
+        if contains_shell_control_tokens(command) {
+            return PermissionCheck::NeedsApproval;
+        }
+        if crate::tools::command_paths_outside_workspace(command, &self.workspace).is_empty() {
+            PermissionCheck::Allow
+        } else {
+            PermissionCheck::NeedsApproval
+        }
     }
 
     pub fn evaluate_patch_paths(&self, paths: &[String]) -> PermissionCheck {
@@ -315,7 +411,10 @@ impl PermissionPolicy {
 
 fn config_for_mode(mode: PermissionMode) -> PermissionConfig {
     match mode {
-        PermissionMode::Open => PermissionConfig::default(),
+        PermissionMode::Open => PermissionConfig {
+            mode: Some("open".to_string()),
+            ..PermissionConfig::default()
+        },
         PermissionMode::Ask => PermissionConfig {
             mode: Some("ask".to_string()),
             terminal: TerminalPermissionConfig {
@@ -338,9 +437,10 @@ fn config_for_mode(mode: PermissionMode) -> PermissionConfig {
                     ".medusa/permissions.json".to_string(),
                 ],
             },
+            sandbox: None,
         },
         PermissionMode::Guarded => PermissionConfig {
-            mode: None,
+            mode: Some("guarded".to_string()),
             terminal: TerminalPermissionConfig {
                 allow_prefixes: Vec::new(),
                 deny_contains: vec![
@@ -361,9 +461,10 @@ fn config_for_mode(mode: PermissionMode) -> PermissionConfig {
                     ".medusa/permissions.json".to_string(),
                 ],
             },
+            sandbox: None,
         },
         PermissionMode::Readonly => PermissionConfig {
-            mode: None,
+            mode: Some("readonly".to_string()),
             terminal: TerminalPermissionConfig {
                 allow_prefixes: vec![
                     "pwd".to_string(),
@@ -387,6 +488,7 @@ fn config_for_mode(mode: PermissionMode) -> PermissionConfig {
                 allow_prefixes: vec!["__medusa_readonly_no_write_paths__".to_string()],
                 deny_prefixes: Vec::new(),
             },
+            sandbox: None,
         },
     }
 }
@@ -421,7 +523,10 @@ fn command_matches_allow_prefix(command: &str, prefix: &str) -> bool {
 }
 
 const SHELL_CONTROL_TOKENS: &[&str] = &[
-    "\n", "\r", ";", "&&", "||", "|", "&", ">", "<", "`", "$(", "${",
+    // Bare `$` (not just `$(`/`${`) so env-var expansion like `cat $HOME/.ssh/id_rsa`
+    // is never treated as safe-readonly — the shell would expand it to a path we
+    // cannot statically confine to the workspace, so it must prompt.
+    "\n", "\r", ";", "&&", "||", "|", "&", ">", "<", "`", "$",
 ];
 
 pub(crate) fn contains_shell_control_tokens(command: &str) -> bool {
@@ -698,6 +803,81 @@ mod tests {
     }
 
     #[test]
+    fn readonly_out_of_workspace_reads_need_approval() {
+        let workspace = temp_workspace();
+        PermissionPolicy::write_mode(&workspace, PermissionMode::Readonly).unwrap();
+        let policy = PermissionPolicy::load(&workspace).unwrap();
+
+        // In-workspace relative reads stay auto-allowed.
+        assert_eq!(
+            policy.evaluate_terminal_command("cat README.md"),
+            PermissionCheck::Allow
+        );
+        assert_eq!(
+            policy.evaluate_terminal_command("ls -la src"),
+            PermissionCheck::Allow
+        );
+
+        // Absolute / escaping reads must prompt instead of silently running,
+        // even though the program is on the read-only allowlist.
+        for command in [
+            "cat /etc/passwd",
+            "cat /Users/victim/.ssh/id_rsa",
+            "head ../../etc/passwd",
+            "tail -n 5 ../secrets.env",
+        ] {
+            assert_eq!(
+                policy.evaluate_terminal_command(command),
+                PermissionCheck::NeedsApproval,
+                "`{command}` must prompt, not silent-allow an out-of-workspace read"
+            );
+        }
+
+        // Env-var expansion makes the path unresolvable, so it must never be
+        // auto-allowed — it either prompts or (for `${`/`$(` shell tokens in
+        // strict readonly mode) is denied outright. Both are safe; silent
+        // Allow is the bug.
+        for command in [
+            "cat $HOME/.ssh/id_rsa",
+            "cat ${HOME}/.aws/credentials",
+            "head $HOME/anyfile",
+        ] {
+            assert_ne!(
+                policy.evaluate_terminal_command(command),
+                PermissionCheck::Allow,
+                "`{command}` must never silent-allow an expanded out-of-workspace read"
+            );
+        }
+    }
+
+    #[test]
+    fn ask_safe_reads_of_out_of_workspace_paths_need_approval() {
+        let workspace = temp_workspace();
+        PermissionPolicy::write_mode(&workspace, PermissionMode::Ask).unwrap();
+        let policy = PermissionPolicy::load(&workspace).unwrap();
+
+        // In-workspace relative reads stay auto-allowed.
+        assert_eq!(
+            policy.evaluate_terminal_command("cat README.md"),
+            PermissionCheck::Allow
+        );
+
+        // The Ask-mode safe-read fast lane must not silently exfiltrate
+        // arbitrary host files.
+        for command in [
+            "cat /Users/victim/.ssh/id_rsa",
+            "head /etc/passwd",
+            "cat ~/.aws/credentials",
+        ] {
+            assert_eq!(
+                policy.evaluate_terminal_command(command),
+                PermissionCheck::NeedsApproval,
+                "`{command}` must prompt, not silent-allow an out-of-workspace read"
+            );
+        }
+    }
+
+    #[test]
     fn readonly_allowlist_never_becomes_ask_grants() {
         let workspace = temp_workspace();
         PermissionPolicy::write_mode(&workspace, PermissionMode::Ask).unwrap();
@@ -805,6 +985,57 @@ mod tests {
             policy.evaluate_terminal_command("cargo test"),
             PermissionCheck::Allow
         );
+    }
+
+    #[test]
+    fn effective_mode_prefers_the_recorded_name_and_infers_legacy_shapes() {
+        for mode in PermissionMode::all() {
+            let workspace = temp_workspace();
+            PermissionPolicy::write_mode(&workspace, *mode).unwrap();
+            let policy = PermissionPolicy::load(&workspace).unwrap();
+            assert_eq!(policy.effective_mode(), *mode, "{} round-trip", mode.name());
+        }
+
+        // Legacy/hand-written configs without a mode name infer from shape.
+        let cases = [
+            (r#"{}"#, PermissionMode::Open),
+            (
+                r#"{"terminal":{"deny_contains":["rm -rf"]}}"#,
+                PermissionMode::Guarded,
+            ),
+            (
+                r#"{"terminal":{"read_only":true,"allow_prefixes":["ls"]}}"#,
+                PermissionMode::Readonly,
+            ),
+        ];
+        for (json, expected) in cases {
+            let workspace = temp_workspace();
+            write_permissions(&workspace, json);
+            let policy = PermissionPolicy::load(&workspace).unwrap();
+            assert_eq!(policy.effective_mode(), expected, "{json}");
+        }
+    }
+
+    #[test]
+    fn sandbox_section_survives_mode_switches_and_grants() {
+        let workspace = temp_workspace();
+        write_permissions(
+            &workspace,
+            r#"{"mode":"guarded","sandbox":{"allow_network":true,"writable_roots":["~/.cargo/registry"]}}"#,
+        );
+
+        PermissionPolicy::write_mode(&workspace, PermissionMode::Ask).unwrap();
+        PermissionPolicy::append_terminal_allow_prefix(&workspace, "cargo test").unwrap();
+        PermissionPolicy::write_mode(&workspace, PermissionMode::Open).unwrap();
+
+        let policy = PermissionPolicy::load(&workspace).unwrap();
+        let settings = policy.sandbox_settings();
+        assert!(settings.allow_network);
+        assert_eq!(
+            settings.writable_roots,
+            vec!["~/.cargo/registry".to_string()]
+        );
+        assert_eq!(settings.enabled, None);
     }
 
     fn write_permissions(workspace: &std::path::Path, json: &str) {

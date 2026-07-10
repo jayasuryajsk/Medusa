@@ -22,6 +22,7 @@ use super::{
     workflow_run_id,
 };
 use crate::{
+    agents::AgentRegistry,
     model::{ConversationMessage, DirectCodexBackend, ModelStreamEvent},
     tools::ToolRuntime,
 };
@@ -89,7 +90,7 @@ pub(crate) struct ScriptAgentSpec {
 }
 
 impl ScriptAgentSpec {
-    fn parse(value: &Value, default_index: usize) -> Result<Self> {
+    fn parse(value: &Value, default_index: usize, agents: &AgentRegistry) -> Result<Self> {
         let default_label = format!("agent-{}", default_index + 1);
         match value {
             Value::String(prompt) if !prompt.trim().is_empty() => Ok(Self {
@@ -100,20 +101,34 @@ impl ScriptAgentSpec {
                 schema: None,
             }),
             Value::Object(map) => {
-                let prompt = map
+                let named = map
+                    .get("agentType")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|name| !name.is_empty())
+                    .map(|name| resolve_named_agent(agents, name))
+                    .transpose()?;
+                let mut prompt = map
                     .get("prompt")
                     .and_then(Value::as_str)
                     .map(str::trim)
                     .filter(|prompt| !prompt.is_empty())
                     .ok_or_else(|| eyre!("agent spec requires a non-empty `prompt`"))?
                     .to_string();
+                if let Some(agent) = named {
+                    prompt = format!("{}\n\n{prompt}", agent.prompt.trim());
+                }
                 let label = map
                     .get("label")
                     .and_then(Value::as_str)
                     .map(str::trim)
                     .filter(|label| !label.is_empty())
                     .map(str::to_string)
-                    .unwrap_or(default_label);
+                    .unwrap_or_else(|| {
+                        named
+                            .map(|agent| agent.name.clone())
+                            .unwrap_or(default_label)
+                    });
                 let role = map
                     .get("role")
                     .and_then(Value::as_str)
@@ -122,7 +137,11 @@ impl ScriptAgentSpec {
                     .map(str::to_string)
                     .unwrap_or_else(|| label.clone());
                 let tool_policy = match map.get("tools").and_then(Value::as_str) {
-                    None => SubagentToolPolicy::ShellRead,
+                    // The named agent's policy is only the default; explicit
+                    // `tools` in the spec always wins.
+                    None => named
+                        .map(|agent| agent.tool_policy)
+                        .unwrap_or(SubagentToolPolicy::ShellRead),
                     Some(tools) => parse_tool_policy(tools)?,
                 };
                 let schema = map
@@ -138,13 +157,30 @@ impl ScriptAgentSpec {
                 })
             }
             _ => bail!(
-                "agent spec must be a prompt string or {{prompt, label?, tools?, schema?}} object"
+                "agent spec must be a prompt string or {{prompt, agentType?, label?, tools?, schema?}} object"
             ),
         }
     }
 }
 
-fn parse_tool_policy(tools: &str) -> Result<SubagentToolPolicy> {
+fn resolve_named_agent<'registry>(
+    agents: &'registry AgentRegistry,
+    name: &str,
+) -> Result<&'registry crate::agents::AgentDefinition> {
+    agents.get(name).ok_or_else(|| {
+        let known = agents.names();
+        if known.is_empty() {
+            eyre!("unknown agentType {name:?}: no agents are defined in .medusa/agents")
+        } else {
+            eyre!(
+                "unknown agentType {name:?}; known agents: {}",
+                known.join(", ")
+            )
+        }
+    })
+}
+
+pub(crate) fn parse_tool_policy(tools: &str) -> Result<SubagentToolPolicy> {
     match tools.trim().to_ascii_lowercase().as_str() {
         "read" | "read-only" | "readonly" => Ok(SubagentToolPolicy::ReadOnly),
         "shell" | "shell-read" => Ok(SubagentToolPolicy::ShellRead),
@@ -170,6 +206,7 @@ struct ScriptHost {
     run_id: String,
     events: Sender<WorkflowEvent>,
     runner: AgentRunner,
+    agents: AgentRegistry,
     max_agents: usize,
     max_parallel: usize,
     total_agents: usize,
@@ -250,7 +287,7 @@ impl ScriptHost {
     }
 
     fn run_single(&mut self, spec_value: &Value) -> Result<Value> {
-        let spec = ScriptAgentSpec::parse(spec_value, self.total_agents)?;
+        let spec = ScriptAgentSpec::parse(spec_value, self.total_agents, &self.agents)?;
         self.reserve_agents(1)?;
         self.ensure_phase();
 
@@ -278,7 +315,11 @@ impl ScriptHost {
 
         let mut specs = Vec::with_capacity(items.len());
         for (offset, item) in items.iter().enumerate() {
-            specs.push(ScriptAgentSpec::parse(item, self.total_agents + offset)?);
+            specs.push(ScriptAgentSpec::parse(
+                item,
+                self.total_agents + offset,
+                &self.agents,
+            )?);
         }
         self.reserve_agents(specs.len())?;
         self.ensure_phase();
@@ -521,8 +562,10 @@ impl WorkflowRuntime {
                     }
                     ModelStreamEvent::ReasoningDelta(_)
                     | ModelStreamEvent::Workflow(_)
+                    | ModelStreamEvent::Usage(_)
                     | ModelStreamEvent::Done { .. }
-                    | ModelStreamEvent::Error(_) => {}
+                    | ModelStreamEvent::Error(_)
+                    | ModelStreamEvent::Cancelled => {}
                 }
                 Ok(())
             };
@@ -554,11 +597,20 @@ impl WorkflowRuntime {
     {
         let (sender, receiver) = std::sync::mpsc::channel();
         let script = script.clone();
+        let agents = self.agent_registry.clone();
         let max_agents = max_script_agents();
         let max_parallel = max_parallel_agents();
 
         let worker = thread::spawn(move || {
-            run_script_thread(script, args, runner, sender, max_agents, max_parallel)
+            run_script_thread(
+                script,
+                args,
+                runner,
+                agents,
+                sender,
+                max_agents,
+                max_parallel,
+            )
         });
 
         for event in receiver {
@@ -591,6 +643,7 @@ fn run_script_thread(
     script: WorkflowScript,
     args: Option<Value>,
     runner: AgentRunner,
+    agents: AgentRegistry,
     events: Sender<WorkflowEvent>,
     max_agents: usize,
     max_parallel: usize,
@@ -612,6 +665,7 @@ fn run_script_thread(
         run_id: run_id.clone(),
         events: events.clone(),
         runner,
+        agents,
         max_agents,
         max_parallel,
         total_agents: 0,
@@ -884,13 +938,53 @@ mod tests {
         args: Option<Value>,
         runner: AgentRunner,
     ) -> Result<(WorkflowRunReport, Vec<WorkflowEvent>)> {
+        run_with_runtime(runtime(), script_source, args, runner)
+    }
+
+    fn run_with_runtime(
+        runtime: WorkflowRuntime,
+        script_source: &str,
+        args: Option<Value>,
+        runner: AgentRunner,
+    ) -> Result<(WorkflowRunReport, Vec<WorkflowEvent>)> {
         let script = WorkflowScript::new("test", script_source);
         let mut events = Vec::new();
-        let report = runtime().run_script_with_runner(&script, args, runner, &mut |event| {
+        let report = runtime.run_script_with_runner(&script, args, runner, &mut |event| {
             events.push(event);
             Ok(())
         })?;
         Ok((report, events))
+    }
+
+    /// Registry with one read-only `reviewer` agent, built from a real
+    /// temp workspace so the loader path is exercised too.
+    fn reviewer_registry() -> AgentRegistry {
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        let unique = NEXT.fetch_add(1, Ordering::Relaxed);
+        let workspace = std::env::temp_dir().join(format!(
+            "medusa-script-agents-test-{}-{unique}",
+            std::process::id()
+        ));
+        let dir = workspace.join(".medusa/agents");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("reviewer.md"),
+            "name: reviewer\ndescription: Harsh diff reviewer\ntools: read\n\nAlways lead with findings.",
+        )
+        .unwrap();
+        AgentRegistry::load(&workspace).unwrap()
+    }
+
+    /// Echoes the effective tool policy and prompt so tests can observe how
+    /// agentType resolution rewrote the spec.
+    fn policy_echo_runner() -> AgentRunner {
+        Arc::new(|spec: &ScriptAgentSpec| {
+            Ok(AgentRunOutcome {
+                output: format!("{}|{}", spec.tool_policy.label(), spec.prompt),
+                tool_counts: BTreeMap::new(),
+                failed_tools: false,
+            })
+        })
     }
 
     #[test]
@@ -1046,6 +1140,62 @@ mod tests {
         assert_eq!(report.status, WorkflowStatus::Succeeded);
         assert_eq!(report.phases[0].agents.len(), 5);
         assert!(report.summary.contains("5 agents"));
+    }
+
+    #[test]
+    fn agent_type_prepends_prompt_and_defaults_label_and_policy() {
+        let runtime = runtime().with_agent_registry(reviewer_registry());
+        let source = r#"return agent({ agentType: "reviewer", prompt: "check the diff" });"#;
+
+        let (report, _) = run_with_runtime(runtime, source, None, policy_echo_runner()).unwrap();
+
+        assert_eq!(report.status, WorkflowStatus::Succeeded);
+        // Named agent's policy (read) became the default and its stored
+        // prompt was prepended before the spec prompt.
+        assert!(
+            report
+                .summary
+                .contains("read-only|Always lead with findings.\n\ncheck the diff")
+        );
+        assert_eq!(report.phases[0].agents[0].name, "reviewer");
+    }
+
+    #[test]
+    fn explicit_spec_tools_override_named_agent_policy() {
+        let runtime = runtime().with_agent_registry(reviewer_registry());
+        let source = r#"return agent({ agentType: "reviewer", prompt: "fix it", tools: "edit" });"#;
+
+        let (report, _) = run_with_runtime(runtime, source, None, policy_echo_runner()).unwrap();
+
+        assert_eq!(report.status, WorkflowStatus::Succeeded);
+        assert!(report.summary.contains("edit|Always lead with findings."));
+    }
+
+    #[test]
+    fn unknown_agent_type_fails_with_known_agent_names() {
+        let runtime = runtime().with_agent_registry(reviewer_registry());
+        let source = r#"return agent({ agentType: "nope", prompt: "check" });"#;
+
+        let (report, _) = run_with_runtime(runtime, source, None, policy_echo_runner()).unwrap();
+
+        assert_eq!(report.status, WorkflowStatus::Failed);
+        assert!(report.summary.contains("unknown agentType \"nope\""));
+        assert!(report.summary.contains("known agents: reviewer"));
+    }
+
+    #[test]
+    fn unknown_agent_type_with_empty_registry_points_at_agents_directory() {
+        let runtime = runtime().with_agent_registry(AgentRegistry::default());
+        let source = r#"return agent({ agentType: "nope", prompt: "check" });"#;
+
+        let (report, _) = run_with_runtime(runtime, source, None, policy_echo_runner()).unwrap();
+
+        assert_eq!(report.status, WorkflowStatus::Failed);
+        assert!(
+            report
+                .summary
+                .contains("no agents are defined in .medusa/agents")
+        );
     }
 
     #[test]

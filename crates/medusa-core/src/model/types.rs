@@ -152,6 +152,27 @@ pub struct ModelChatResult {
     pub event_count: usize,
 }
 
+/// Token usage reported by the backend for a single model request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct TokenUsage {
+    pub input: u64,
+    pub output: u64,
+    /// Cached input tokens (a subset of `input`) when the backend reports them.
+    pub cached: u64,
+}
+
+impl TokenUsage {
+    pub fn total(&self) -> u64 {
+        self.input + self.output
+    }
+
+    pub fn add(&mut self, other: TokenUsage) {
+        self.input += other.input;
+        self.output += other.output;
+        self.cached += other.cached;
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ModelStreamEvent {
     Delta(String),
@@ -167,8 +188,16 @@ pub enum ModelStreamEvent {
         output: String,
     },
     Workflow(crate::workflow::WorkflowEvent),
-    Done { event_count: usize },
+    /// Backend-reported token usage for one model request. A turn that runs
+    /// tools makes several requests, so consumers must sum every Usage event
+    /// they see to get turn totals.
+    Usage(TokenUsage),
+    Done {
+        event_count: usize,
+    },
     Error(String),
+    /// The user interrupted the turn (Esc) — an outcome, not a failure.
+    Cancelled,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -246,6 +275,8 @@ pub(crate) struct ToolExecution {
 pub(crate) struct TurnOutcome {
     pub(crate) event_count: usize,
     pub(crate) tool_calls: Vec<ToolCall>,
+    /// Usage for this single request, when the backend reported one.
+    pub(crate) usage: Option<TokenUsage>,
 }
 
 #[derive(Debug, Clone, Default)]

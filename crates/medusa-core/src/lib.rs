@@ -1,12 +1,21 @@
+pub mod agents;
 pub mod auth;
+pub mod cancel;
+pub mod checkpoint;
 pub mod context;
 pub mod harness;
 pub mod hooks;
+pub mod mcp;
 pub mod model;
 pub mod permissions;
+mod proc;
 pub mod project;
+pub mod sandbox;
 pub mod session;
 pub mod skills;
 pub mod tools;
 pub mod verify;
+pub mod web;
 pub mod workflow;
+
+pub use cancel::{CancelToken, TurnCancelled, error_is_cancellation};

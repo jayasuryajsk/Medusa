@@ -10,6 +10,7 @@ use color_eyre::eyre::{Result, WrapErr};
 use serde::{Deserialize, Serialize};
 
 use crate::{
+    agents::AgentRegistry,
     model::{ConversationMessage, DirectCodexBackend, ModelStreamEvent},
     tools::ToolRuntime,
 };
@@ -24,6 +25,7 @@ pub struct WorkflowRuntime {
     workspace: PathBuf,
     max_agents: usize,
     memory_context: Option<String>,
+    agent_registry: AgentRegistry,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -72,7 +74,7 @@ impl SubagentToolPolicy {
         matches!(self, Self::Edit)
     }
 
-    fn label(self) -> &'static str {
+    pub fn label(self) -> &'static str {
         match self {
             Self::ReadOnly => "read-only",
             Self::ShellRead => "shell-read",
@@ -204,10 +206,15 @@ impl WorkflowRuntime {
             .filter(|value| *value > 0)
             .unwrap_or(DEFAULT_MAX_AGENTS);
 
+        let workspace = workspace.into();
+        // Missing or partially malformed .medusa/agents must never block a
+        // workflow run; malformed files were already skipped with warnings.
+        let agent_registry = AgentRegistry::load(&workspace).unwrap_or_default();
         Self {
-            workspace: workspace.into(),
+            workspace,
             max_agents,
             memory_context: None,
+            agent_registry,
         }
     }
 
@@ -216,6 +223,12 @@ impl WorkflowRuntime {
         if !memory_context.trim().is_empty() {
             self.memory_context = Some(memory_context);
         }
+        self
+    }
+
+    /// Replace the named-agent registry resolved for `agentType` specs.
+    pub fn with_agent_registry(mut self, agent_registry: AgentRegistry) -> Self {
+        self.agent_registry = agent_registry;
         self
     }
 
@@ -586,8 +599,10 @@ impl WorkflowRuntime {
                 }
                 ModelStreamEvent::ReasoningDelta(_)
                 | ModelStreamEvent::Workflow(_)
+                | ModelStreamEvent::Usage(_)
                 | ModelStreamEvent::Done { .. }
-                | ModelStreamEvent::Error(_) => {}
+                | ModelStreamEvent::Error(_)
+                | ModelStreamEvent::Cancelled => {}
             }
             Ok(())
         };

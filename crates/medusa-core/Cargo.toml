@@ -1,6 +1,6 @@
 [package]
 name = "medusa-core"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "Medusa coding harness engine"
 license = "MIT"
@@ -15,3 +15,9 @@ rquickjs = "0.12.0"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.147"
 similar = "2.7.0"
+url = "2.5"
+
+[target.'cfg(unix)'.dependencies]
+# Process-group signalling for cancellable child commands: std can only
+# SIGKILL the direct child, never SIGTERM or a whole group (see proc.rs).
+libc = "0.2"

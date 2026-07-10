@@ -17,9 +17,8 @@ use crossterm::{
     },
     execute,
     terminal::{
-        BeginSynchronizedUpdate, EndSynchronizedUpdate, EnterAlternateScreen,
-        LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
-        supports_keyboard_enhancement,
+        BeginSynchronizedUpdate, EndSynchronizedUpdate, EnterAlternateScreen, LeaveAlternateScreen,
+        disable_raw_mode, enable_raw_mode, supports_keyboard_enhancement,
     },
 };
 use ratatui::{Terminal, backend::CrosstermBackend};
