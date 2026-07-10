@@ -240,11 +240,18 @@ mod tests {
     }
 
     fn temp_workspace() -> PathBuf {
+        // Timestamp alone collides when parallel tests start in the same
+        // instant; the counter makes each workspace unique per process.
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let suffix = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let path = std::env::temp_dir().join(format!("medusa-skills-test-{suffix}"));
+        let unique = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "medusa-skills-test-{}-{suffix}-{unique}",
+            std::process::id()
+        ));
         fs::create_dir_all(&path).unwrap();
         path.canonicalize().unwrap()
     }

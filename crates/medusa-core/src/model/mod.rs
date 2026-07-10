@@ -338,6 +338,13 @@ impl DirectCodexBackend {
         F: FnMut(types::ModelStreamEvent) -> Result<()>,
     {
         let mut executions: Vec<Option<types::ToolExecution>> = vec![None; calls.len()];
+        // Post-edit verification runs once per turn, after the batch's final
+        // file mutation — mid-refactor intermediate states are expected to be
+        // broken, so checking every edit would just produce false alarms.
+        let last_mutation = calls
+            .iter()
+            .rposition(|call| exec::tool_call_is_file_mutation(&call.name));
+        let mut turn_changed_files: Vec<String> = Vec::new();
         let mut index = 0;
         while index < calls.len() {
             let call = &calls[index];
@@ -390,11 +397,22 @@ impl DirectCodexBackend {
                 continue;
             }
 
-            let execution = if call.name == "workflow_run" {
+            let mut execution = if call.name == "workflow_run" {
                 exec::execute_workflow_run_with_hooks(tools, call, policy, tool_policy, self, on_event)
             } else {
                 exec::execute_tool_call_with_hooks(tools, call, state, policy, tool_policy)
             };
+            if exec::tool_call_is_file_mutation(&call.name) && !execution.failed {
+                turn_changed_files.extend(exec::mutation_changed_files(&execution.output));
+            }
+            if Some(index) == last_mutation
+                && !execution.failed
+                && let Some(verdict) =
+                    crate::verify::verify_after_mutation(tools.workspace(), &turn_changed_files)
+            {
+                execution.output.push('\n');
+                execution.output.push_str(&verdict);
+            }
             finish_tool_call(on_event, call, &execution)?;
             exec::update_tool_loop_state(state, call, &execution);
             executions[index] = Some(execution);

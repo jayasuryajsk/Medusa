@@ -33,6 +33,10 @@ Built in Rust. Single binary, no runtime dependencies.
   place, instead of scrolling away in chat history.
 - **Inline diffs & syntax highlighting** — edits render as colored diffs; code
   blocks are syntax-highlighted; terminal output keeps its ANSI colors.
+- **Post-edit verification** — after the model's last edit in a turn, Medusa
+  runs a cheap project check (`cargo check`, `go build`, `tsc --noEmit`,
+  `py_compile`) and feeds the pass/fail result straight back to the model, so
+  breakage gets fixed in the next turn instead of discovered later.
 - **Interactive permissions** — approve, always-allow, or deny each mutating
   action, with three modes: `open`, `guarded`, `readonly`.
 - **JS workflow engine** — the model (or you, via `/workflow`) can author and run
@@ -169,6 +173,8 @@ Selected environment variables:
 | `MEDUSA_PROVIDER` | `codex` (default), `openai-compatible`, or `deepseek` |
 | `MEDUSA_REASONING_EFFORT` | `none` / `low` / `medium` / `high` |
 | `MEDUSA_CONTEXT_MAX_TOKENS` | Context budget before compaction (default 60k) |
+| `MEDUSA_VERIFY` | `off` disables post-edit verification |
+| `MEDUSA_VERIFY_TIMEOUT_SECS` | Verification command timeout (default 90) |
 | `MEDUSA_THEME` | Startup theme |
 | `CODEX_HOME` | Directory holding `auth.json` (default `~/.codex`) |
 

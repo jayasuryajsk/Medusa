@@ -8,4 +8,5 @@ pub mod project;
 pub mod session;
 pub mod skills;
 pub mod tools;
+pub mod verify;
 pub mod workflow;

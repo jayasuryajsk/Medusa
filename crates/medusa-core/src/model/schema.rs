@@ -22,6 +22,7 @@ Do not write Python/shell just to list, search, or read files when a native Medu
 Prefer targeted tool calls that produce compact output; avoid dumping entire large files unless necessary. \
 When file_edit is available, prefer it for exact old/new string or block replacement in one file. \
 When file_patch is available, use Codex-style *** Begin Patch envelopes for multi-file edits, add/delete/move operations, or changes that are clearer as hunks; unified git diffs are supported as compatibility. \
+After your final file_edit/file_patch in a turn, the harness may run a quick project check (cargo check, go build, tsc, py_compile) and append a `verify:` line to that tool result. Treat `verify: … FAILED` as breakage your changes introduced: fix it before considering the work done. A passing or absent verify line is not a substitute for running the project's real tests. \
 Use task_update sparingly for user-visible phase changes during longer work. \
 Use plan_update for nontrivial multi-step work: publish a concise checklist before acting, then update it as steps move from pending to active, done, or blocked. \
 Do not use plan_update for casual chat or one-step answers. \

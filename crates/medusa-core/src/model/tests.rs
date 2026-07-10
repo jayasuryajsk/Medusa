@@ -626,6 +626,80 @@ fn read_only_tool_calls_execute_in_parallel_and_return_in_emission_order() {
     assert_eq!(result_ids, vec!["call_a", "call_b", "call_missing"]);
 }
 
+fn edit_call(call_id: &str, path: &str, old: &str, new: &str) -> types::ToolCall {
+    types::ToolCall {
+        name: "file_edit".to_string(),
+        call_id: call_id.to_string(),
+        arguments: serde_json::json!({"path": path, "oldString": old, "newString": new})
+            .to_string(),
+        reasoning_content: None,
+    }
+}
+
+#[test]
+fn verification_runs_once_after_the_last_mutation_and_covers_the_whole_turn() {
+    let workspace = temp_workspace();
+    fs::write(workspace.join("first.py"), "x = 1\n").unwrap();
+    fs::write(workspace.join("second.py"), "y = 2\n").unwrap();
+    let tools = ToolRuntime::new(&workspace).unwrap();
+    let backend = super::DirectCodexBackend::new(&workspace).unwrap();
+
+    // First edit breaks first.py; second edit touches second.py harmlessly.
+    let calls = vec![
+        edit_call("call_1", "first.py", "x = 1\n", "def broken(:\n"),
+        edit_call("call_2", "second.py", "y = 2\n", "y = 3\n"),
+    ];
+
+    let mut state = types::ToolLoopState::default();
+    let executions = backend
+        .execute_turn_tool_calls(
+            &tools,
+            &calls,
+            &mut state,
+            crate::harness::HarnessPolicy::for_user_prompt("edit the files"),
+            types::ToolLoopPolicy::mutation_allowed(),
+            &mut |_| Ok(()),
+        )
+        .unwrap();
+
+    // Mid-batch edits carry no verify block; only the final mutation does.
+    assert!(!executions[0].output.contains("verify:"));
+    assert!(executions[1].output.contains("verify: python py_compile FAILED"));
+    // The check covered the earlier edit's file, not just the last one.
+    assert!(executions[1].output.contains("first.py"));
+    // The edit itself still succeeded — verification is feedback, not a veto.
+    assert!(!executions[1].failed);
+
+    // The verify block reaches the model context and the UI summary.
+    let context = exec::compact_tool_context_output(&calls[1], &executions[1]);
+    assert!(context.contains("verify: python py_compile FAILED"));
+    let ui = exec::summarize_tool_result(&calls[1], &executions[1]);
+    assert!(ui.contains("edited second.py (1 replacement) · verify: python py_compile FAILED"));
+}
+
+#[test]
+fn clean_edits_get_a_passing_verify_line() {
+    let workspace = temp_workspace();
+    fs::write(workspace.join("tool.py"), "x = 1\n").unwrap();
+    let tools = ToolRuntime::new(&workspace).unwrap();
+    let backend = super::DirectCodexBackend::new(&workspace).unwrap();
+
+    let calls = vec![edit_call("call_1", "tool.py", "x = 1\n", "x = 2\n")];
+    let mut state = types::ToolLoopState::default();
+    let executions = backend
+        .execute_turn_tool_calls(
+            &tools,
+            &calls,
+            &mut state,
+            crate::harness::HarnessPolicy::for_user_prompt("edit the file"),
+            types::ToolLoopPolicy::mutation_allowed(),
+            &mut |_| Ok(()),
+        )
+        .unwrap();
+
+    assert!(executions[0].output.contains("verify: python py_compile ok"));
+}
+
 #[test]
 fn mutating_calls_are_barriers_between_read_batches() {
     let workspace = temp_workspace();

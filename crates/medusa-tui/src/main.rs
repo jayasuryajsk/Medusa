@@ -10052,6 +10052,9 @@ fn ansi_detail_spans(line: &str, fallback: Style) -> Vec<Span<'static>> {
 
 fn diff_line_style(line: &str) -> Option<Style> {
     let trimmed = line.trim_start();
+    if trimmed.contains("verify:") && trimmed.contains("FAILED") {
+        return Some(error_style());
+    }
     if trimmed.starts_with("+") {
         Some(Style::default().fg(palette().success))
     } else if trimmed.starts_with("-") {

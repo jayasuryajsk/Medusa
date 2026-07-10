@@ -22,6 +22,41 @@ pub(crate) fn tool_call_is_read_only(name: &str) -> bool {
     )
 }
 
+pub(crate) fn tool_call_is_file_mutation(name: &str) -> bool {
+    matches!(name, "file_edit" | "file_patch")
+}
+
+/// Workspace-relative paths a successful file_edit/file_patch touched,
+/// parsed from its raw output.
+pub(crate) fn mutation_changed_files(output: &str) -> Vec<String> {
+    if let Some(rest) = output.strip_prefix("edited files:\n") {
+        return rest
+            .lines()
+            .take_while(|line| !line.starts_with("replacements:"))
+            .map(|line| line.trim().to_string())
+            .filter(|line| !line.is_empty())
+            .collect();
+    }
+    if let Some(rest) = output.strip_prefix("patched files:\n") {
+        return rest
+            .lines()
+            .take_while(|line| !line.starts_with("verify:"))
+            .map(|line| line.trim().to_string())
+            .filter(|line| !line.is_empty())
+            .collect();
+    }
+    Vec::new()
+}
+
+/// Split a mutation output into its base and the trailing `verify:` block
+/// appended by post-edit verification, if any.
+pub(crate) fn split_verify_section(output: &str) -> (&str, Option<&str>) {
+    match output.find("\nverify: ") {
+        Some(position) => (&output[..position], Some(&output[position + 1..])),
+        None => (output, None),
+    }
+}
+
 pub(crate) fn execute_tool_call_with_hooks(
     tools: &ToolRuntime,
     call: &ToolCall,
@@ -1091,9 +1126,26 @@ pub(crate) fn compact_tool_context_output(call: &ToolCall, execution: &ToolExecu
         "terminal_exec" => compact_terminal_context_output(&execution.output, 6000),
         "workflow_run" => compact(&execution.output, 8000),
         // Short confirmations only: the model already produced the edit content,
-        // so echoing a diff back would just duplicate tokens in context.
-        "file_edit" => summarize_file_edit_output(&execution.output),
-        "file_patch" => summarize_file_patch_output(&execution.output),
+        // so echoing a diff back would just duplicate tokens in context. The
+        // verify: block DOES go back — breakage feedback is the whole point.
+        "file_edit" => {
+            let (base, verify) = split_verify_section(&execution.output);
+            let mut context = summarize_file_edit_output(base);
+            if let Some(block) = verify {
+                context.push('\n');
+                context.push_str(block);
+            }
+            context
+        }
+        "file_patch" => {
+            let (base, verify) = split_verify_section(&execution.output);
+            let mut context = summarize_file_patch_output(base);
+            if let Some(block) = verify {
+                context.push('\n');
+                context.push_str(block);
+            }
+            context
+        }
         "task_update" => execution.output.clone(),
         "plan_update" => execution.output.clone(),
         "decision_request" => execution.output.clone(),
@@ -1115,20 +1167,20 @@ pub(crate) fn summarize_tool_result(call: &ToolCall, execution: &ToolExecution) 
         "explore_batch" => summarize_explore_batch_output(&execution.output),
         "terminal_exec" => summarize_terminal_output(&execution.output),
         "file_edit" => {
-            let mut summary = summarize_file_edit_output(&execution.output);
-            if let Some(diff) = file_edit_display_diff(call) {
-                summary.push('\n');
-                summary.push_str(&diff);
-            }
-            summary
+            let (base, verify) = split_verify_section(&execution.output);
+            compose_mutation_summary(
+                summarize_file_edit_output(base),
+                verify,
+                file_edit_display_diff(call),
+            )
         }
         "file_patch" => {
-            let mut summary = summarize_file_patch_output(&execution.output);
-            if let Some(diff) = file_patch_display_diff(call) {
-                summary.push('\n');
-                summary.push_str(&diff);
-            }
-            summary
+            let (base, verify) = split_verify_section(&execution.output);
+            compose_mutation_summary(
+                summarize_file_patch_output(base),
+                verify,
+                file_patch_display_diff(call),
+            )
         }
         "workflow_run" => execution
             .output
@@ -1142,6 +1194,37 @@ pub(crate) fn summarize_tool_result(call: &ToolCall, execution: &ToolExecution) 
         "question" => execution.output.clone(),
         _ => compact(&execution.output, 500),
     }
+}
+
+/// Transcript layout for a mutation: verify status rides the headline,
+/// failure details come before the diff (breakage first), diff last.
+fn compose_mutation_summary(
+    base_summary: String,
+    verify: Option<&str>,
+    diff: Option<String>,
+) -> String {
+    let mut summary = base_summary;
+    let mut details = None;
+    if let Some(block) = verify {
+        let mut lines = block.lines();
+        if let Some(status) = lines.next() {
+            summary.push_str(" · ");
+            summary.push_str(status);
+        }
+        let rest = lines.collect::<Vec<_>>().join("\n");
+        if !rest.trim().is_empty() {
+            details = Some(rest);
+        }
+    }
+    if let Some(details) = details {
+        summary.push('\n');
+        summary.push_str(&details);
+    }
+    if let Some(diff) = diff {
+        summary.push('\n');
+        summary.push_str(&diff);
+    }
+    summary
 }
 
 fn summarize_file_edit_output(output: &str) -> String {
