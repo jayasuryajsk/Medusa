@@ -7203,7 +7203,7 @@ impl App {
             .split(area);
         let columns = Layout::default()
             .direction(Direction::Horizontal)
-            .constraints([Constraint::Min(56), Constraint::Length(36)])
+            .constraints([Constraint::Min(40), Constraint::Length(52)])
             .split(sections[0]);
         let (state_label, state_style) = self.header_state();
         let session = self
@@ -7229,9 +7229,19 @@ impl App {
         // Left side: state + workspace
         frame.render_widget(left, columns[0]);
 
-        // Right side: perm / git / session info
+        // Right side: model · effort / perm / git / session info
         {
             let mut right_spans = vec![];
+            right_spans.push(Span::styled(
+                self.model.model_name().to_string(),
+                tool_label_style().add_modifier(Modifier::BOLD),
+            ));
+            // Reasoning effort rides alongside the model; "none" means disabled.
+            let effort = self.model.reasoning_effort();
+            if !effort.is_empty() {
+                right_spans.push(Span::styled(format!(" {effort}"), accent()));
+            }
+            right_spans.push(Span::styled("  ", muted()));
             right_spans.push(Span::styled("perm ", muted()));
             right_spans.push(Span::styled(self.permission_mode.name(), value_style()));
             right_spans.push(Span::styled("  ", muted()));
@@ -14887,6 +14897,42 @@ mod tests {
         assert_eq!(app.active_modal, Some(Modal::Models));
         assert_eq!(app.input, "");
         assert_eq!(app.status_line, "models opened");
+    }
+
+    #[test]
+    fn header_shows_current_model_and_reasoning_effort() {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let (mut app, _workspace) = app_in_workspace();
+        app.model.set_model_name("gpt-5.6-sol");
+        app.model.set_reasoning_effort("high");
+
+        let mut terminal = Terminal::new(TestBackend::new(120, 2)).unwrap();
+        terminal
+            .draw(|frame| app.draw_header(frame, frame.area()))
+            .unwrap();
+        let rendered = buffer_text(terminal.backend().buffer());
+
+        assert!(
+            rendered.contains("gpt-5.6-sol"),
+            "header should show the model: {rendered:?}"
+        );
+        assert!(
+            rendered.contains("high"),
+            "header should show the reasoning effort: {rendered:?}"
+        );
+    }
+
+    fn buffer_text(buffer: &ratatui::buffer::Buffer) -> String {
+        let area = buffer.area();
+        let mut out = String::new();
+        for y in 0..area.height {
+            for x in 0..area.width {
+                out.push_str(buffer[(x, y)].symbol());
+            }
+            out.push('\n');
+        }
+        out
     }
 
     #[test]
