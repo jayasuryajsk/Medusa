@@ -117,7 +117,9 @@ fn auth_file_path() -> PathBuf {
     codex_home().join("auth.json")
 }
 
-fn codex_home() -> PathBuf {
+/// The Codex home directory (`$CODEX_HOME`, else `~/.codex`). Shared with the
+/// model catalog, which reads Codex's cached backend model list from here.
+pub fn codex_home() -> PathBuf {
     std::env::var_os("CODEX_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".codex")))

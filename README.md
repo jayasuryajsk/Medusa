@@ -175,7 +175,7 @@ In the composer:
 |---|---|
 | `/help` | List all commands |
 | `/plan` | Toggle plan mode (explore & propose before editing) |
-| `/model` | Switch the model |
+| `/model` | Switch the model (list populated live from the Codex backend) |
 | `/permissions` | Change permission mode (open / guarded / readonly) |
 | `/theme` | Cycle color themes (`medusa`, `opencode`, `tokyonight`, `catppuccin`, …) |
 | `/workflow <script> [args]` | Run a `.medusa/workflows/*.js` workflow |

@@ -7,6 +7,7 @@ pub mod harness;
 pub mod hooks;
 pub mod mcp;
 pub mod model;
+pub mod models;
 pub mod permissions;
 mod proc;
 pub mod project;

@@ -1327,16 +1327,40 @@ fn theme_at_offset(theme: ThemeKind, offset: isize) -> ThemeKind {
     themes[next]
 }
 
+/// Selectable model slugs. Primary source is Codex's own backend model cache
+/// (`~/.codex/models_cache.json`), so the picker reflects exactly what the
+/// account can use — new models appear with no code change. Falls back to a
+/// built-in list when the cache is absent (non-Codex provider / fresh install).
+/// The current model is always present, pinned first if the source omits it.
 fn model_choices(current: &str) -> Vec<String> {
-    let mut choices = DEFAULT_MODEL_CHOICES
-        .iter()
-        .map(|model| (*model).to_string())
-        .collect::<Vec<_>>();
+    let mut choices = medusa_core::models::codex_backend_models()
+        .map(|models| {
+            models
+                .into_iter()
+                .map(|model| model.slug)
+                .collect::<Vec<_>>()
+        })
+        .filter(|slugs: &Vec<String>| !slugs.is_empty())
+        .unwrap_or_else(|| {
+            DEFAULT_MODEL_CHOICES
+                .iter()
+                .map(|model| (*model).to_string())
+                .collect()
+        });
     let current = current.trim();
     if !current.is_empty() && !choices.iter().any(|model| model == current) {
         choices.insert(0, current.to_string());
     }
     choices
+}
+
+/// Display label + optional description for a model slug, from the Codex
+/// backend cache. Unknown slugs (custom/env-set models) render as the slug.
+fn model_display(slug: &str) -> (String, Option<String>) {
+    medusa_core::models::codex_backend_models()
+        .and_then(|models| models.into_iter().find(|model| model.slug == slug))
+        .map(|model| (model.display_name, model.description))
+        .unwrap_or_else(|| (slug.to_string(), None))
 }
 
 fn model_index(current: &str) -> usize {
@@ -8577,13 +8601,19 @@ impl App {
             .iter()
             .map(|model| {
                 let active = model == self.model.model_name();
-                ListItem::new(Line::from(vec![
+                let (label, _) = model_display(model);
+                let mut spans = vec![
                     Span::styled(
                         if active { "● " } else { "  " },
                         if active { success_style() } else { muted() },
                     ),
-                    Span::styled(model.clone(), value_style()),
-                ]))
+                    Span::styled(label.clone(), value_style()),
+                ];
+                // Show the wire slug beside a friendlier display name.
+                if label != *model {
+                    spans.push(Span::styled(format!("  {model}"), muted()));
+                }
+                ListItem::new(Line::from(spans))
             })
             .collect::<Vec<_>>();
         let mut state = ListState::default().with_selected(Some(self.model_selection));
@@ -12975,16 +13005,28 @@ fn theme_preview_lines(theme: ThemeKind) -> Vec<Line<'static>> {
 
 fn model_detail_lines(selected: &str, active: &str) -> Vec<Line<'static>> {
     let is_active = selected == active;
-    vec![
-        Line::from(vec![
-            Span::styled(selected.to_string(), prompt_style()),
-            Span::styled("  ", muted()),
-            Span::styled(
-                if is_active { "active" } else { "ready to save" },
-                if is_active { success_style() } else { muted() },
-            ),
-        ]),
-        Line::from(""),
+    let (display_name, description) = model_display(selected);
+    let mut lines = vec![Line::from(vec![
+        Span::styled(
+            display_name.clone(),
+            prompt_style().add_modifier(Modifier::BOLD),
+        ),
+        Span::styled("  ", muted()),
+        Span::styled(
+            if is_active { "active" } else { "ready to save" },
+            if is_active { success_style() } else { muted() },
+        ),
+    ])];
+    if display_name != selected {
+        lines.push(Line::from(Span::styled(selected.to_string(), muted())));
+    }
+    lines.push(Line::from(""));
+    // Backend-provided description, when the Codex model cache has one.
+    if let Some(description) = description {
+        lines.push(Line::from(Span::styled(description, value_style())));
+        lines.push(Line::from(""));
+    }
+    lines.extend([
         Line::from(Span::styled(
             "The selected model is used for new Medusa turns. Active streams keep the model they started with.",
             value_style(),
@@ -13013,7 +13055,8 @@ fn model_detail_lines(selected: &str, active: &str) -> Vec<Line<'static>> {
             Span::styled("custom  ", muted()),
             Span::styled("/model <provider-model-id>", prompt_style()),
         ]),
-    ]
+    ]);
+    lines
 }
 
 fn model_backend_hint(model: &str) -> &'static str {
