@@ -176,6 +176,7 @@ In the composer:
 | `/help` | List all commands |
 | `/plan` | Toggle plan mode (explore & propose before editing) |
 | `/model` | Switch the model (list populated live from the Codex backend) |
+| `/reasoning` | Set thinking effort (`low`…`xhigh`, choices per model) |
 | `/permissions` | Change permission mode (open / guarded / readonly) |
 | `/theme` | Cycle color themes (`medusa`, `opencode`, `tokyonight`, `catppuccin`, …) |
 | `/workflow <script> [args]` | Run a `.medusa/workflows/*.js` workflow |
@@ -290,7 +291,7 @@ Selected environment variables:
 |---|---|
 | `MEDUSA_MODEL` | Override the model |
 | `MEDUSA_PROVIDER` | `codex` (default), `openai-compatible`, or `deepseek` |
-| `MEDUSA_REASONING_EFFORT` | `none` / `low` / `medium` / `high` |
+| `MEDUSA_REASONING_EFFORT` | Startup thinking effort (`none`/`low`/`medium`/`high`/`xhigh`); overrides the saved `/reasoning` choice |
 | `MEDUSA_CONTEXT_MAX_TOKENS` | Context budget before compaction (default 60k) |
 | `MEDUSA_VERIFY` | `off` disables post-edit verification |
 | `MEDUSA_VERIFY_TIMEOUT_SECS` | Verification command timeout (default 90) |

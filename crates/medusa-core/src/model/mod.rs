@@ -135,6 +135,14 @@ impl DirectCodexBackend {
         }
     }
 
+    pub fn reasoning_effort(&self) -> &str {
+        &self.reasoning_effort
+    }
+
+    pub fn set_reasoning_effort(&mut self, effort: impl Into<String>) {
+        self.reasoning_effort = effort.into().trim().to_string();
+    }
+
     fn set_provider(&mut self, provider: types::ModelProvider) {
         self.provider = provider;
         self.chat_base_url = provider.base_url();

@@ -27,6 +27,39 @@ pub struct ModelInfo {
     pub description: Option<String>,
     /// The backend's default reasoning effort for this model, when given.
     pub default_reasoning: Option<String>,
+    /// Reasoning efforts this model accepts, in the backend's order.
+    pub reasoning_levels: Vec<ReasoningLevel>,
+}
+
+/// A selectable reasoning effort for a model, with the backend's description.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReasoningLevel {
+    /// Wire value sent as `reasoning.effort`, e.g. `medium`, `xhigh`.
+    pub effort: String,
+    /// One-line description from the backend, when provided.
+    pub description: Option<String>,
+}
+
+/// Standard reasoning efforts, used when a model has no backend-provided list
+/// (non-Codex providers, missing cache). `none` disables reasoning.
+pub const DEFAULT_REASONING_EFFORTS: &[&str] = &["none", "low", "medium", "high", "xhigh"];
+
+/// The reasoning efforts selectable for a model slug: the backend's per-model
+/// list when known, else the standard defaults. Always non-empty.
+pub fn reasoning_efforts_for(slug: &str) -> Vec<ReasoningLevel> {
+    codex_backend_models()
+        .and_then(|models| models.into_iter().find(|model| model.slug == slug))
+        .map(|model| model.reasoning_levels)
+        .filter(|levels| !levels.is_empty())
+        .unwrap_or_else(|| {
+            DEFAULT_REASONING_EFFORTS
+                .iter()
+                .map(|effort| ReasoningLevel {
+                    effort: (*effort).to_string(),
+                    description: None,
+                })
+                .collect()
+        })
 }
 
 #[derive(Debug, Deserialize)]
@@ -54,6 +87,15 @@ struct CachedModel {
     /// Backend-provided sort order (lower = higher priority).
     #[serde(default)]
     priority: i64,
+    #[serde(default)]
+    supported_reasoning_levels: Vec<CachedReasoningLevel>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CachedReasoningLevel {
+    effort: String,
+    #[serde(default)]
+    description: Option<String>,
 }
 
 fn default_true() -> bool {
@@ -107,6 +149,15 @@ fn parse_codex_models(raw: &str) -> Option<Vec<ModelInfo>> {
                     default_reasoning: model
                         .default_reasoning_level
                         .filter(|text| !text.trim().is_empty()),
+                    reasoning_levels: model
+                        .supported_reasoning_levels
+                        .into_iter()
+                        .filter(|level| !level.effort.trim().is_empty())
+                        .map(|level| ReasoningLevel {
+                            effort: level.effort,
+                            description: level.description.filter(|text| !text.trim().is_empty()),
+                        })
+                        .collect(),
                 },
             )
         })
@@ -129,7 +180,8 @@ mod tests {
     const SAMPLE: &str = r#"{
         "fetched_at": "2026-07-11T04:40:46Z",
         "models": [
-            {"slug":"gpt-5.5","display_name":"GPT-5.5","description":"Frontier model.","default_reasoning_level":"medium","visibility":"list","supported_in_api":true,"priority":0},
+            {"slug":"gpt-5.5","display_name":"GPT-5.5","description":"Frontier model.","default_reasoning_level":"medium","visibility":"list","supported_in_api":true,"priority":0,
+             "supported_reasoning_levels":[{"effort":"low","description":"Fast"},{"effort":"medium"},{"effort":"high"},{"effort":"xhigh"}]},
             {"slug":"gpt-5.6-sol","display_name":"GPT-5.6-Sol","description":"Latest.","default_reasoning_level":"medium","visibility":"list","supported_in_api":true,"priority":1},
             {"slug":"gpt-5.3-codex-spark","display_name":"Spark","visibility":"list","supported_in_api":false,"priority":26},
             {"slug":"codex-auto-review","display_name":"Auto Review","visibility":"hide","supported_in_api":true,"priority":43}
@@ -145,6 +197,34 @@ mod tests {
         assert_eq!(models[1].display_name, "GPT-5.6-Sol");
         assert_eq!(models[0].description.as_deref(), Some("Frontier model."));
         assert_eq!(models[0].default_reasoning.as_deref(), Some("medium"));
+    }
+
+    #[test]
+    fn parses_supported_reasoning_levels_with_descriptions() {
+        let models = parse_codex_models(SAMPLE).unwrap();
+        let gpt55 = models.iter().find(|m| m.slug == "gpt-5.5").unwrap();
+        let efforts: Vec<&str> = gpt55
+            .reasoning_levels
+            .iter()
+            .map(|l| l.effort.as_str())
+            .collect();
+        assert_eq!(efforts, vec!["low", "medium", "high", "xhigh"]);
+        assert_eq!(
+            gpt55.reasoning_levels[0].description.as_deref(),
+            Some("Fast")
+        );
+        assert!(gpt55.reasoning_levels[1].description.is_none());
+        // A model with no listed levels reports an empty vec.
+        let sol = models.iter().find(|m| m.slug == "gpt-5.6-sol").unwrap();
+        assert!(sol.reasoning_levels.is_empty());
+    }
+
+    #[test]
+    fn reasoning_efforts_fall_back_to_defaults_for_unknown_slug() {
+        // No cache on the test path -> defaults. Always non-empty, includes none.
+        let levels = reasoning_efforts_for("totally-unknown-model");
+        assert!(levels.iter().any(|l| l.effort == "medium"));
+        assert!(levels.iter().any(|l| l.effort == "none"));
     }
 
     #[test]

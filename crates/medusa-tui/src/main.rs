@@ -498,6 +498,8 @@ struct AppSettings {
     permission_mode: Option<String>,
     #[serde(default)]
     bell: Option<bool>,
+    #[serde(default)]
+    reasoning_effort: Option<String>,
 }
 
 impl AppSettings {
@@ -510,6 +512,14 @@ impl AppSettings {
             .as_deref()
             .map(str::trim)
             .filter(|model| !model.is_empty())
+            .map(ToString::to_string)
+    }
+
+    fn reasoning_effort(&self) -> Option<String> {
+        self.reasoning_effort
+            .as_deref()
+            .map(str::trim)
+            .filter(|effort| !effort.is_empty())
             .map(ToString::to_string)
     }
 
@@ -556,6 +566,12 @@ fn save_theme_preference(workspace: &Path, theme: ThemeKind) -> Result<()> {
 fn save_model_preference(workspace: &Path, model: &str) -> Result<()> {
     let mut settings = load_app_settings(workspace).unwrap_or_default();
     settings.model = Some(model.trim().to_string());
+    save_app_settings(workspace, &settings)
+}
+
+fn save_reasoning_preference(workspace: &Path, effort: &str) -> Result<()> {
+    let mut settings = load_app_settings(workspace).unwrap_or_default();
+    settings.reasoning_effort = Some(effort.trim().to_string());
     save_app_settings(workspace, &settings)
 }
 
@@ -688,6 +704,7 @@ struct App {
     bell_setting: bool,
     settings_selection: usize,
     model_selection: usize,
+    reasoning_selection: usize,
     permission_selection: usize,
     theme_selection: usize,
     image_preview_index: usize,
@@ -1370,6 +1387,35 @@ fn model_index(current: &str) -> usize {
         .unwrap_or(0)
 }
 
+/// Reasoning efforts selectable for `model`: the backend's per-model list when
+/// known, else standard defaults. The active effort is always present.
+fn reasoning_choices(model: &str, current: &str) -> Vec<String> {
+    let mut choices = medusa_core::models::reasoning_efforts_for(model)
+        .into_iter()
+        .map(|level| level.effort)
+        .collect::<Vec<_>>();
+    let current = current.trim();
+    if !current.is_empty() && !choices.iter().any(|effort| effort == current) {
+        choices.push(current.to_string());
+    }
+    choices
+}
+
+fn reasoning_index(model: &str, current: &str) -> usize {
+    reasoning_choices(model, current)
+        .iter()
+        .position(|effort| effort == current)
+        .unwrap_or(0)
+}
+
+/// Backend description for a reasoning effort of a model, when the cache has one.
+fn reasoning_description(model: &str, effort: &str) -> Option<String> {
+    medusa_core::models::reasoning_efforts_for(model)
+        .into_iter()
+        .find(|level| level.effort == effort)
+        .and_then(|level| level.description)
+}
+
 fn permission_mode_index(mode: PermissionMode) -> usize {
     PermissionMode::all()
         .iter()
@@ -1424,6 +1470,7 @@ enum Modal {
     Sessions,
     SessionTree,
     Models,
+    Reasoning,
     Permissions,
     Themes,
     Rewind,
@@ -1970,6 +2017,12 @@ impl App {
         {
             model.set_model_name(model_name);
         }
+        // Env override wins for one-off launches; else the saved preference.
+        if env::var_os("MEDUSA_REASONING_EFFORT").is_none()
+            && let Some(effort) = app_settings.reasoning_effort()
+        {
+            model.set_reasoning_effort(effort);
+        }
         let cwd_display = abbreviate_home(&tools.workspace().to_string_lossy());
         let inside_git_repo = Path::new(".git").exists();
         let theme = ThemeKind::from_workspace_settings(tools.workspace());
@@ -2052,6 +2105,7 @@ impl App {
             bell_setting: app_settings.bell.unwrap_or(true),
             settings_selection: 0,
             model_selection: 0,
+            reasoning_selection: 0,
             permission_selection: permission_mode_index(permission_mode),
             theme_selection: theme_index(theme),
             image_preview_index: 0,
@@ -2327,6 +2381,29 @@ impl App {
                             .saturating_sub(1);
                     }
                     KeyCode::Enter => self.accept_model_selection(),
+                    _ => {}
+                }
+                return;
+            }
+
+            if self.active_modal == Some(Modal::Reasoning) {
+                match key.code {
+                    KeyCode::Esc => self.close_modal(),
+                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        self.should_quit = true;
+                    }
+                    KeyCode::Up | KeyCode::BackTab => self.move_reasoning_selection_up(),
+                    KeyCode::Down | KeyCode::Tab => self.move_reasoning_selection_down(),
+                    KeyCode::Home => self.reasoning_selection = 0,
+                    KeyCode::End => {
+                        self.reasoning_selection = reasoning_choices(
+                            self.model.model_name(),
+                            self.model.reasoning_effort(),
+                        )
+                        .len()
+                        .saturating_sub(1);
+                    }
+                    KeyCode::Enter => self.accept_reasoning_selection(),
                     _ => {}
                 }
                 return;
@@ -3140,7 +3217,10 @@ impl App {
         // Typing a command out in full and hitting Enter runs it as typed
         // instead of re-completing it into the composer.
         if self.input.trim() == command.name
-            && !matches!(command.name, "/theme" | "/model" | "/permissions")
+            && !matches!(
+                command.name,
+                "/theme" | "/model" | "/reasoning" | "/permissions"
+            )
         {
             self.submit_input();
             return;
@@ -3154,6 +3234,10 @@ impl App {
             self.input.clear();
             self.input_cursor = 0;
             self.open_models_modal();
+        } else if command.name == "/reasoning" {
+            self.input.clear();
+            self.input_cursor = 0;
+            self.open_reasoning_modal();
         } else if command.name == "/permissions" {
             self.input.clear();
             self.input_cursor = 0;
@@ -3330,6 +3414,13 @@ impl App {
         self.status_line = "models opened".to_string();
     }
 
+    fn open_reasoning_modal(&mut self) {
+        self.active_modal = Some(Modal::Reasoning);
+        self.reasoning_selection =
+            reasoning_index(self.model.model_name(), self.model.reasoning_effort());
+        self.status_line = "reasoning effort opened".to_string();
+    }
+
     fn open_permissions_modal(&mut self) {
         self.active_modal = Some(Modal::Permissions);
         self.permission_selection = permission_mode_index(self.permission_mode);
@@ -3429,6 +3520,43 @@ impl App {
             return;
         };
         self.set_model_name(&model);
+        self.active_modal = None;
+    }
+
+    fn move_reasoning_selection_up(&mut self) {
+        let count = reasoning_choices(self.model.model_name(), self.model.reasoning_effort()).len();
+        if count == 0 {
+            return;
+        }
+        self.reasoning_selection = if self.reasoning_selection == 0 {
+            count - 1
+        } else {
+            self.reasoning_selection - 1
+        };
+        self.status_line = "reasoning selection".to_string();
+    }
+
+    fn move_reasoning_selection_down(&mut self) {
+        let count = reasoning_choices(self.model.model_name(), self.model.reasoning_effort()).len();
+        if count == 0 {
+            return;
+        }
+        self.reasoning_selection = (self.reasoning_selection + 1) % count;
+        self.status_line = "reasoning selection".to_string();
+    }
+
+    fn accept_reasoning_selection(&mut self) {
+        let choices = reasoning_choices(self.model.model_name(), self.model.reasoning_effort());
+        let Some(effort) = choices
+            .get(
+                self.reasoning_selection
+                    .min(choices.len().saturating_sub(1)),
+            )
+            .cloned()
+        else {
+            return;
+        };
+        self.set_reasoning_effort(&effort);
         self.active_modal = None;
     }
 
@@ -4586,6 +4714,20 @@ impl App {
             return true;
         }
 
+        if task == "/reasoning" || task == "/effort" || task == "/think" {
+            self.open_reasoning_modal();
+            return true;
+        }
+
+        if let Some(effort) = task
+            .strip_prefix("/reasoning ")
+            .or_else(|| task.strip_prefix("/effort "))
+            .or_else(|| task.strip_prefix("/think "))
+        {
+            self.set_reasoning_effort(effort);
+            return true;
+        }
+
         if task == "/permissions" || task == "/permission" {
             self.open_permissions_modal();
             return true;
@@ -4806,6 +4948,27 @@ impl App {
         match save_model_preference(self.tools.workspace(), model) {
             Ok(()) => self.toast(format!("Model set to {model}"), ToastKind::Success),
             Err(error) => self.toast(format!("Model set, save failed: {error}"), ToastKind::Error),
+        }
+    }
+
+    fn set_reasoning_effort(&mut self, effort: &str) {
+        let effort = effort.trim();
+        if effort.is_empty() {
+            self.toast("Reasoning effort cannot be empty", ToastKind::Error);
+            return;
+        }
+        self.model.set_reasoning_effort(effort.to_string());
+        self.reasoning_selection = reasoning_index(self.model.model_name(), effort);
+        self.status_line = format!("reasoning: {effort}");
+        match save_reasoning_preference(self.tools.workspace(), effort) {
+            Ok(()) => self.toast(
+                format!("Reasoning effort set to {effort}"),
+                ToastKind::Success,
+            ),
+            Err(error) => self.toast(
+                format!("Effort set, save failed: {error}"),
+                ToastKind::Error,
+            ),
         }
     }
 
@@ -7863,7 +8026,7 @@ impl App {
             Modal::Jobs => 16,
             Modal::Sessions => 14,
             Modal::SessionTree => 18,
-            Modal::Models | Modal::Permissions => 16,
+            Modal::Models | Modal::Reasoning | Modal::Permissions => 16,
             Modal::Themes => 18,
             Modal::Rewind => 16,
             Modal::EditMessage => 18,
@@ -7885,6 +8048,7 @@ impl App {
             Modal::Sessions => self.draw_sessions_modal(frame, popup),
             Modal::SessionTree => self.draw_session_tree_modal(frame, popup),
             Modal::Models => self.draw_models_modal(frame, popup),
+            Modal::Reasoning => self.draw_reasoning_modal(frame, popup),
             Modal::Permissions => self.draw_permissions_modal(frame, popup),
             Modal::Themes => self.draw_themes_modal(frame, popup),
             Modal::Rewind => self.draw_rewind_modal(frame, popup),
@@ -8628,6 +8792,93 @@ impl App {
             .map(String::as_str)
             .unwrap_or(self.model.model_name());
         let detail = Paragraph::new(model_detail_lines(selected, self.model.model_name()))
+            .style(Style::default().bg(surface()).fg(text()))
+            .wrap(Wrap { trim: true });
+        frame.render_widget(detail, columns[1]);
+
+        let footer = Paragraph::new(Line::from(vec![
+            Span::styled("↑/↓ tab", prompt_style()),
+            Span::styled(" choose  ", muted()),
+            Span::styled("enter", prompt_style()),
+            Span::styled(" save  ", muted()),
+            Span::styled("esc", prompt_style()),
+            Span::styled(" close", muted()),
+        ]))
+        .alignment(Alignment::Right)
+        .style(Style::default().bg(surface()));
+        frame.render_widget(footer, sections[2]);
+    }
+
+    fn draw_reasoning_modal(&self, frame: &mut Frame<'_>, area: Rect) {
+        frame.render_widget(
+            modal_block(" Reasoning effort ")
+                .border_type(BorderType::Rounded)
+                .padding(Padding::new(2, 2, 0, 0)),
+            area,
+        );
+        let inner = area.inner(Margin {
+            horizontal: 3,
+            vertical: 1,
+        });
+        let sections = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(2),
+                Constraint::Min(5),
+                Constraint::Length(1),
+            ])
+            .split(inner);
+        let columns = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Length(22), Constraint::Min(34)])
+            .split(sections[1]);
+
+        let model = self.model.model_name().to_string();
+        let active = self.model.reasoning_effort().to_string();
+        let (model_label, _) = model_display(&model);
+        let header = Paragraph::new(vec![
+            Line::from(vec![
+                Span::styled("Reasoning effort", accent().add_modifier(Modifier::BOLD)),
+                Span::styled("  for ", muted()),
+                Span::styled(model_label, prompt_style()),
+            ]),
+            Line::from(Span::styled(
+                "higher effort = deeper thinking, slower + more tokens",
+                muted(),
+            )),
+        ])
+        .style(Style::default().bg(surface()).fg(text()));
+        frame.render_widget(header, sections[0]);
+
+        let choices = reasoning_choices(&model, &active);
+        let rows = choices
+            .iter()
+            .map(|effort| {
+                let is_active = *effort == active;
+                ListItem::new(Line::from(vec![
+                    Span::styled(
+                        if is_active { "● " } else { "  " },
+                        if is_active { success_style() } else { muted() },
+                    ),
+                    Span::styled(effort.clone(), value_style()),
+                ]))
+            })
+            .collect::<Vec<_>>();
+        let mut state = ListState::default().with_selected(Some(self.reasoning_selection));
+        let list = List::new(rows)
+            .style(Style::default().bg(surface()).fg(text()))
+            .highlight_style(command_selected_style())
+            .highlight_symbol("▌ ");
+        frame.render_stateful_widget(list, columns[0], &mut state);
+
+        let selected = choices
+            .get(
+                self.reasoning_selection
+                    .min(choices.len().saturating_sub(1)),
+            )
+            .map(String::as_str)
+            .unwrap_or(active.as_str());
+        let detail = Paragraph::new(reasoning_detail_lines(&model, selected, &active))
             .style(Style::default().bg(surface()).fg(text()))
             .wrap(Wrap { trim: true });
         frame.render_widget(detail, columns[1]);
@@ -9687,6 +9938,12 @@ const SLASH_COMMANDS: &[SlashCommand] = &[
         args: "<name>",
         category: "model",
         description: "Change the model used for new turns",
+    },
+    SlashCommand {
+        name: "/reasoning",
+        args: "[effort]",
+        category: "model",
+        description: "Set the reasoning/thinking effort (low…xhigh, model-specific)",
     },
     SlashCommand {
         name: "/permissions",
@@ -13055,6 +13312,49 @@ fn model_detail_lines(selected: &str, active: &str) -> Vec<Line<'static>> {
             Span::styled("custom  ", muted()),
             Span::styled("/model <provider-model-id>", prompt_style()),
         ]),
+        Line::from(vec![
+            Span::styled("effort  ", muted()),
+            Span::styled("/reasoning", prompt_style()),
+            Span::styled(" sets thinking depth", muted()),
+        ]),
+    ]);
+    lines
+}
+
+fn reasoning_detail_lines(model: &str, selected: &str, active: &str) -> Vec<Line<'static>> {
+    let is_active = selected == active;
+    let mut lines = vec![Line::from(vec![
+        Span::styled(
+            selected.to_string(),
+            prompt_style().add_modifier(Modifier::BOLD),
+        ),
+        Span::styled("  ", muted()),
+        Span::styled(
+            if is_active { "active" } else { "ready to save" },
+            if is_active { success_style() } else { muted() },
+        ),
+    ])];
+    lines.push(Line::from(""));
+    // Backend-provided description for this effort, when the model cache has one.
+    if let Some(description) = reasoning_description(model, selected) {
+        lines.push(Line::from(Span::styled(description, value_style())));
+        lines.push(Line::from(""));
+    }
+    lines.extend([
+        Line::from(Span::styled(
+            "Applies to new turns; active streams keep the effort they started with.",
+            value_style(),
+        )),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("override  ", muted()),
+            Span::styled("MEDUSA_REASONING_EFFORT", value_style()),
+            Span::styled(" wins for one-off launches", muted()),
+        ]),
+        Line::from(vec![
+            Span::styled("none  ", muted()),
+            Span::styled("disables reasoning entirely", value_style()),
+        ]),
     ]);
     lines
 }
@@ -14587,6 +14887,52 @@ mod tests {
         assert_eq!(app.active_modal, Some(Modal::Models));
         assert_eq!(app.input, "");
         assert_eq!(app.status_line, "models opened");
+    }
+
+    #[test]
+    fn reasoning_command_sets_effort_and_persists_setting() {
+        let (mut app, workspace) = app_in_workspace();
+
+        app.input = "/reasoning high".to_string();
+        app.input_cursor = app.input_len();
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert_eq!(app.model.reasoning_effort(), "high");
+        assert_eq!(app.status_line, "reasoning: high");
+        let settings = load_app_settings(&workspace).unwrap();
+        assert_eq!(settings.reasoning_effort(), Some("high".to_string()));
+    }
+
+    #[test]
+    fn reasoning_command_opens_picker_and_enter_saves_selection() {
+        let (mut app, _workspace) = app_in_workspace();
+
+        app.input = "/reasoning".to_string();
+        app.input_cursor = app.input_len();
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.active_modal, Some(Modal::Reasoning));
+
+        // The picker is seeded to the active effort; moving + Enter applies a
+        // different one and closes.
+        let before = app.model.reasoning_effort().to_string();
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.active_modal, None);
+        assert_ne!(app.model.reasoning_effort(), before);
+    }
+
+    #[test]
+    fn reasoning_effort_preference_round_trips_through_settings() {
+        let workspace = temp_workspace();
+        save_reasoning_preference(&workspace, "xhigh").unwrap();
+        let settings = load_app_settings(&workspace).unwrap();
+        assert_eq!(settings.reasoning_effort(), Some("xhigh".to_string()));
+        // Blank/whitespace is normalized away so the backend default applies.
+        save_reasoning_preference(&workspace, "   ").unwrap();
+        assert_eq!(
+            load_app_settings(&workspace).unwrap().reasoning_effort(),
+            None
+        );
     }
 
     #[test]
