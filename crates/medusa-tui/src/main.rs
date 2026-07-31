@@ -11613,10 +11613,8 @@ fn input_display_lines(input: &str, cursor: usize, max_lines: usize) -> Vec<Line
                 }
             }
             current_line += 1;
-        } else {
-            if current_line >= visible_start_line {
-                current.push(Span::styled(ch.to_string(), value_style()));
-            }
+        } else if current_line >= visible_start_line {
+            current.push(Span::styled(ch.to_string(), value_style()));
         }
     }
 
