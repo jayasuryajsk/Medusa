@@ -8,23 +8,15 @@ activity, inline colored diffs, and a live plan strip above the composer.
 Built in Rust and distributed as a single binary. Guarded execution on Linux
 also requires `bubblewrap`.
 
-```
- MEDUSA   ● ready   workspace ~/code/myproject                   perm guarded  git
-─────────────────────────────────────────────────────────────────────────────────
- • read src/parser.rs, src/lexer.rs +3 more
-   ⎿ 5 files, 1.2k lines
- • edit src/parser.rs (1 replacement)
-   ⎿ - fn parse(&self) -> Ast {
-     + fn parse(&mut self) -> Result<Ast> {
+<p align="center">
+  <a href="docs/assets/medusa-demo.mp4">
+    <img src="docs/assets/medusa-demo.gif" alt="Medusa live theme, command, model, and reasoning controls in Ghostty" width="100%">
+  </a>
+</p>
 
- plan · 2/4 · Rework the parser
-   ✓ 2 done
-   ● Wire the new lexer in
-   · Run the full suite
- ╭─────────────────────────────────────────────────────────────────────────────╮
- │ █ Type a task or ask a question…                                             │
- ╰─────────────────────────────────────────────────────────────────────────────╯
-```
+<p align="center">
+  <sub>Live theme preview, command palette, and model/reasoning selection in Ghostty. <a href="docs/assets/medusa-terminal.png">Static preview</a> · <a href="docs/assets/medusa-demo.mp4">Full-quality video</a></sub>
+</p>
 
 ## Features
 
