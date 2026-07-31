@@ -183,7 +183,7 @@ In the composer:
 |---|---|
 | `/help` | List all commands |
 | `/plan` | Toggle plan mode (explore & propose before editing) |
-| `/model` | Switch the model (list populated live from the Codex backend) |
+| `/model` | Choose the model and reasoning effort (model list populated live from the Codex backend) |
 | `/reasoning` | Set thinking effort (`low`…`xhigh`, choices per model) |
 | `/permissions` | Change permission mode (open / guarded / readonly) |
 | `/theme` | Cycle color themes (`medusa`, `opencode`, `tokyonight`, `catppuccin`, …) |

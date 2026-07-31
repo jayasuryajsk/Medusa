@@ -597,6 +597,13 @@ fn save_reasoning_preference(workspace: &Path, effort: &str) -> Result<()> {
     save_app_settings(workspace, &settings)
 }
 
+fn save_model_picker_preferences(workspace: &Path, model: &str, effort: &str) -> Result<()> {
+    let mut settings = load_app_settings(workspace).unwrap_or_default();
+    settings.model = Some(model.trim().to_string());
+    settings.reasoning_effort = Some(effort.trim().to_string());
+    save_app_settings(workspace, &settings)
+}
+
 fn save_permission_mode_preference(workspace: &Path, mode: PermissionMode) -> Result<()> {
     let mut settings = load_app_settings(workspace).unwrap_or_default();
     settings.permission_mode = Some(mode.name().to_string());
@@ -727,6 +734,7 @@ struct App {
     settings_selection: usize,
     model_selection: usize,
     reasoning_selection: usize,
+    model_picker_pane: ModelPickerPane,
     permission_selection: usize,
     theme_selection: usize,
     image_preview_index: usize,
@@ -1409,6 +1417,12 @@ fn model_index(current: &str) -> usize {
         .unwrap_or(0)
 }
 
+fn model_default_reasoning(model: &str) -> Option<String> {
+    medusa_core::models::codex_backend_models()
+        .and_then(|models| models.into_iter().find(|candidate| candidate.slug == model))
+        .and_then(|model| model.default_reasoning)
+}
+
 /// Reasoning efforts selectable for `model`: the backend's per-model list when
 /// known, else standard defaults. The active effort is always present.
 fn reasoning_choices(model: &str, current: &str) -> Vec<String> {
@@ -1428,6 +1442,24 @@ fn reasoning_index(model: &str, current: &str) -> usize {
         .iter()
         .position(|effort| effort == current)
         .unwrap_or(0)
+}
+
+fn preferred_reasoning_for_model(model: &str, preferred: &str) -> String {
+    let choices = reasoning_choices(model, "");
+    if choices.iter().any(|effort| effort == preferred) {
+        return preferred.to_string();
+    }
+    if let Some(default) = model_default_reasoning(model)
+        && choices.iter().any(|effort| effort == &default)
+    {
+        return default;
+    }
+    choices
+        .iter()
+        .find(|effort| effort.as_str() == "medium")
+        .or_else(|| choices.first())
+        .cloned()
+        .unwrap_or_else(|| "medium".to_string())
 }
 
 /// Backend description for a reasoning effort of a model, when the cache has one.
@@ -1541,6 +1573,12 @@ enum UiFocus {
     Activity,
     Modal,
     Transcript,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ModelPickerPane {
+    Models,
+    Reasoning,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2128,6 +2166,7 @@ impl App {
             settings_selection: 0,
             model_selection: 0,
             reasoning_selection: 0,
+            model_picker_pane: ModelPickerPane::Models,
             permission_selection: permission_mode_index(permission_mode),
             theme_selection: theme_index(theme),
             image_preview_index: 0,
@@ -2394,15 +2433,19 @@ impl App {
                     KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                         self.should_quit = true;
                     }
-                    KeyCode::Up | KeyCode::BackTab => self.move_model_selection_up(),
-                    KeyCode::Down | KeyCode::Tab => self.move_model_selection_down(),
-                    KeyCode::Home => self.model_selection = 0,
-                    KeyCode::End => {
-                        self.model_selection = model_choices(self.model.model_name())
-                            .len()
-                            .saturating_sub(1);
+                    KeyCode::Left | KeyCode::Char('h') | KeyCode::BackTab => {
+                        self.model_picker_pane = ModelPickerPane::Models;
+                        self.status_line = "choose model".to_string();
                     }
-                    KeyCode::Enter => self.accept_model_selection(),
+                    KeyCode::Right | KeyCode::Char('l') | KeyCode::Tab => {
+                        self.model_picker_pane = ModelPickerPane::Reasoning;
+                        self.status_line = "choose reasoning effort".to_string();
+                    }
+                    KeyCode::Up => self.move_model_picker_selection_up(),
+                    KeyCode::Down => self.move_model_picker_selection_down(),
+                    KeyCode::Home => self.move_model_picker_selection_home(),
+                    KeyCode::End => self.move_model_picker_selection_end(),
+                    KeyCode::Enter => self.accept_model_picker_selection(),
                     _ => {}
                 }
                 return;
@@ -3432,8 +3475,10 @@ impl App {
 
     fn open_models_modal(&mut self) {
         self.active_modal = Some(Modal::Models);
+        self.model_picker_pane = ModelPickerPane::Models;
         self.model_selection = model_index(self.model.model_name());
-        self.status_line = "models opened".to_string();
+        self.sync_model_picker_reasoning_selection();
+        self.status_line = "model and reasoning picker opened".to_string();
     }
 
     fn open_reasoning_modal(&mut self) {
@@ -3482,6 +3527,7 @@ impl App {
         let items = self.settings_items();
         match items.get(self.settings_selection).map(|item| item.key) {
             Some("model") => self.open_models_modal(),
+            Some("reasoning") => self.open_reasoning_modal(),
             Some("theme") => self.open_themes_modal(),
             Some("permissions") => self.open_permissions_modal(),
             Some("bell") => self.toggle_bell_setting(),
@@ -3521,7 +3567,8 @@ impl App {
         } else {
             self.model_selection - 1
         };
-        self.status_line = "model selection".to_string();
+        self.sync_model_picker_reasoning_selection();
+        self.status_line = "choose model".to_string();
     }
 
     fn move_model_selection_down(&mut self) {
@@ -3530,19 +3577,129 @@ impl App {
             return;
         }
         self.model_selection = (self.model_selection + 1) % count;
-        self.status_line = "model selection".to_string();
+        self.sync_model_picker_reasoning_selection();
+        self.status_line = "choose model".to_string();
     }
 
-    fn accept_model_selection(&mut self) {
+    fn selected_model_picker_model(&self) -> String {
         let choices = model_choices(self.model.model_name());
-        let Some(model) = choices
+        choices
             .get(self.model_selection.min(choices.len().saturating_sub(1)))
+            .cloned()
+            .unwrap_or_else(|| self.model.model_name().to_string())
+    }
+
+    fn model_picker_reasoning_choices(&self) -> Vec<String> {
+        reasoning_choices(&self.selected_model_picker_model(), "")
+    }
+
+    fn sync_model_picker_reasoning_selection(&mut self) {
+        let model = self.selected_model_picker_model();
+        let preferred = preferred_reasoning_for_model(&model, self.model.reasoning_effort());
+        let choices = reasoning_choices(&model, "");
+        self.reasoning_selection = choices
+            .iter()
+            .position(|effort| effort == &preferred)
+            .unwrap_or(0);
+    }
+
+    fn move_model_picker_selection_up(&mut self) {
+        match self.model_picker_pane {
+            ModelPickerPane::Models => self.move_model_selection_up(),
+            ModelPickerPane::Reasoning => {
+                let count = self.model_picker_reasoning_choices().len();
+                if count == 0 {
+                    return;
+                }
+                self.reasoning_selection = if self.reasoning_selection == 0 {
+                    count - 1
+                } else {
+                    self.reasoning_selection - 1
+                };
+                self.status_line = "choose reasoning effort".to_string();
+            }
+        }
+    }
+
+    fn move_model_picker_selection_down(&mut self) {
+        match self.model_picker_pane {
+            ModelPickerPane::Models => self.move_model_selection_down(),
+            ModelPickerPane::Reasoning => {
+                let count = self.model_picker_reasoning_choices().len();
+                if count == 0 {
+                    return;
+                }
+                self.reasoning_selection = (self.reasoning_selection + 1) % count;
+                self.status_line = "choose reasoning effort".to_string();
+            }
+        }
+    }
+
+    fn move_model_picker_selection_home(&mut self) {
+        match self.model_picker_pane {
+            ModelPickerPane::Models => {
+                self.model_selection = 0;
+                self.sync_model_picker_reasoning_selection();
+                self.status_line = "choose model".to_string();
+            }
+            ModelPickerPane::Reasoning => {
+                self.reasoning_selection = 0;
+                self.status_line = "choose reasoning effort".to_string();
+            }
+        }
+    }
+
+    fn move_model_picker_selection_end(&mut self) {
+        match self.model_picker_pane {
+            ModelPickerPane::Models => {
+                self.model_selection = model_choices(self.model.model_name())
+                    .len()
+                    .saturating_sub(1);
+                self.sync_model_picker_reasoning_selection();
+                self.status_line = "choose model".to_string();
+            }
+            ModelPickerPane::Reasoning => {
+                self.reasoning_selection = self
+                    .model_picker_reasoning_choices()
+                    .len()
+                    .saturating_sub(1);
+                self.status_line = "choose reasoning effort".to_string();
+            }
+        }
+    }
+
+    fn accept_model_picker_selection(&mut self) {
+        if self.model_picker_pane == ModelPickerPane::Models {
+            self.model_picker_pane = ModelPickerPane::Reasoning;
+            self.status_line = "choose reasoning effort".to_string();
+            return;
+        }
+
+        let model = self.selected_model_picker_model();
+        let choices = self.model_picker_reasoning_choices();
+        let Some(effort) = choices
+            .get(
+                self.reasoning_selection
+                    .min(choices.len().saturating_sub(1)),
+            )
             .cloned()
         else {
             return;
         };
-        self.set_model_name(&model);
+
+        self.model.set_model_name(model.clone());
+        self.model.set_reasoning_effort(effort.clone());
+        self.model_selection = model_index(&model);
+        self.reasoning_selection = reasoning_index(&model, &effort);
         self.active_modal = None;
+        self.status_line = format!("model: {model} · reasoning: {effort}");
+        match save_model_picker_preferences(self.tools.workspace(), &model, &effort) {
+            Ok(()) => self.toast(
+                format!("Model set to {model} · {effort}"),
+                ToastKind::Success,
+            ),
+            Err(error) => self.toast(format!("Model set, save failed: {error}"), ToastKind::Error),
+        }
     }
 
     fn move_reasoning_selection_up(&mut self) {
@@ -7619,7 +7776,7 @@ impl App {
                 Some(Modal::Themes) => "↑/↓ · enter · esc",
                 Some(Modal::Rewind) => "↑/↓ · enter · esc",
                 Some(Modal::EditMessage) => "↑/↓ · enter · esc",
-                Some(Modal::Models) => "↑/↓ · enter · esc",
+                Some(Modal::Models) => "↑/↓ choose · ←/→ pane · enter · esc",
                 Some(Modal::Permissions) => "↑/↓ · enter · esc",
                 Some(Modal::ImagePreview) => "j/k · +/- · d detach · o/y · esc",
                 _ => "esc",
@@ -8002,7 +8159,8 @@ impl App {
         let popup_width = match modal {
             Modal::ImagePreview => area.width.saturating_sub(4).min(128),
             Modal::Settings | Modal::Themes => area.width.saturating_sub(8).min(94),
-            Modal::Models | Modal::Permissions => area.width.saturating_sub(8).min(88),
+            Modal::Models => area.width.saturating_sub(8).min(104),
+            Modal::Permissions => area.width.saturating_sub(8).min(88),
             _ => area.width.saturating_sub(8).min(78),
         };
         let popup_height = area.height.saturating_sub(4).min(match modal {
@@ -8014,7 +8172,8 @@ impl App {
             Modal::Jobs => 16,
             Modal::Sessions => 14,
             Modal::SessionTree => 18,
-            Modal::Models | Modal::Reasoning | Modal::Permissions => 16,
+            Modal::Models => 18,
+            Modal::Reasoning | Modal::Permissions => 16,
             Modal::Themes => 18,
             Modal::Rewind => 16,
             Modal::EditMessage => 18,
@@ -8623,9 +8782,18 @@ impl App {
                 detail.extend(theme_preview_lines(self.theme));
             } else if item.key == "model" {
                 detail.push(Line::from(""));
-                detail.extend(model_detail_lines(
+                detail.extend(model_picker_detail_lines(
                     self.model.model_name(),
+                    self.model.reasoning_effort(),
                     self.model.model_name(),
+                    self.model.reasoning_effort(),
+                ));
+            } else if item.key == "reasoning" {
+                detail.push(Line::from(""));
+                detail.extend(reasoning_detail_lines(
+                    self.model.model_name(),
+                    self.model.reasoning_effort(),
+                    self.model.reasoning_effort(),
                 ));
             } else if item.key == "permissions" {
                 detail.push(Line::from(""));
@@ -8708,7 +8876,7 @@ impl App {
 
     fn draw_models_modal(&self, frame: &mut Frame<'_>, area: Rect) {
         frame.render_widget(
-            modal_block(" Model ")
+            modal_block(" Model & reasoning ")
                 .border_type(BorderType::Rounded)
                 .padding(Padding::new(2, 2, 0, 0)),
             area,
@@ -8727,26 +8895,98 @@ impl App {
             .split(inner);
         let columns = Layout::default()
             .direction(Direction::Horizontal)
-            .constraints([Constraint::Length(30), Constraint::Min(34)])
+            .constraints([
+                Constraint::Length(28),
+                Constraint::Length(2),
+                Constraint::Length(18),
+                Constraint::Length(2),
+                Constraint::Min(28),
+            ])
             .split(sections[1]);
 
         let header = Paragraph::new(vec![
             Line::from(vec![
-                Span::styled("Model picker", accent().add_modifier(Modifier::BOLD)),
+                Span::styled("Model & reasoning", accent().add_modifier(Modifier::BOLD)),
                 Span::styled("  ", muted()),
                 Span::styled(self.model.provider_name(), muted()),
                 Span::styled("/", muted()),
                 Span::styled(self.model.model_name().to_string(), prompt_style()),
+                Span::styled(" · ", muted()),
+                Span::styled(self.model.reasoning_effort().to_string(), prompt_style()),
             ]),
             Line::from(vec![
-                Span::styled("enter saves for future turns", muted()),
-                Span::styled(" · ", muted()),
+                Span::styled("choose both for future turns", muted()),
+                Span::styled("  ·  ", muted()),
                 Span::styled("/model <id>", prompt_style()),
                 Span::styled(" accepts any model id", muted()),
             ]),
         ])
         .style(Style::default().bg(surface()).fg(text()));
         frame.render_widget(header, sections[0]);
+
+        let model_sections = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(1), Constraint::Min(1)])
+            .split(columns[0]);
+        let reasoning_sections = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(1), Constraint::Min(1)])
+            .split(columns[2]);
+        let detail_sections = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(1), Constraint::Min(1)])
+            .split(columns[4]);
+        let model_pane_active = self.model_picker_pane == ModelPickerPane::Models;
+        let reasoning_pane_active = self.model_picker_pane == ModelPickerPane::Reasoning;
+
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(
+                    if model_pane_active { "● " } else { "  " },
+                    if model_pane_active { accent() } else { muted() },
+                ),
+                Span::styled(
+                    "MODEL",
+                    if model_pane_active {
+                        accent().add_modifier(Modifier::BOLD)
+                    } else {
+                        muted().add_modifier(Modifier::BOLD)
+                    },
+                ),
+            ]))
+            .style(Style::default().bg(surface())),
+            model_sections[0],
+        );
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(
+                    if reasoning_pane_active { "● " } else { "  " },
+                    if reasoning_pane_active {
+                        accent()
+                    } else {
+                        muted()
+                    },
+                ),
+                Span::styled(
+                    "REASONING",
+                    if reasoning_pane_active {
+                        accent().add_modifier(Modifier::BOLD)
+                    } else {
+                        muted().add_modifier(Modifier::BOLD)
+                    },
+                ),
+            ]))
+            .style(Style::default().bg(surface())),
+            reasoning_sections[0],
+        );
+        frame.render_widget(
+            Paragraph::new(Span::styled(
+                "SELECTION",
+                muted().add_modifier(Modifier::BOLD),
+            ))
+            .style(Style::default().bg(surface())),
+            detail_sections[0],
+        );
 
         let choices = model_choices(self.model.model_name());
         let rows = choices
@@ -8771,24 +9011,86 @@ impl App {
         let mut state = ListState::default().with_selected(Some(self.model_selection));
         let list = List::new(rows)
             .style(Style::default().bg(surface()).fg(text()))
-            .highlight_style(command_selected_style())
-            .highlight_symbol("▌ ");
-        frame.render_stateful_widget(list, columns[0], &mut state);
+            .highlight_style(if model_pane_active {
+                command_selected_style()
+            } else {
+                Style::default()
+                    .bg(surface())
+                    .fg(accent_color())
+                    .add_modifier(Modifier::BOLD)
+            })
+            .highlight_symbol(if model_pane_active { "▌ " } else { "› " });
+        frame.render_stateful_widget(list, model_sections[1], &mut state);
 
         let selected = choices
             .get(self.model_selection.min(choices.len().saturating_sub(1)))
             .map(String::as_str)
             .unwrap_or(self.model.model_name());
-        let detail = Paragraph::new(model_detail_lines(selected, self.model.model_name()))
+        let reasoning_choices = reasoning_choices(selected, "");
+        let selected_reasoning = reasoning_choices
+            .get(
+                self.reasoning_selection
+                    .min(reasoning_choices.len().saturating_sub(1)),
+            )
+            .map(String::as_str)
+            .unwrap_or(self.model.reasoning_effort());
+        let reasoning_rows = reasoning_choices
+            .iter()
+            .map(|effort| {
+                let active =
+                    selected == self.model.model_name() && effort == self.model.reasoning_effort();
+                ListItem::new(Line::from(vec![
+                    Span::styled(
+                        if active { "● " } else { "  " },
+                        if active { success_style() } else { muted() },
+                    ),
+                    Span::styled(effort.clone(), value_style()),
+                ]))
+            })
+            .collect::<Vec<_>>();
+        let mut reasoning_state =
+            ListState::default().with_selected(Some(self.reasoning_selection));
+        let reasoning_list = List::new(reasoning_rows)
             .style(Style::default().bg(surface()).fg(text()))
-            .wrap(Wrap { trim: true });
-        frame.render_widget(detail, columns[1]);
+            .highlight_style(if reasoning_pane_active {
+                command_selected_style()
+            } else {
+                Style::default()
+                    .bg(surface())
+                    .fg(accent_color())
+                    .add_modifier(Modifier::BOLD)
+            })
+            .highlight_symbol(if reasoning_pane_active {
+                "▌ "
+            } else {
+                "› "
+            });
+        frame.render_stateful_widget(reasoning_list, reasoning_sections[1], &mut reasoning_state);
+
+        let detail = Paragraph::new(model_picker_detail_lines(
+            selected,
+            selected_reasoning,
+            self.model.model_name(),
+            self.model.reasoning_effort(),
+        ))
+        .style(Style::default().bg(surface()).fg(text()))
+        .wrap(Wrap { trim: true });
+        frame.render_widget(detail, detail_sections[1]);
 
         let footer = Paragraph::new(Line::from(vec![
-            Span::styled("↑/↓ tab", prompt_style()),
+            Span::styled("↑/↓", prompt_style()),
             Span::styled(" choose  ", muted()),
+            Span::styled("←/→ tab", prompt_style()),
+            Span::styled(" pane  ", muted()),
             Span::styled("enter", prompt_style()),
-            Span::styled(" save  ", muted()),
+            Span::styled(
+                if model_pane_active {
+                    " next  "
+                } else {
+                    " save  "
+                },
+                muted(),
+            ),
             Span::styled("esc", prompt_style()),
             Span::styled(" close", muted()),
         ]))
@@ -9497,7 +9799,14 @@ impl App {
                 key: "model",
                 value: self.model.model_name().to_string(),
                 description: "The model Medusa sends coding turns to.",
-                action: "enter opens model picker",
+                action: "enter opens model + reasoning picker",
+                editable: true,
+            },
+            SettingsItem {
+                key: "reasoning",
+                value: self.model.reasoning_effort().to_string(),
+                description: "Thinking depth for new model turns.",
+                action: "enter opens reasoning picker",
                 editable: true,
             },
             SettingsItem {
@@ -9925,7 +10234,7 @@ const SLASH_COMMANDS: &[SlashCommand] = &[
         name: "/model",
         args: "<name>",
         category: "model",
-        description: "Change the model used for new turns",
+        description: "Choose the model and reasoning effort for new turns",
     },
     SlashCommand {
         name: "/reasoning",
@@ -13222,9 +13531,14 @@ fn theme_preview_lines(theme: ThemeKind) -> Vec<Line<'static>> {
     ]
 }
 
-fn model_detail_lines(selected: &str, active: &str) -> Vec<Line<'static>> {
-    let is_active = selected == active;
-    let (display_name, description) = model_display(selected);
+fn model_picker_detail_lines(
+    selected_model: &str,
+    selected_effort: &str,
+    active_model: &str,
+    active_effort: &str,
+) -> Vec<Line<'static>> {
+    let is_active = selected_model == active_model && selected_effort == active_effort;
+    let (display_name, description) = model_display(selected_model);
     let mut lines = vec![Line::from(vec![
         Span::styled(
             display_name.clone(),
@@ -13236,49 +13550,41 @@ fn model_detail_lines(selected: &str, active: &str) -> Vec<Line<'static>> {
             if is_active { success_style() } else { muted() },
         ),
     ])];
-    if display_name != selected {
-        lines.push(Line::from(Span::styled(selected.to_string(), muted())));
+    if display_name != selected_model {
+        lines.push(Line::from(Span::styled(
+            selected_model.to_string(),
+            muted(),
+        )));
     }
     lines.push(Line::from(""));
-    // Backend-provided description, when the Codex model cache has one.
     if let Some(description) = description {
         lines.push(Line::from(Span::styled(description, value_style())));
         lines.push(Line::from(""));
     }
+    lines.push(Line::from(vec![
+        Span::styled("reasoning  ", muted()),
+        Span::styled(
+            selected_effort.to_string(),
+            prompt_style().add_modifier(Modifier::BOLD),
+        ),
+    ]));
+    if let Some(description) = reasoning_description(selected_model, selected_effort) {
+        lines.push(Line::from(Span::styled(description, value_style())));
+    }
     lines.extend([
-        Line::from(Span::styled(
-            "The selected model is used for new Medusa turns. Active streams keep the model they started with.",
-            value_style(),
-        )),
-        Line::from(""),
         Line::from(vec![
             Span::styled("backend  ", muted()),
-            Span::styled(model_backend_hint(selected), value_style()),
+            Span::styled(model_backend_hint(selected_model), value_style()),
         ]),
         Line::from(vec![
             Span::styled("config  ", muted()),
             Span::styled(".medusa/settings.json", value_style()),
         ]),
-        Line::from(vec![
-            Span::styled("override  ", muted()),
-            Span::styled("MEDUSA_MODEL", value_style()),
-            Span::styled(" wins for one-off launches", muted()),
-        ]),
-        Line::from(vec![
-            Span::styled("provider  ", muted()),
-            Span::styled("MEDUSA_PROVIDER", value_style()),
-            Span::styled(" can force codex, deepseek, or openai-compatible", muted()),
-        ]),
         Line::from(""),
-        Line::from(vec![
-            Span::styled("custom  ", muted()),
-            Span::styled("/model <provider-model-id>", prompt_style()),
-        ]),
-        Line::from(vec![
-            Span::styled("effort  ", muted()),
-            Span::styled("/reasoning", prompt_style()),
-            Span::styled(" sets thinking depth", muted()),
-        ]),
+        Line::from(Span::styled(
+            "Applies to new turns. Active work keeps its current model and effort.",
+            muted(),
+        )),
     ]);
     lines
 }
@@ -14807,6 +15113,7 @@ mod tests {
     fn settings_command_opens_settings_modal() {
         let mut app = app();
         let expected_theme = app.theme.name().to_string();
+        let expected_reasoning = app.model.reasoning_effort().to_string();
 
         app.input = "/settings".to_string();
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
@@ -14817,6 +15124,11 @@ mod tests {
             app.settings_rows()
                 .iter()
                 .any(|(key, value)| { *key == "model" && value == "gpt-5.5" })
+        );
+        assert!(
+            app.settings_rows()
+                .iter()
+                .any(|(key, value)| { *key == "reasoning" && value == &expected_reasoning })
         );
         assert!(
             app.settings_rows()
@@ -14854,7 +15166,61 @@ mod tests {
 
         assert_eq!(app.active_modal, Some(Modal::Models));
         assert_eq!(app.input, "");
-        assert_eq!(app.status_line, "models opened");
+        assert_eq!(app.model_picker_pane, ModelPickerPane::Models);
+        assert_eq!(app.status_line, "model and reasoning picker opened");
+    }
+
+    #[test]
+    fn model_picker_steps_into_reasoning_and_persists_both() {
+        let (mut app, workspace) = app_in_workspace();
+        app.model.set_model_name("custom-test-model");
+        app.model.set_reasoning_effort("medium");
+
+        app.open_models_modal();
+        assert_eq!(app.model_picker_pane, ModelPickerPane::Models);
+        assert_eq!(
+            app.reasoning_selection,
+            reasoning_index("custom-test-model", "medium")
+        );
+
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.active_modal, Some(Modal::Models));
+        assert_eq!(app.model_picker_pane, ModelPickerPane::Reasoning);
+
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert_eq!(app.active_modal, None);
+        assert_eq!(app.model.model_name(), "custom-test-model");
+        assert_eq!(app.model.reasoning_effort(), "high");
+        assert_eq!(
+            app.status_line,
+            "model: custom-test-model · reasoning: high"
+        );
+        let settings = load_app_settings(&workspace).unwrap();
+        assert_eq!(settings.model(), Some("custom-test-model".to_string()));
+        assert_eq!(settings.reasoning_effort(), Some("high".to_string()));
+    }
+
+    #[test]
+    fn model_picker_renders_model_reasoning_and_selection_panes() {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let mut app = app();
+        app.open_models_modal();
+        let mut terminal = Terminal::new(TestBackend::new(112, 24)).unwrap();
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                app.draw_modal(frame, area);
+            })
+            .unwrap();
+        let rendered = buffer_text(terminal.backend().buffer());
+
+        assert!(rendered.contains("Model & reasoning"), "{rendered}");
+        assert!(rendered.contains("MODEL"), "{rendered}");
+        assert!(rendered.contains("REASONING"), "{rendered}");
+        assert!(rendered.contains("SELECTION"), "{rendered}");
     }
 
     #[test]
@@ -15114,6 +15480,15 @@ mod tests {
             .unwrap();
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert_eq!(app.active_modal, Some(Modal::Models));
+
+        app.open_settings_modal();
+        app.settings_selection = app
+            .settings_items()
+            .iter()
+            .position(|item| item.key == "reasoning")
+            .unwrap();
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.active_modal, Some(Modal::Reasoning));
 
         app.open_settings_modal();
         app.settings_selection = app
@@ -15923,7 +16298,11 @@ mod tests {
         let mut app = app();
 
         app.open_settings_modal();
-        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        app.settings_selection = app
+            .settings_items()
+            .iter()
+            .position(|item| item.key == "theme")
+            .unwrap();
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
 
         assert_eq!(app.active_modal, Some(Modal::Themes));
