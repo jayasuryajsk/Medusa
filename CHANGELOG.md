@@ -5,6 +5,8 @@ semantic versioning while the public interfaces stabilize.
 
 ## Unreleased
 
+## 0.2.0 - 2026-07-31
+
 ### Added
 
 - Linux bubblewrap sandboxing with fail-closed guarded execution.
@@ -27,3 +29,5 @@ semantic versioning while the public interfaces stabilize.
 - Terminal state is restored when TUI startup or execution unwinds with an
   error.
 - Workflow workers are joined even when the UI event consumer exits early.
+- Headless `--permission` overrides now govern the actual tool runtime,
+  sandbox policy, and MCP tool visibility instead of only the reported mode.

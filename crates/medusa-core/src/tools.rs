@@ -162,6 +162,15 @@ impl ToolRuntime {
         self
     }
 
+    /// Override the permission mode for this runtime without persisting it.
+    /// Non-interactive callers use this so their CLI flag governs both tool
+    /// authorization and the derived sandbox stance.
+    pub fn with_permission_mode(mut self, mode: PermissionMode) -> Self {
+        self.permissions = self.permissions.with_mode_override(mode);
+        self.sandbox = SandboxPolicy::load(&self.permissions);
+        self
+    }
+
     pub fn sandbox_policy(&self) -> &SandboxPolicy {
         &self.sandbox
     }

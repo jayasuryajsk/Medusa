@@ -79,8 +79,28 @@ also requires `bubblewrap`.
 - **A model backend.** By default Medusa reuses your **Codex CLI** OAuth login
   (see below). OpenAI-compatible and DeepSeek backends are also supported via
   environment variables.
+- **Optional browser control:** the current stable versions of Chrome,
+  Node.js LTS, and npm.
 
 ## Install
+
+### With Cargo from GitHub
+
+Install the latest tagged release directly:
+
+```sh
+cargo install --locked \
+  --git https://github.com/jayasuryajsk/Medusa.git \
+  --tag v0.2.0 \
+  medusa-tui
+```
+
+Cargo places `medusa` in `~/.cargo/bin`. If the command is not found after
+installation, add that directory to your shell profile and restart the shell:
+
+```sh
+export PATH="$HOME/.cargo/bin:$PATH"
+```
 
 ### From release binaries
 
@@ -93,6 +113,7 @@ curl -LO https://github.com/jayasuryajsk/Medusa/releases/latest/download/medusa-
 tar xzf medusa-v0.2.0-aarch64-apple-darwin.tar.gz
 cd medusa-v0.2.0-aarch64-apple-darwin
 chmod +x medusa
+mkdir -p ~/.local/bin
 mv medusa ~/.local/bin/          # or anywhere on your PATH
 ```
 
@@ -101,7 +122,7 @@ Each release includes a `.sha256` file and GitHub build-provenance
 attestation. Verify a download with `sha256sum -c <archive>.sha256` (Linux) or
 `shasum -a 256 -c <archive>.sha256` (macOS).
 
-### From source
+### From a source checkout
 
 ```sh
 git clone https://github.com/jayasuryajsk/Medusa.git
@@ -283,6 +304,35 @@ Servers spawn lazily; their tools are advertised to the model as
 `mcp_<server>_<tool>`. Only servers you mark `"readOnly": true` are reachable
 in `readonly` permission mode. `/mcp` shows server status and tools;
 `/mcp restart <server>` restarts a wedged one.
+
+#### Browser control
+
+Medusa can control and inspect Chrome through the official
+[Chrome DevTools MCP server](https://github.com/ChromeDevTools/chrome-devtools-mcp).
+Add this to the workspace's `.medusa/mcp.json`:
+
+```json
+{
+  "servers": {
+    "browser": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "chrome-devtools-mcp@1.6.0",
+        "--isolated=true",
+        "--no-usage-statistics"
+      ],
+      "readOnly": false
+    }
+  }
+}
+```
+
+Restart Medusa or run `/reload`, then use `/mcp` to confirm that `browser` is
+available. The server starts Chrome lazily on the first browser request.
+`--isolated=true` uses a temporary browser profile, keeping normal Chrome
+cookies and logged-in sessions separate. Browser tools are intentionally
+unavailable in Medusa's `readonly` permission mode.
 
 ### Custom agents
 

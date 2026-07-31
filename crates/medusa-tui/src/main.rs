@@ -307,6 +307,7 @@ fn run_headless(options: HeadlessOptions) -> Result<()> {
     let permission_mode = options
         .permission_mode
         .unwrap_or_else(|| settings.permission_mode());
+    let tools = tools.with_permission_mode(permission_mode);
     let mut backend =
         DirectCodexBackend::new(tools.workspace().to_path_buf()).wrap_err("HTTP client builds")?;
 

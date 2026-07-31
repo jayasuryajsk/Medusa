@@ -156,6 +156,16 @@ impl PermissionPolicy {
         Ok(Self { config, workspace })
     }
 
+    /// Apply a process-local mode override without rewriting the workspace
+    /// permissions file. Explicit sandbox settings remain orthogonal to the
+    /// selected mode, matching [`Self::write_mode`].
+    pub fn with_mode_override(mut self, mode: PermissionMode) -> Self {
+        let sandbox = self.config.sandbox.take();
+        self.config = config_for_mode(mode);
+        self.config.sandbox = sandbox;
+        self
+    }
+
     pub fn write_mode(workspace: impl AsRef<Path>, mode: PermissionMode) -> Result<()> {
         let workspace = workspace.as_ref();
         let path = workspace.join(".medusa").join("permissions.json");
@@ -656,6 +666,39 @@ mod tests {
         policy
             .check_patch_paths(&["src/main.rs".to_string()])
             .unwrap();
+    }
+
+    #[test]
+    fn mode_override_is_in_memory_and_preserves_sandbox_settings() {
+        let workspace = temp_workspace();
+        write_permissions(
+            &workspace,
+            r#"{
+                "mode": "guarded",
+                "sandbox": {
+                    "enabled": true,
+                    "allow_network": true,
+                    "writable_roots": ["~/.cargo/registry"]
+                }
+            }"#,
+        );
+
+        let policy = PermissionPolicy::load(&workspace)
+            .unwrap()
+            .with_mode_override(PermissionMode::Open);
+
+        assert_eq!(policy.effective_mode(), PermissionMode::Open);
+        assert_eq!(
+            policy.evaluate_terminal_command("rm -rf build"),
+            PermissionCheck::Allow
+        );
+        let sandbox = policy.sandbox_settings();
+        assert_eq!(sandbox.enabled, Some(true));
+        assert!(sandbox.allow_network);
+        assert_eq!(sandbox.writable_roots, vec!["~/.cargo/registry"]);
+
+        let persisted = PermissionPolicy::load(&workspace).unwrap();
+        assert_eq!(persisted.effective_mode(), PermissionMode::Guarded);
     }
 
     #[test]
