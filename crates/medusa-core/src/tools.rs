@@ -1260,13 +1260,12 @@ impl ToolRuntime {
 
     fn walk_files(&self, root: &Path, max_depth: usize) -> Result<Vec<PathBuf>> {
         let mut files = Vec::new();
-        self.collect_files(root, 0, max_depth, &mut files)?;
+        Self::collect_files(root, 0, max_depth, &mut files)?;
         files.sort();
         Ok(files)
     }
 
     fn collect_files(
-        &self,
         path: &Path,
         depth: usize,
         max_depth: usize,
@@ -1286,7 +1285,7 @@ impl ToolRuntime {
                 if should_skip_dir(&entry_path) {
                     continue;
                 }
-                self.collect_files(&entry_path, depth + 1, max_depth, files)?;
+                Self::collect_files(&entry_path, depth + 1, max_depth, files)?;
             } else if entry_path.is_file() {
                 files.push(entry_path);
             }
