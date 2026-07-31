@@ -6,6 +6,8 @@ use std::{
 use color_eyre::eyre::{Result, WrapErr, bail};
 use serde::{Deserialize, Serialize};
 
+use crate::persistence::{atomic_write_private, ensure_private_dir};
+
 #[derive(Debug, Clone)]
 pub struct PermissionPolicy {
     config: PermissionConfig,
@@ -148,10 +150,20 @@ impl PermissionPolicy {
             serde_json::from_str(&text)
                 .wrap_err_with(|| format!("failed to parse {}", path.display()))?
         } else {
-            PermissionConfig::default()
+            config_for_mode(PermissionMode::Guarded)
         };
 
         Ok(Self { config, workspace })
+    }
+
+    /// Apply a process-local mode override without rewriting the workspace
+    /// permissions file. Explicit sandbox settings remain orthogonal to the
+    /// selected mode, matching [`Self::write_mode`].
+    pub fn with_mode_override(mut self, mode: PermissionMode) -> Self {
+        let sandbox = self.config.sandbox.take();
+        self.config = config_for_mode(mode);
+        self.config.sandbox = sandbox;
+        self
     }
 
     pub fn write_mode(workspace: impl AsRef<Path>, mode: PermissionMode) -> Result<()> {
@@ -194,13 +206,14 @@ impl PermissionPolicy {
         }
 
         if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)
+            ensure_private_dir(parent)
                 .wrap_err_with(|| format!("failed to create {}", parent.display()))?;
         }
 
         let json =
             serde_json::to_string_pretty(&config).wrap_err("failed to encode permissions")?;
-        fs::write(&path, json).wrap_err_with(|| format!("failed to write {}", path.display()))
+        atomic_write_private(&path, json)
+            .wrap_err_with(|| format!("failed to write {}", path.display()))
     }
 
     pub fn check_terminal_command(&self, command: &str) -> Result<()> {
@@ -400,12 +413,13 @@ impl PermissionPolicy {
         }
 
         if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)
+            ensure_private_dir(parent)
                 .wrap_err_with(|| format!("failed to create {}", parent.display()))?;
         }
         let json =
             serde_json::to_string_pretty(&config).wrap_err("failed to encode permissions")?;
-        fs::write(&path, json).wrap_err_with(|| format!("failed to write {}", path.display()))
+        atomic_write_private(&path, json)
+            .wrap_err_with(|| format!("failed to write {}", path.display()))
     }
 }
 
@@ -643,13 +657,48 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
-    fn missing_permissions_allow_by_default() {
+    fn missing_permissions_use_guarded_default() {
         let policy = PermissionPolicy::load(temp_workspace()).unwrap();
 
-        policy.check_terminal_command("rm -rf target").unwrap();
+        assert_eq!(policy.effective_mode(), PermissionMode::Guarded);
+        assert!(policy.check_terminal_command("rm -rf target").is_err());
+        policy.check_terminal_command("git status").unwrap();
         policy
             .check_patch_paths(&["src/main.rs".to_string()])
             .unwrap();
+    }
+
+    #[test]
+    fn mode_override_is_in_memory_and_preserves_sandbox_settings() {
+        let workspace = temp_workspace();
+        write_permissions(
+            &workspace,
+            r#"{
+                "mode": "guarded",
+                "sandbox": {
+                    "enabled": true,
+                    "allow_network": true,
+                    "writable_roots": ["~/.cargo/registry"]
+                }
+            }"#,
+        );
+
+        let policy = PermissionPolicy::load(&workspace)
+            .unwrap()
+            .with_mode_override(PermissionMode::Open);
+
+        assert_eq!(policy.effective_mode(), PermissionMode::Open);
+        assert_eq!(
+            policy.evaluate_terminal_command("rm -rf build"),
+            PermissionCheck::Allow
+        );
+        let sandbox = policy.sandbox_settings();
+        assert_eq!(sandbox.enabled, Some(true));
+        assert!(sandbox.allow_network);
+        assert_eq!(sandbox.writable_roots, vec!["~/.cargo/registry"]);
+
+        let persisted = PermissionPolicy::load(&workspace).unwrap();
+        assert_eq!(persisted.effective_mode(), PermissionMode::Guarded);
     }
 
     #[test]

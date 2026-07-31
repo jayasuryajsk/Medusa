@@ -5,6 +5,7 @@
 //! deadline and the turn's [`CancelToken`].
 
 use std::{
+    collections::VecDeque,
     io::Read,
     process::{Child, Command, Stdio},
     thread,
@@ -14,6 +15,8 @@ use std::{
 use crate::cancel::CancelToken;
 
 const POLL_INTERVAL: Duration = Duration::from_millis(40);
+const MAX_CAPTURED_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
+const OUTPUT_TAIL_BYTES: usize = 1024 * 1024;
 /// SIGTERM → grace → SIGKILL: long enough for shells to reap their children,
 /// short enough that cancellation still feels instant.
 const KILL_GRACE: Duration = Duration::from_millis(500);
@@ -32,23 +35,11 @@ pub(crate) struct CommandOutcome {
 /// Output is drained on reader threads so a chatty child can never deadlock
 /// against a full pipe. `timeout: None` means no deadline.
 pub(crate) fn run_command(
-    mut command: Command,
+    command: Command,
     timeout: Option<Duration>,
     cancel: &CancelToken,
 ) -> std::io::Result<CommandOutcome> {
-    command
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        // Own process group, so killing on cancel/timeout reaches the whole
-        // tree (`$SHELL -lc` grandchildren included), not just the shell.
-        command.process_group(0);
-    }
-    let mut child = command.spawn()?;
-
+    let mut child = spawn_command(command)?;
     let stdout_reader = drain_pipe(child.stdout.take());
     let stderr_reader = drain_pipe(child.stderr.take());
 
@@ -78,14 +69,86 @@ pub(crate) fn run_command(
     })
 }
 
-fn drain_pipe<R: Read + Send + 'static>(pipe: Option<R>) -> thread::JoinHandle<String> {
-    thread::spawn(move || {
-        let mut buffer = String::new();
-        if let Some(mut pipe) = pipe {
-            let _ = pipe.read_to_string(&mut buffer);
-        }
-        buffer
+/// Spawn a command with the same pipe and process-group discipline used by
+/// foreground execution. Background jobs use this so their output is bounded
+/// and a later explicit kill can reach the whole shell process tree.
+pub(crate) fn spawn_command(mut command: Command) -> std::io::Result<Child> {
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // Own process group, so killing on cancel/timeout reaches the whole
+        // tree (`$SHELL -lc` grandchildren included), not just the shell.
+        command.process_group(0);
+    }
+    command.spawn()
+}
+
+/// Wait for an already managed child without a deadline. Pipes are drained
+/// through the bounded capture path, so a long-lived background task cannot
+/// grow Medusa's memory without limit.
+pub(crate) fn wait_for_child(mut child: Child) -> std::io::Result<CommandOutcome> {
+    let stdout_reader = drain_pipe(child.stdout.take());
+    let stderr_reader = drain_pipe(child.stderr.take());
+    let status = child.wait()?;
+
+    Ok(CommandOutcome {
+        success: status.success(),
+        code: status.code(),
+        timed_out: false,
+        cancelled: false,
+        stdout: stdout_reader.join().unwrap_or_default(),
+        stderr: stderr_reader.join().unwrap_or_default(),
     })
+}
+
+fn drain_pipe<R: Read + Send + 'static>(pipe: Option<R>) -> thread::JoinHandle<String> {
+    thread::spawn(move || pipe.map(capture_reader).unwrap_or_default())
+}
+
+fn capture_reader(mut reader: impl Read) -> String {
+    let head_limit = MAX_CAPTURED_OUTPUT_BYTES - OUTPUT_TAIL_BYTES;
+    let mut head = Vec::with_capacity(head_limit.min(64 * 1024));
+    let mut tail = VecDeque::with_capacity(OUTPUT_TAIL_BYTES);
+    let mut chunk = [0u8; 16 * 1024];
+    let mut total = 0usize;
+
+    loop {
+        let Ok(read) = reader.read(&mut chunk) else {
+            break;
+        };
+        if read == 0 {
+            break;
+        }
+        total = total.saturating_add(read);
+
+        let mut offset = 0;
+        if head.len() < head_limit {
+            let keep = (head_limit - head.len()).min(read);
+            head.extend_from_slice(&chunk[..keep]);
+            offset = keep;
+        }
+        for byte in &chunk[offset..read] {
+            if tail.len() == OUTPUT_TAIL_BYTES {
+                tail.pop_front();
+            }
+            tail.push_back(*byte);
+        }
+    }
+
+    let mut output = String::from_utf8_lossy(&head).into_owned();
+    if total > MAX_CAPTURED_OUTPUT_BYTES {
+        let omitted = total - MAX_CAPTURED_OUTPUT_BYTES;
+        output.push_str(&format!(
+            "\n[medusa truncated {omitted} bytes of process output]\n"
+        ));
+    }
+    let tail = tail.into_iter().collect::<Vec<_>>();
+    output.push_str(&String::from_utf8_lossy(&tail));
+    output
 }
 
 /// Terminate the child's whole process group: SIGTERM first so shells can
@@ -177,6 +240,33 @@ mod tests {
         assert!(!outcome.timed_out);
         assert!(!outcome.success);
         assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn process_output_is_bounded_but_keeps_the_tail() {
+        let mut input = vec![b'a'; MAX_CAPTURED_OUTPUT_BYTES + 4096];
+        input.extend_from_slice(b"important tail");
+
+        let output = capture_reader(std::io::Cursor::new(input));
+
+        assert!(output.contains("[medusa truncated"));
+        assert!(output.ends_with("important tail"));
+        assert!(output.len() < MAX_CAPTURED_OUTPUT_BYTES + 256);
+    }
+
+    #[test]
+    fn managed_background_child_drains_and_bounds_output() {
+        let child = spawn_command(shell_command(
+            "yes x | head -c 5000000; printf 'important tail'",
+        ))
+        .unwrap();
+
+        let outcome = wait_for_child(child).unwrap();
+
+        assert!(outcome.success);
+        assert!(outcome.stdout.contains("[medusa truncated"));
+        assert!(outcome.stdout.ends_with("important tail"));
+        assert!(outcome.stdout.len() < MAX_CAPTURED_OUTPUT_BYTES + 256);
     }
 
     #[cfg(unix)]

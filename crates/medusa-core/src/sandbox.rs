@@ -1,12 +1,10 @@
-//! macOS Seatbelt sandboxing for model-initiated terminal commands.
+//! OS sandboxing for model-initiated terminal commands.
 //!
-//! Commands are wrapped with `/usr/bin/sandbox-exec` and a deny-default
-//! profile: reads stay broad (toolchains, dyld), writes are confined to the
-//! workspace and temp directories, and network access is denied unless
-//! explicitly enabled. Writable roots are never spliced into the profile
-//! string — they travel as `-D WRn=<path>` parameters referenced with
-//! `(param "WRn")`, which is immune to quote/paren injection and handles
-//! spaces. Non-macOS platforms degrade to a clean no-op.
+//! macOS uses Seatbelt. Linux uses bubblewrap with a read-only root,
+//! writable-root bind mounts, isolated user/PID namespaces, and an isolated
+//! network namespace unless network was explicitly enabled. A requested
+//! sandbox that is unavailable must be rejected by the tool layer rather than
+//! silently degrading to full host access.
 
 use std::{
     ffi::OsStr,
@@ -24,10 +22,9 @@ use crate::permissions::PermissionPolicy;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SandboxAvailability {
     Available,
-    /// Not macOS; sandboxing silently does not apply.
+    /// No supported sandbox backend exists for this operating system.
     UnsupportedPlatform,
-    /// macOS, but the deprecated-yet-functional `sandbox-exec` binary failed
-    /// its self-test; commands run unsandboxed with a one-time notice.
+    /// The platform backend is missing or failed its self-test.
     Broken(String),
 }
 
@@ -58,14 +55,58 @@ fn probe_availability() -> SandboxAvailability {
     }
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "linux")]
+fn probe_availability() -> SandboxAvailability {
+    let Some(bwrap) = linux_bwrap_path() else {
+        return SandboxAvailability::Broken(
+            "bubblewrap is not installed at /usr/bin/bwrap or /bin/bwrap".to_string(),
+        );
+    };
+
+    match Command::new(bwrap)
+        .args([
+            "--die-with-parent",
+            "--new-session",
+            "--unshare-user",
+            "--unshare-pid",
+            "--unshare-net",
+            "--ro-bind",
+            "/",
+            "/",
+            "--proc",
+            "/proc",
+            "--dev",
+            "/dev",
+            "--",
+            "/bin/true",
+        ])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .output()
+    {
+        Ok(output) if output.status.success() => SandboxAvailability::Available,
+        Ok(output) => SandboxAvailability::Broken(format!(
+            "bubblewrap self-test failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )),
+        Err(error) => SandboxAvailability::Broken(format!("bubblewrap unavailable: {error}")),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_bwrap_path() -> Option<&'static Path> {
+    [Path::new("/usr/bin/bwrap"), Path::new("/bin/bwrap")]
+        .into_iter()
+        .find(|path| path.is_file())
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn probe_availability() -> SandboxAvailability {
     SandboxAvailability::UnsupportedPlatform
 }
 
-/// One-time notice when the sandbox should apply but the macOS `sandbox-exec`
-/// self-test failed. Returns `Some` exactly once per process; unsupported
-/// platforms never notice (sandboxing simply does not apply there).
+/// One-time notice for a missing platform sandbox.
 pub fn take_unavailability_notice() -> Option<String> {
     static EMITTED: AtomicBool = AtomicBool::new(false);
     unavailability_notice(sandbox_availability(), &EMITTED)
@@ -77,7 +118,10 @@ fn unavailability_notice(
 ) -> Option<String> {
     match availability {
         SandboxAvailability::Broken(reason) if !emitted.swap(true, Ordering::SeqCst) => Some(
-            format!("sandbox unavailable: {reason}; commands run unsandboxed"),
+            format!("sandbox unavailable: {reason}; sandbox-required commands are blocked"),
+        ),
+        SandboxAvailability::UnsupportedPlatform if !emitted.swap(true, Ordering::SeqCst) => Some(
+            "sandbox unavailable on this platform; sandbox-required commands are blocked".into(),
         ),
         _ => None,
     }
@@ -127,8 +171,9 @@ pub fn build_profile(spec: &SandboxSpec) -> (String, Vec<(String, String)>) {
 
 /// Wrap `$SHELL -lc <command>` in a `sandbox-exec` invocation carrying the
 /// profile and writable-root params. The child environment advertises the
-/// sandbox (`MEDUSA_SANDBOX=seatbelt`, plus `MEDUSA_SANDBOX_NETWORK_DISABLED=1`
-/// when network is denied) so hooks and scripts can adapt.
+/// active backend through `MEDUSA_SANDBOX`, plus
+/// `MEDUSA_SANDBOX_NETWORK_DISABLED=1` when network is denied.
+#[cfg(target_os = "macos")]
 pub fn wrap_command(spec: &SandboxSpec, shell: &OsStr, command_text: &str, cwd: &Path) -> Command {
     let (profile, params) = build_profile(spec);
     let mut command = Command::new("/usr/bin/sandbox-exec");
@@ -146,9 +191,51 @@ pub fn wrap_command(spec: &SandboxSpec, shell: &OsStr, command_text: &str, cwd: 
     command
 }
 
-/// Conservative check: does this failed command's stderr look like a Seatbelt
-/// denial? Used only to decorate output with an escalation hint — it never
-/// auto-escalates.
+/// Wrap a shell command in bubblewrap. The host filesystem starts read-only;
+/// only configured roots are rebound writable. Network isolation is opt-out,
+/// matching Seatbelt's policy.
+#[cfg(target_os = "linux")]
+pub fn wrap_command(spec: &SandboxSpec, shell: &OsStr, command_text: &str, cwd: &Path) -> Command {
+    let bwrap = linux_bwrap_path().unwrap_or_else(|| Path::new("/usr/bin/bwrap"));
+    let mut command = Command::new(bwrap);
+    command.args([
+        "--die-with-parent",
+        "--new-session",
+        "--unshare-user",
+        "--unshare-pid",
+        "--ro-bind",
+        "/",
+        "/",
+        "--proc",
+        "/proc",
+        "--dev",
+        "/dev",
+    ]);
+    if !spec.allow_network || spec.strict {
+        command.arg("--unshare-net");
+    }
+    for root in &spec.writable_roots {
+        command.arg("--bind").arg(root).arg(root);
+    }
+    command.arg("--chdir").arg(cwd);
+    command.arg("--").arg(shell).arg("-lc").arg(command_text);
+    command.env("MEDUSA_SANDBOX", "bubblewrap");
+    if !spec.allow_network || spec.strict {
+        command.env("MEDUSA_SANDBOX_NETWORK_DISABLED", "1");
+    }
+    command
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+pub fn wrap_command(_spec: &SandboxSpec, shell: &OsStr, command_text: &str, cwd: &Path) -> Command {
+    let mut command = Command::new(shell);
+    command.arg("-lc").arg(command_text).current_dir(cwd);
+    command
+}
+
+/// Conservative check: does this failed command's stderr look like an OS
+/// sandbox denial? Used only to decorate output with an escalation hint; it
+/// never auto-escalates.
 pub fn looks_sandbox_denied(stderr: &str, code: Option<i32>) -> bool {
     if code == Some(0) {
         return false;
@@ -159,8 +246,24 @@ pub fn looks_sandbox_denied(stderr: &str, code: Option<i32>) -> bool {
         "Could not resolve host",
         "Read-only file system",
         "sandbox-exec:",
+        "bwrap:",
     ];
     PATTERNS.iter().any(|pattern| stderr.contains(pattern))
+}
+
+pub fn execution_note() -> &'static str {
+    #[cfg(target_os = "macos")]
+    {
+        "sandbox: ran under macOS Seatbelt (writes confined to workspace/temp; network denied unless enabled)\n"
+    }
+    #[cfg(target_os = "linux")]
+    {
+        "sandbox: ran under Linux bubblewrap (read-only host; writes confined to workspace/temp; network denied unless enabled)\n"
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        "sandbox: ran under the platform sandbox\n"
+    }
 }
 
 /// Expand a leading `~` and canonicalize. Returns `None` for empty or
@@ -322,6 +425,7 @@ mod tests {
         assert!(!strict.contains("network"));
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn wrap_command_sets_sandbox_env_and_params() {
         let spec = spec_with_roots(vec![PathBuf::from("/tmp/wr root")], false, false);
@@ -354,6 +458,7 @@ mod tests {
         )));
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn wrap_command_omits_network_disabled_marker_when_network_allowed() {
         let spec = spec_with_roots(vec![PathBuf::from("/tmp")], true, false);
@@ -363,6 +468,34 @@ mod tests {
                 .get_envs()
                 .any(|(key, _)| key == OsStr::new("MEDUSA_SANDBOX_NETWORK_DISABLED"))
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn wrap_command_uses_bubblewrap_namespaces_and_writable_binds() {
+        let spec = spec_with_roots(vec![PathBuf::from("/tmp/wr root")], false, false);
+        let command = wrap_command(&spec, OsStr::new("/bin/sh"), "echo hi", Path::new("/tmp"));
+        let args = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+
+        assert!(command.get_program().to_string_lossy().ends_with("bwrap"));
+        assert!(args.contains(&"--ro-bind".to_string()));
+        assert!(args.contains(&"--unshare-user".to_string()));
+        assert!(args.contains(&"--unshare-pid".to_string()));
+        assert!(args.contains(&"--unshare-net".to_string()));
+        assert!(args.windows(3).any(|window| {
+            window
+                == [
+                    String::from("--bind"),
+                    String::from("/tmp/wr root"),
+                    String::from("/tmp/wr root"),
+                ]
+        }));
+        assert!(command.get_envs().any(|(key, value)| {
+            key == OsStr::new("MEDUSA_SANDBOX") && value == Some(OsStr::new("bubblewrap"))
+        }));
     }
 
     #[test]
@@ -510,14 +643,22 @@ mod tests {
         );
         assert_eq!(unavailability_notice(&broken, &emitted), None);
 
-        // Unsupported platforms and healthy sandboxes never notice.
+        // Unsupported platforms also explain the fail-closed behavior once.
         let quiet = AtomicBool::new(false);
+        assert!(
+            unavailability_notice(&SandboxAvailability::UnsupportedPlatform, &quiet)
+                .as_deref()
+                .is_some_and(|notice| notice.contains("unavailable on this platform"))
+        );
         assert_eq!(
             unavailability_notice(&SandboxAvailability::UnsupportedPlatform, &quiet),
             None
         );
+
+        // Healthy sandboxes stay quiet.
+        let healthy = AtomicBool::new(false);
         assert_eq!(
-            unavailability_notice(&SandboxAvailability::Available, &quiet),
+            unavailability_notice(&SandboxAvailability::Available, &healthy),
             None
         );
     }

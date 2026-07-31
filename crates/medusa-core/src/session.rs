@@ -3,11 +3,16 @@ use std::{
     fs,
     marker::PhantomData,
     path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
     time::{SystemTime, UNIX_EPOCH},
 };
 
 use color_eyre::eyre::{Result, WrapErr, bail};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
+
+use crate::persistence::{atomic_write_private, ensure_private_dir};
+
+const CURRENT_SESSION_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionOpenMode {
@@ -80,11 +85,11 @@ where
 {
     pub fn open(workspace: &Path, mode: SessionOpenMode) -> Result<Self> {
         let sessions_dir = workspace.join(".medusa").join("sessions");
-        fs::create_dir_all(&sessions_dir).wrap_err("failed to create .medusa/sessions")?;
+        ensure_private_dir(&sessions_dir).wrap_err("failed to create .medusa/sessions")?;
         let pointer_path = sessions_dir.join("last");
 
         let session_path = match mode {
-            SessionOpenMode::New => sessions_dir.join(format!("{}.json", session_timestamp())),
+            SessionOpenMode::New => unique_session_path(&sessions_dir, Path::new("")),
             SessionOpenMode::ContinueLast => {
                 let session_id = read_last_session_name(&pointer_path)?;
                 existing_session_path(&sessions_dir, &session_id)?
@@ -181,13 +186,7 @@ where
         if !self.session_path.exists() {
             return Ok(Vec::new());
         }
-        Ok(
-            read_session_file::<T, serde_json::Value>(&self.session_path)
-                .wrap_err_with(|| {
-                    format!("failed to parse session {}", self.session_path.display())
-                })?
-                .transcript,
-        )
+        Ok(read_session_file::<T, serde_json::Value>(&self.session_path)?.transcript)
     }
 
     pub fn load_transcript_with_legacy<L, F>(&self, map_legacy: F) -> Result<Vec<T>>
@@ -199,8 +198,7 @@ where
             return Ok(Vec::new());
         }
 
-        let session = read_session_file::<T, L>(&self.session_path)
-            .wrap_err_with(|| format!("failed to parse session {}", self.session_path.display()))?;
+        let session = read_session_file::<T, L>(&self.session_path)?;
         if !session.transcript.is_empty() {
             return Ok(session.transcript);
         }
@@ -210,7 +208,7 @@ where
 
     pub fn save_transcript(&self, transcript: &[T]) -> Result<()> {
         let session = SessionFile {
-            version: 3,
+            version: CURRENT_SESSION_VERSION,
             session_id: Some(self.current_id()),
             parent_id: self.parent_id.clone(),
             workspace: self.workspace.to_string_lossy().to_string(),
@@ -219,13 +217,27 @@ where
         };
 
         if let Some(parent) = self.session_path.parent() {
-            fs::create_dir_all(parent).wrap_err_with(|| {
+            ensure_private_dir(parent).wrap_err_with(|| {
                 format!("failed to create session directory {}", parent.display())
             })?;
         }
 
         let json = serde_json::to_string_pretty(&session).wrap_err("failed to encode session")?;
-        fs::write(&self.session_path, json)
+        if self.session_path.exists()
+            && read_session_file_primary::<T, serde_json::Value>(&self.session_path).is_ok()
+        {
+            let previous = fs::read(&self.session_path).wrap_err_with(|| {
+                format!(
+                    "failed to read session backup source {}",
+                    self.session_path.display()
+                )
+            })?;
+            atomic_write_private(&session_backup_path(&self.session_path), previous)
+                .wrap_err_with(|| {
+                    format!("failed to back up session {}", self.session_path.display())
+                })?;
+        }
+        atomic_write_private(&self.session_path, json)
             .wrap_err_with(|| format!("failed to write session {}", self.session_path.display()))?;
 
         write_last_pointer(&self.pointer_path, &self.session_path)?;
@@ -341,10 +353,61 @@ where
     T: DeserializeOwned,
     L: DeserializeOwned,
 {
+    reject_unsupported_session_version(path)?;
+    match read_session_file_primary(path) {
+        Ok(session) => Ok(session),
+        Err(primary_error) => {
+            let backup = session_backup_path(path);
+            match read_session_file_primary(&backup) {
+                Ok(session) => Ok(session),
+                Err(_) => Err(primary_error),
+            }
+        }
+    }
+}
+
+fn reject_unsupported_session_version(path: &Path) -> Result<()> {
+    #[derive(Deserialize)]
+    struct VersionHeader {
+        #[serde(default)]
+        version: u32,
+    }
+
+    let Ok(text) = fs::read_to_string(path) else {
+        return Ok(());
+    };
+    let Ok(header) = serde_json::from_str::<VersionHeader>(&text) else {
+        return Ok(());
+    };
+    if header.version > CURRENT_SESSION_VERSION {
+        bail!(
+            "session {} uses unsupported version {} (this Medusa supports through version {})",
+            path.display(),
+            header.version,
+            CURRENT_SESSION_VERSION
+        );
+    }
+    Ok(())
+}
+
+fn read_session_file_primary<T, L>(path: &Path) -> Result<LoadedSessionFile<T, L>>
+where
+    T: DeserializeOwned,
+    L: DeserializeOwned,
+{
     let text = fs::read_to_string(path)
         .wrap_err_with(|| format!("failed to read session {}", path.display()))?;
-    serde_json::from_str(&text)
-        .wrap_err_with(|| format!("failed to parse session {}", path.display()))
+    let session: LoadedSessionFile<T, L> = serde_json::from_str(&text)
+        .wrap_err_with(|| format!("failed to parse session {}", path.display()))?;
+    if session.version > CURRENT_SESSION_VERSION {
+        bail!(
+            "session {} uses unsupported version {} (this Medusa supports through version {})",
+            path.display(),
+            session.version,
+            CURRENT_SESSION_VERSION
+        );
+    }
+    Ok(session)
 }
 
 pub fn normalize_session_name(session_id: &str) -> Result<String> {
@@ -408,7 +471,7 @@ fn existing_session_path(sessions_dir: &Path, session_id: &str) -> Result<PathBu
 }
 
 fn write_last_pointer(pointer_path: &Path, session_path: &Path) -> Result<()> {
-    fs::write(
+    atomic_write_private(
         pointer_path,
         session_path
             .file_name()
@@ -417,6 +480,14 @@ fn write_last_pointer(pointer_path: &Path, session_path: &Path) -> Result<()> {
             .as_bytes(),
     )
     .wrap_err("failed to update last session pointer")
+}
+
+fn session_backup_path(path: &Path) -> PathBuf {
+    let name = path
+        .file_name()
+        .unwrap_or_else(|| std::ffi::OsStr::new("session.json"))
+        .to_string_lossy();
+    path.with_file_name(format!("{name}.bak"))
 }
 
 fn unique_session_path(sessions_dir: &Path, excluded: &Path) -> PathBuf {
@@ -465,11 +536,13 @@ fn append_tree_entry(
 }
 
 fn session_timestamp() -> String {
+    static SESSION_SEQUENCE: AtomicU64 = AtomicU64::new(0);
     let millis = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis();
-    format!("session-{millis}")
+    let sequence = SESSION_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    format!("session-{millis}-{}-{sequence}", std::process::id())
 }
 
 #[cfg(test)]
@@ -536,6 +609,45 @@ mod tests {
         assert_eq!(root.depth, 0);
         assert_eq!(child.depth, 1);
         assert!(child.current);
+    }
+
+    #[test]
+    fn corrupt_primary_session_recovers_from_last_valid_backup() {
+        let workspace = temp_workspace("backup-recovery");
+        let session = SessionStore::<TestMessage>::open(&workspace, SessionOpenMode::New).unwrap();
+        session
+            .save_transcript(&[TestMessage {
+                text: "first".into(),
+            }])
+            .unwrap();
+        session
+            .save_transcript(&[TestMessage {
+                text: "second".into(),
+            }])
+            .unwrap();
+
+        fs::write(&session.session_path, "{torn").unwrap();
+
+        assert_eq!(
+            session.load_transcript().unwrap(),
+            vec![TestMessage {
+                text: "first".into()
+            }]
+        );
+    }
+
+    #[test]
+    fn future_session_versions_are_rejected() {
+        let workspace = temp_workspace("future-version");
+        let session = SessionStore::<TestMessage>::open(&workspace, SessionOpenMode::New).unwrap();
+        fs::write(
+            &session.session_path,
+            r#"{"version":999,"workspace":"/tmp","transcript":[],"messages":[]}"#,
+        )
+        .unwrap();
+
+        let error = session.load_transcript().unwrap_err();
+        assert!(error.to_string().contains("unsupported version"));
     }
 
     fn temp_workspace(label: &str) -> PathBuf {

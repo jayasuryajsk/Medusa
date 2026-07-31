@@ -579,9 +579,7 @@ fn execute_terminal_exec(tools: &ToolRuntime, args: &Value) -> ToolExecution {
             // Harness notes live between the exit line and the stdout marker
             // so the stdout/stderr sections stay pure command output.
             if result.sandboxed && failed {
-                output.push_str(
-                    "sandbox: ran under macOS Seatbelt (writes confined to workspace/temp; network denied unless enabled)\n",
-                );
+                output.push_str(crate::sandbox::execution_note());
                 if crate::sandbox::looks_sandbox_denied(&result.stderr, result.code) {
                     output.push_str(
                         "hint: if the sandbox caused this failure, retry with \"sandbox\": false and explain why; the user must approve every unsandboxed run\n",

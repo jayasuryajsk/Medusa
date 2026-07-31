@@ -50,6 +50,7 @@ use medusa_core::model::{
     ConversationAttachment, ConversationMessage, DirectCodexBackend, ModelStreamEvent, TokenUsage,
 };
 use medusa_core::permissions::{PermissionMode, PermissionPolicy};
+use medusa_core::persistence::{atomic_write, atomic_write_private};
 use medusa_core::session::{
     SessionOpenMode, SessionStore as CoreSessionStore, compact_session_id, human_bytes,
 };
@@ -58,8 +59,7 @@ use medusa_core::tools::{
     TerminalExecRequest, TerminalExecResult, ToolRuntime,
 };
 use medusa_core::workflow::{
-    SubagentToolPolicy, WorkflowEvent, WorkflowPhasePlan, WorkflowRuntime, WorkflowScript,
-    WorkflowStatus,
+    SubagentToolPolicy, WorkflowEvent, WorkflowRuntime, WorkflowScript, WorkflowStatus,
 };
 
 mod animation;
@@ -67,30 +67,34 @@ mod terminal;
 
 #[cfg(test)]
 use terminal::maybe_rebuild_before_reload;
-use terminal::{Tui, init_terminal, relaunch_current_executable, restore_terminal};
+use terminal::{
+    TerminalRestoreGuard, Tui, init_terminal, relaunch_current_executable, restore_terminal,
+};
 
 type SessionStore = CoreSessionStore<TranscriptItem>;
 
 fn main() -> Result<()> {
     color_eyre::install()?;
 
-    let startup_command = parse_args()?;
-    if let StartupCommand::Headless(options) = startup_command {
-        return run_headless(options);
-    }
-
-    let StartupCommand::Tui(startup_session) = startup_command else {
-        unreachable!("headless command returned above");
+    let startup_session = match parse_args()? {
+        StartupCommand::Tui(startup_session) => startup_session,
+        StartupCommand::Headless(options) => return run_headless(options),
+        StartupCommand::Print(text) => {
+            println!("{text}");
+            return Ok(());
+        }
     };
 
     let mut terminal = init_terminal()?;
+    let mut restore_guard = TerminalRestoreGuard::armed();
     let mut app = App::new(startup_session)?;
     let app_result = app.run(&mut terminal);
     let restart_requested = app.restart_requested;
-    restore_terminal(&mut terminal)?;
     // Reap MCP server children deterministically (stdin EOF, then a bounded
     // kill) instead of leaning on process exit.
     app.mcp.shutdown();
+    restore_terminal(&mut terminal)?;
+    restore_guard.disarm();
 
     app_result?;
 
@@ -127,7 +131,36 @@ struct SettingsItem {
 enum StartupCommand {
     Tui(SessionOpenMode),
     Headless(HeadlessOptions),
+    Print(&'static str),
 }
+
+const HELP_TEXT: &str = "Usage: medusa [continue [session]]
+       medusa run [options] [--] <task>
+
+Commands:
+  continue            Resume the last Medusa TUI session in this workspace
+  continue <session>  Resume a specific session from .medusa/sessions
+  run                 Run one non-interactive headless agent turn
+
+Run options:
+  --model <name>                 Override the model for this run
+  --permission <open|guarded|readonly>
+  --json                         Print a machine-readable JSON result
+  --no-stream                    Print only the final answer
+
+If <task> is omitted, medusa run reads the task from stdin.";
+
+const RUN_HELP_TEXT: &str = "Usage: medusa run [options] [--] <task>
+
+Options:
+  --model <name>                 Override the model for this run
+  --permission <open|guarded|readonly>
+  --json                         Print a machine-readable JSON result
+  --no-stream                    Print only the final answer
+
+If <task> is omitted, medusa run reads the task from stdin.";
+
+const VERSION_TEXT: &str = concat!("medusa ", env!("CARGO_PKG_VERSION"));
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct HeadlessOptions {
@@ -165,11 +198,9 @@ fn parse_startup_command(args: &[String]) -> Result<StartupCommand> {
             SessionOpenMode::ContinueNamed(session.to_string()),
         )),
         [command, rest @ ..] if command == "run" => parse_headless_options(rest),
-        [command] if command == "--help" || command == "-h" => {
-            println!(
-                "Usage: medusa [continue [session]]\n       medusa run [options] [--] <task>\n\nCommands:\n  continue            Resume the last Medusa TUI session in this workspace\n  continue <session>  Resume a specific session from .medusa/sessions\n  run                 Run one non-interactive headless agent turn\n\nRun options:\n  --model <name>                 Override the model for this run\n  --permission <open|guarded|readonly>\n  --json                         Print a machine-readable JSON result\n  --no-stream                    Print only the final answer\n\nIf <task> is omitted, medusa run reads the task from stdin."
-            );
-            std::process::exit(0);
+        [command] if command == "--help" || command == "-h" => Ok(StartupCommand::Print(HELP_TEXT)),
+        [command] if command == "--version" || command == "-V" => {
+            Ok(StartupCommand::Print(VERSION_TEXT))
         }
         [command] => bail!("unknown command `{command}` (try `medusa run` or `medusa continue`)"),
         _ => bail!(
@@ -227,12 +258,7 @@ fn parse_headless_options(args: &[String]) -> Result<StartupCommand> {
                     })?);
                 index += 2;
             }
-            "--help" | "-h" => {
-                println!(
-                    "Usage: medusa run [options] [--] <task>\n\nOptions:\n  --model <name>                 Override the model for this run\n  --permission <open|guarded|readonly>\n  --json                         Print a machine-readable JSON result\n  --no-stream                    Print only the final answer\n\nIf <task> is omitted, medusa run reads the task from stdin."
-                );
-                std::process::exit(0);
-            }
+            "--help" | "-h" => return Ok(StartupCommand::Print(RUN_HELP_TEXT)),
             value if value.starts_with('-') && task_parts.is_empty() => {
                 bail!("unknown medusa run option `{value}`");
             }
@@ -281,6 +307,7 @@ fn run_headless(options: HeadlessOptions) -> Result<()> {
     let permission_mode = options
         .permission_mode
         .unwrap_or_else(|| settings.permission_mode());
+    let tools = tools.with_permission_mode(permission_mode);
     let mut backend =
         DirectCodexBackend::new(tools.workspace().to_path_buf()).wrap_err("HTTP client builds")?;
 
@@ -527,7 +554,7 @@ impl AppSettings {
         self.permission_mode
             .as_deref()
             .and_then(PermissionMode::from_name)
-            .unwrap_or(PermissionMode::Open)
+            .unwrap_or(PermissionMode::Guarded)
     }
 }
 
@@ -548,13 +575,9 @@ fn load_app_settings(workspace: &Path) -> Result<AppSettings> {
 
 fn save_app_settings(workspace: &Path, settings: &AppSettings) -> Result<()> {
     let path = app_settings_path(workspace);
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .wrap_err_with(|| format!("failed to create {}", parent.display()))?;
-    }
-
     let json = serde_json::to_string_pretty(settings).wrap_err("failed to encode settings")?;
-    fs::write(&path, json).wrap_err_with(|| format!("failed to write {}", path.display()))
+    atomic_write_private(&path, json)
+        .wrap_err_with(|| format!("failed to write {}", path.display()))
 }
 
 fn save_theme_preference(workspace: &Path, theme: ThemeKind) -> Result<()> {
@@ -571,6 +594,13 @@ fn save_model_preference(workspace: &Path, model: &str) -> Result<()> {
 
 fn save_reasoning_preference(workspace: &Path, effort: &str) -> Result<()> {
     let mut settings = load_app_settings(workspace).unwrap_or_default();
+    settings.reasoning_effort = Some(effort.trim().to_string());
+    save_app_settings(workspace, &settings)
+}
+
+fn save_model_picker_preferences(workspace: &Path, model: &str, effort: &str) -> Result<()> {
+    let mut settings = load_app_settings(workspace).unwrap_or_default();
+    settings.model = Some(model.trim().to_string());
     settings.reasoning_effort = Some(effort.trim().to_string());
     save_app_settings(workspace, &settings)
 }
@@ -705,6 +735,7 @@ struct App {
     settings_selection: usize,
     model_selection: usize,
     reasoning_selection: usize,
+    model_picker_pane: ModelPickerPane,
     permission_selection: usize,
     theme_selection: usize,
     image_preview_index: usize,
@@ -1387,6 +1418,12 @@ fn model_index(current: &str) -> usize {
         .unwrap_or(0)
 }
 
+fn model_default_reasoning(model: &str) -> Option<String> {
+    medusa_core::models::codex_backend_models()
+        .and_then(|models| models.into_iter().find(|candidate| candidate.slug == model))
+        .and_then(|model| model.default_reasoning)
+}
+
 /// Reasoning efforts selectable for `model`: the backend's per-model list when
 /// known, else standard defaults. The active effort is always present.
 fn reasoning_choices(model: &str, current: &str) -> Vec<String> {
@@ -1406,6 +1443,24 @@ fn reasoning_index(model: &str, current: &str) -> usize {
         .iter()
         .position(|effort| effort == current)
         .unwrap_or(0)
+}
+
+fn preferred_reasoning_for_model(model: &str, preferred: &str) -> String {
+    let choices = reasoning_choices(model, "");
+    if choices.iter().any(|effort| effort == preferred) {
+        return preferred.to_string();
+    }
+    if let Some(default) = model_default_reasoning(model)
+        && choices.iter().any(|effort| effort == &default)
+    {
+        return default;
+    }
+    choices
+        .iter()
+        .find(|effort| effort.as_str() == "medium")
+        .or_else(|| choices.first())
+        .cloned()
+        .unwrap_or_else(|| "medium".to_string())
 }
 
 /// Backend description for a reasoning effort of a model, when the cache has one.
@@ -1519,6 +1574,12 @@ enum UiFocus {
     Activity,
     Modal,
     Transcript,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ModelPickerPane {
+    Models,
+    Reasoning,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2106,6 +2167,7 @@ impl App {
             settings_selection: 0,
             model_selection: 0,
             reasoning_selection: 0,
+            model_picker_pane: ModelPickerPane::Models,
             permission_selection: permission_mode_index(permission_mode),
             theme_selection: theme_index(theme),
             image_preview_index: 0,
@@ -2372,15 +2434,19 @@ impl App {
                     KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                         self.should_quit = true;
                     }
-                    KeyCode::Up | KeyCode::BackTab => self.move_model_selection_up(),
-                    KeyCode::Down | KeyCode::Tab => self.move_model_selection_down(),
-                    KeyCode::Home => self.model_selection = 0,
-                    KeyCode::End => {
-                        self.model_selection = model_choices(self.model.model_name())
-                            .len()
-                            .saturating_sub(1);
+                    KeyCode::Left | KeyCode::Char('h') | KeyCode::BackTab => {
+                        self.model_picker_pane = ModelPickerPane::Models;
+                        self.status_line = "choose model".to_string();
                     }
-                    KeyCode::Enter => self.accept_model_selection(),
+                    KeyCode::Right | KeyCode::Char('l') | KeyCode::Tab => {
+                        self.model_picker_pane = ModelPickerPane::Reasoning;
+                        self.status_line = "choose reasoning effort".to_string();
+                    }
+                    KeyCode::Up => self.move_model_picker_selection_up(),
+                    KeyCode::Down => self.move_model_picker_selection_down(),
+                    KeyCode::Home => self.move_model_picker_selection_home(),
+                    KeyCode::End => self.move_model_picker_selection_end(),
+                    KeyCode::Enter => self.accept_model_picker_selection(),
                     _ => {}
                 }
                 return;
@@ -2756,9 +2822,9 @@ impl App {
         let safe_name = sanitize_attachment_name(name_hint, extension);
         let file_name = format!("{id}-{safe_name}");
         let dir = self.attachment_dir()?;
-        fs::create_dir_all(&dir).wrap_err("failed to create attachments directory")?;
         let path = dir.join(file_name);
-        fs::write(&path, &bytes).wrap_err_with(|| format!("failed to write {}", path.display()))?;
+        atomic_write_private(&path, &bytes)
+            .wrap_err_with(|| format!("failed to write {}", path.display()))?;
         Ok(ImageAttachment {
             id,
             name: safe_name,
@@ -3410,8 +3476,10 @@ impl App {
 
     fn open_models_modal(&mut self) {
         self.active_modal = Some(Modal::Models);
+        self.model_picker_pane = ModelPickerPane::Models;
         self.model_selection = model_index(self.model.model_name());
-        self.status_line = "models opened".to_string();
+        self.sync_model_picker_reasoning_selection();
+        self.status_line = "model and execution mode picker opened".to_string();
     }
 
     fn open_reasoning_modal(&mut self) {
@@ -3460,6 +3528,7 @@ impl App {
         let items = self.settings_items();
         match items.get(self.settings_selection).map(|item| item.key) {
             Some("model") => self.open_models_modal(),
+            Some("reasoning") => self.open_reasoning_modal(),
             Some("theme") => self.open_themes_modal(),
             Some("permissions") => self.open_permissions_modal(),
             Some("bell") => self.toggle_bell_setting(),
@@ -3499,7 +3568,8 @@ impl App {
         } else {
             self.model_selection - 1
         };
-        self.status_line = "model selection".to_string();
+        self.sync_model_picker_reasoning_selection();
+        self.status_line = "choose model".to_string();
     }
 
     fn move_model_selection_down(&mut self) {
@@ -3508,19 +3578,129 @@ impl App {
             return;
         }
         self.model_selection = (self.model_selection + 1) % count;
-        self.status_line = "model selection".to_string();
+        self.sync_model_picker_reasoning_selection();
+        self.status_line = "choose model".to_string();
     }
 
-    fn accept_model_selection(&mut self) {
+    fn selected_model_picker_model(&self) -> String {
         let choices = model_choices(self.model.model_name());
-        let Some(model) = choices
+        choices
             .get(self.model_selection.min(choices.len().saturating_sub(1)))
+            .cloned()
+            .unwrap_or_else(|| self.model.model_name().to_string())
+    }
+
+    fn model_picker_reasoning_choices(&self) -> Vec<String> {
+        reasoning_choices(&self.selected_model_picker_model(), "")
+    }
+
+    fn sync_model_picker_reasoning_selection(&mut self) {
+        let model = self.selected_model_picker_model();
+        let preferred = preferred_reasoning_for_model(&model, self.model.reasoning_effort());
+        let choices = reasoning_choices(&model, "");
+        self.reasoning_selection = choices
+            .iter()
+            .position(|effort| effort == &preferred)
+            .unwrap_or(0);
+    }
+
+    fn move_model_picker_selection_up(&mut self) {
+        match self.model_picker_pane {
+            ModelPickerPane::Models => self.move_model_selection_up(),
+            ModelPickerPane::Reasoning => {
+                let count = self.model_picker_reasoning_choices().len();
+                if count == 0 {
+                    return;
+                }
+                self.reasoning_selection = if self.reasoning_selection == 0 {
+                    count - 1
+                } else {
+                    self.reasoning_selection - 1
+                };
+                self.status_line = "choose reasoning effort".to_string();
+            }
+        }
+    }
+
+    fn move_model_picker_selection_down(&mut self) {
+        match self.model_picker_pane {
+            ModelPickerPane::Models => self.move_model_selection_down(),
+            ModelPickerPane::Reasoning => {
+                let count = self.model_picker_reasoning_choices().len();
+                if count == 0 {
+                    return;
+                }
+                self.reasoning_selection = (self.reasoning_selection + 1) % count;
+                self.status_line = "choose reasoning effort".to_string();
+            }
+        }
+    }
+
+    fn move_model_picker_selection_home(&mut self) {
+        match self.model_picker_pane {
+            ModelPickerPane::Models => {
+                self.model_selection = 0;
+                self.sync_model_picker_reasoning_selection();
+                self.status_line = "choose model".to_string();
+            }
+            ModelPickerPane::Reasoning => {
+                self.reasoning_selection = 0;
+                self.status_line = "choose reasoning effort".to_string();
+            }
+        }
+    }
+
+    fn move_model_picker_selection_end(&mut self) {
+        match self.model_picker_pane {
+            ModelPickerPane::Models => {
+                self.model_selection = model_choices(self.model.model_name())
+                    .len()
+                    .saturating_sub(1);
+                self.sync_model_picker_reasoning_selection();
+                self.status_line = "choose model".to_string();
+            }
+            ModelPickerPane::Reasoning => {
+                self.reasoning_selection = self
+                    .model_picker_reasoning_choices()
+                    .len()
+                    .saturating_sub(1);
+                self.status_line = "choose reasoning effort".to_string();
+            }
+        }
+    }
+
+    fn accept_model_picker_selection(&mut self) {
+        if self.model_picker_pane == ModelPickerPane::Models {
+            self.model_picker_pane = ModelPickerPane::Reasoning;
+            self.status_line = "choose reasoning effort".to_string();
+            return;
+        }
+
+        let model = self.selected_model_picker_model();
+        let choices = self.model_picker_reasoning_choices();
+        let Some(effort) = choices
+            .get(
+                self.reasoning_selection
+                    .min(choices.len().saturating_sub(1)),
+            )
             .cloned()
         else {
             return;
         };
-        self.set_model_name(&model);
+
+        self.model.set_model_name(model.clone());
+        self.model.set_reasoning_effort(effort.clone());
+        self.model_selection = model_index(&model);
+        self.reasoning_selection = reasoning_index(&model, &effort);
         self.active_modal = None;
+        self.status_line = format!("model: {model} · reasoning: {effort}");
+        match save_model_picker_preferences(self.tools.workspace(), &model, &effort) {
+            Ok(()) => self.toast(
+                format!("Model set to {model} · {effort}"),
+                ToastKind::Success,
+            ),
+            Err(error) => self.toast(format!("Model set, save failed: {error}"), ToastKind::Error),
+        }
     }
 
     fn move_reasoning_selection_up(&mut self) {
@@ -4602,7 +4782,7 @@ impl App {
             };
             self.transcript
                 .push(TranscriptItem::Message(ChatMessage::system(format!(
-                    "usage: /workflow <script-name> [args]  — run a saved JS workflow script\n       /workflow <task>               — run the built-in recon/implement/verify pipeline\n\n{script_lines}",
+                    "usage: /workflow <script-name> [args]  — run a saved JS workflow script\n       /workflow <task>               — have the model author and run a task-specific JS workflow\n\n{script_lines}",
                 ))));
             self.touch_transcript();
             self.status_line = "workflow needs a task or script".to_string();
@@ -4611,16 +4791,7 @@ impl App {
         }
 
         if let Some(workflow_task) = task.strip_prefix("/workflow ") {
-            let workflow_task = workflow_task.trim();
-            let (first, rest) = match workflow_task.split_once(char::is_whitespace) {
-                Some((first, rest)) => (first, rest.trim()),
-                None => (workflow_task, ""),
-            };
-            if WorkflowScript::list(self.tools.workspace()).contains(&first.to_string()) {
-                self.start_workflow_script(first, rest);
-            } else {
-                self.start_workflow(workflow_task);
-            }
+            self.start_workflow_request(workflow_task);
             return true;
         }
 
@@ -5874,7 +6045,20 @@ impl App {
         self.should_quit = true;
     }
 
-    fn start_workflow(&mut self, task: &str) {
+    fn start_workflow_request(&mut self, request: &str) {
+        let request = request.trim();
+        let (first, rest) = match request.split_once(char::is_whitespace) {
+            Some((first, rest)) => (first, rest.trim()),
+            None => (request, ""),
+        };
+        if WorkflowScript::list(self.tools.workspace()).contains(&first.to_string()) {
+            self.start_workflow_script(first, rest);
+        } else {
+            self.start_model_authored_workflow(request);
+        }
+    }
+
+    fn start_model_authored_workflow(&mut self, task: &str) {
         if task.trim().is_empty() {
             self.status_line = "workflow needs a task".to_string();
             self.toast("Workflow task required", ToastKind::Warning);
@@ -5898,61 +6082,14 @@ impl App {
         }
 
         let command = format!("/workflow {}", task.trim());
-        let user_index = self.transcript.len();
         self.transcript
             .push(TranscriptItem::Message(ChatMessage::user(command.clone())));
         self.touch_transcript();
         self.persist_session();
         self.scroll_chat_to_bottom();
 
-        let runtime = WorkflowRuntime::new(self.tools.workspace().to_path_buf())
-            .with_memory_context(self.session_state_context_text());
-        self.denied_this_turn.clear();
-        self.denied_edits_this_turn.clear();
-        let backend = self.model.clone();
-        // Per-run checkpoint recorder + cancel token so subagent file edits are
-        // captured (rewindable) and the run's tools are cancellable — parity
-        // with the model-turn path.
-        let recorder = self.new_workflow_checkpoint(&command, user_index);
-        let cancel = CancelToken::new();
-        let tools = self
-            .tools
-            .clone()
-            .with_approval_handler(self.approval_handler.clone())
-            .with_checkpoint_recorder(recorder.clone())
-            .with_cancel_token(cancel.clone());
-        #[cfg(test)]
-        {
-            self.last_workflow_runtime = Some(tools.clone());
-        }
-        let task = task.trim().to_string();
-        let (sender, receiver) = mpsc::channel();
-        self.workflow_events.push(BackgroundWorkflow {
-            events: receiver,
-            checkpoint: recorder,
-            cancel,
-        });
-        if !self.is_working() {
-            self.status_line = "background workflow starting".to_string();
-        }
-        self.toast("Background workflow started", ToastKind::Info);
-
-        thread::spawn(move || {
-            let result = runtime.run_task(task, backend, tools, |event| {
-                sender.send(event).map_err(|error| {
-                    color_eyre::eyre::eyre!("failed to send workflow event: {error}")
-                })?;
-                Ok(())
-            });
-
-            if let Err(error) = result {
-                let _ = sender.send(WorkflowEvent::RunFinished {
-                    run_id: "workflow-error".to_string(),
-                    status: WorkflowStatus::Failed,
-                    summary: format!("workflow failed: {error}"),
-                });
-            }
-        });
+        self.status_line = "authoring dynamic workflow".to_string();
+        self.start_model_turn(&command);
     }
 
     fn start_workflow_script(&mut self, name: &str, raw_args: &str) {
@@ -6724,9 +6861,8 @@ impl App {
                 run_id,
                 title,
                 task,
-                phases,
             } => {
-                let view = workflow_view_from_plan(run_id, title, task, phases);
+                let view = workflow_view_started(run_id, title, task);
                 self.set_workflow_status_line(format!("workflow: {}", truncate(&view.title, 48)));
                 self.workflows.push(view.clone());
                 self.transcript.push(TranscriptItem::Workflow(view));
@@ -6910,7 +7046,7 @@ impl App {
 
         if let Some(workflow_task) = task.strip_prefix("/workflow ") {
             self.status_line = "starting queued workflow".to_string();
-            self.start_workflow(workflow_task);
+            self.start_workflow_request(workflow_task);
             return;
         }
 
@@ -7641,7 +7777,7 @@ impl App {
                 Some(Modal::Themes) => "↑/↓ · enter · esc",
                 Some(Modal::Rewind) => "↑/↓ · enter · esc",
                 Some(Modal::EditMessage) => "↑/↓ · enter · esc",
-                Some(Modal::Models) => "↑/↓ · enter · esc",
+                Some(Modal::Models) => "↑/↓ choose · ←/→ pane · enter · esc",
                 Some(Modal::Permissions) => "↑/↓ · enter · esc",
                 Some(Modal::ImagePreview) => "j/k · +/- · d detach · o/y · esc",
                 _ => "esc",
@@ -8024,7 +8160,8 @@ impl App {
         let popup_width = match modal {
             Modal::ImagePreview => area.width.saturating_sub(4).min(128),
             Modal::Settings | Modal::Themes => area.width.saturating_sub(8).min(94),
-            Modal::Models | Modal::Permissions => area.width.saturating_sub(8).min(88),
+            Modal::Models => area.width.saturating_sub(8).min(104),
+            Modal::Permissions => area.width.saturating_sub(8).min(88),
             _ => area.width.saturating_sub(8).min(78),
         };
         let popup_height = area.height.saturating_sub(4).min(match modal {
@@ -8036,7 +8173,8 @@ impl App {
             Modal::Jobs => 16,
             Modal::Sessions => 14,
             Modal::SessionTree => 18,
-            Modal::Models | Modal::Reasoning | Modal::Permissions => 16,
+            Modal::Models => 18,
+            Modal::Reasoning | Modal::Permissions => 16,
             Modal::Themes => 18,
             Modal::Rewind => 16,
             Modal::EditMessage => 18,
@@ -8645,9 +8783,18 @@ impl App {
                 detail.extend(theme_preview_lines(self.theme));
             } else if item.key == "model" {
                 detail.push(Line::from(""));
-                detail.extend(model_detail_lines(
+                detail.extend(model_picker_detail_lines(
                     self.model.model_name(),
+                    self.model.reasoning_effort(),
                     self.model.model_name(),
+                    self.model.reasoning_effort(),
+                ));
+            } else if item.key == "reasoning" {
+                detail.push(Line::from(""));
+                detail.extend(reasoning_detail_lines(
+                    self.model.model_name(),
+                    self.model.reasoning_effort(),
+                    self.model.reasoning_effort(),
                 ));
             } else if item.key == "permissions" {
                 detail.push(Line::from(""));
@@ -8730,7 +8877,7 @@ impl App {
 
     fn draw_models_modal(&self, frame: &mut Frame<'_>, area: Rect) {
         frame.render_widget(
-            modal_block(" Model ")
+            modal_block(" Model & execution mode ")
                 .border_type(BorderType::Rounded)
                 .padding(Padding::new(2, 2, 0, 0)),
             area,
@@ -8749,26 +8896,101 @@ impl App {
             .split(inner);
         let columns = Layout::default()
             .direction(Direction::Horizontal)
-            .constraints([Constraint::Length(30), Constraint::Min(34)])
+            .constraints([
+                Constraint::Length(28),
+                Constraint::Length(2),
+                Constraint::Length(18),
+                Constraint::Length(2),
+                Constraint::Min(28),
+            ])
             .split(sections[1]);
 
         let header = Paragraph::new(vec![
             Line::from(vec![
-                Span::styled("Model picker", accent().add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    "Model & execution mode",
+                    accent().add_modifier(Modifier::BOLD),
+                ),
                 Span::styled("  ", muted()),
                 Span::styled(self.model.provider_name(), muted()),
                 Span::styled("/", muted()),
                 Span::styled(self.model.model_name().to_string(), prompt_style()),
+                Span::styled(" · ", muted()),
+                Span::styled(self.model.reasoning_effort().to_string(), prompt_style()),
             ]),
             Line::from(vec![
-                Span::styled("enter saves for future turns", muted()),
-                Span::styled(" · ", muted()),
+                Span::styled("choose effort or Ultra orchestration", muted()),
+                Span::styled("  ·  ", muted()),
                 Span::styled("/model <id>", prompt_style()),
                 Span::styled(" accepts any model id", muted()),
             ]),
         ])
         .style(Style::default().bg(surface()).fg(text()));
         frame.render_widget(header, sections[0]);
+
+        let model_sections = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(1), Constraint::Min(1)])
+            .split(columns[0]);
+        let reasoning_sections = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(1), Constraint::Min(1)])
+            .split(columns[2]);
+        let detail_sections = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(1), Constraint::Min(1)])
+            .split(columns[4]);
+        let model_pane_active = self.model_picker_pane == ModelPickerPane::Models;
+        let reasoning_pane_active = self.model_picker_pane == ModelPickerPane::Reasoning;
+
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(
+                    if model_pane_active { "● " } else { "  " },
+                    if model_pane_active { accent() } else { muted() },
+                ),
+                Span::styled(
+                    "MODEL",
+                    if model_pane_active {
+                        accent().add_modifier(Modifier::BOLD)
+                    } else {
+                        muted().add_modifier(Modifier::BOLD)
+                    },
+                ),
+            ]))
+            .style(Style::default().bg(surface())),
+            model_sections[0],
+        );
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(
+                    if reasoning_pane_active { "● " } else { "  " },
+                    if reasoning_pane_active {
+                        accent()
+                    } else {
+                        muted()
+                    },
+                ),
+                Span::styled(
+                    "EFFORT / MODE",
+                    if reasoning_pane_active {
+                        accent().add_modifier(Modifier::BOLD)
+                    } else {
+                        muted().add_modifier(Modifier::BOLD)
+                    },
+                ),
+            ]))
+            .style(Style::default().bg(surface())),
+            reasoning_sections[0],
+        );
+        frame.render_widget(
+            Paragraph::new(Span::styled(
+                "SELECTION",
+                muted().add_modifier(Modifier::BOLD),
+            ))
+            .style(Style::default().bg(surface())),
+            detail_sections[0],
+        );
 
         let choices = model_choices(self.model.model_name());
         let rows = choices
@@ -8793,24 +9015,86 @@ impl App {
         let mut state = ListState::default().with_selected(Some(self.model_selection));
         let list = List::new(rows)
             .style(Style::default().bg(surface()).fg(text()))
-            .highlight_style(command_selected_style())
-            .highlight_symbol("▌ ");
-        frame.render_stateful_widget(list, columns[0], &mut state);
+            .highlight_style(if model_pane_active {
+                command_selected_style()
+            } else {
+                Style::default()
+                    .bg(surface())
+                    .fg(accent_color())
+                    .add_modifier(Modifier::BOLD)
+            })
+            .highlight_symbol(if model_pane_active { "▌ " } else { "› " });
+        frame.render_stateful_widget(list, model_sections[1], &mut state);
 
         let selected = choices
             .get(self.model_selection.min(choices.len().saturating_sub(1)))
             .map(String::as_str)
             .unwrap_or(self.model.model_name());
-        let detail = Paragraph::new(model_detail_lines(selected, self.model.model_name()))
+        let reasoning_choices = reasoning_choices(selected, "");
+        let selected_reasoning = reasoning_choices
+            .get(
+                self.reasoning_selection
+                    .min(reasoning_choices.len().saturating_sub(1)),
+            )
+            .map(String::as_str)
+            .unwrap_or(self.model.reasoning_effort());
+        let reasoning_rows = reasoning_choices
+            .iter()
+            .map(|effort| {
+                let active =
+                    selected == self.model.model_name() && effort == self.model.reasoning_effort();
+                ListItem::new(Line::from(vec![
+                    Span::styled(
+                        if active { "● " } else { "  " },
+                        if active { success_style() } else { muted() },
+                    ),
+                    Span::styled(effort.clone(), value_style()),
+                ]))
+            })
+            .collect::<Vec<_>>();
+        let mut reasoning_state =
+            ListState::default().with_selected(Some(self.reasoning_selection));
+        let reasoning_list = List::new(reasoning_rows)
             .style(Style::default().bg(surface()).fg(text()))
-            .wrap(Wrap { trim: true });
-        frame.render_widget(detail, columns[1]);
+            .highlight_style(if reasoning_pane_active {
+                command_selected_style()
+            } else {
+                Style::default()
+                    .bg(surface())
+                    .fg(accent_color())
+                    .add_modifier(Modifier::BOLD)
+            })
+            .highlight_symbol(if reasoning_pane_active {
+                "▌ "
+            } else {
+                "› "
+            });
+        frame.render_stateful_widget(reasoning_list, reasoning_sections[1], &mut reasoning_state);
+
+        let detail = Paragraph::new(model_picker_detail_lines(
+            selected,
+            selected_reasoning,
+            self.model.model_name(),
+            self.model.reasoning_effort(),
+        ))
+        .style(Style::default().bg(surface()).fg(text()))
+        .wrap(Wrap { trim: true });
+        frame.render_widget(detail, detail_sections[1]);
 
         let footer = Paragraph::new(Line::from(vec![
-            Span::styled("↑/↓ tab", prompt_style()),
+            Span::styled("↑/↓", prompt_style()),
             Span::styled(" choose  ", muted()),
+            Span::styled("←/→ tab", prompt_style()),
+            Span::styled(" pane  ", muted()),
             Span::styled("enter", prompt_style()),
-            Span::styled(" save  ", muted()),
+            Span::styled(
+                if model_pane_active {
+                    " next  "
+                } else {
+                    " save  "
+                },
+                muted(),
+            ),
             Span::styled("esc", prompt_style()),
             Span::styled(" close", muted()),
         ]))
@@ -8821,7 +9105,7 @@ impl App {
 
     fn draw_reasoning_modal(&self, frame: &mut Frame<'_>, area: Rect) {
         frame.render_widget(
-            modal_block(" Reasoning effort ")
+            modal_block(" Reasoning & orchestration ")
                 .border_type(BorderType::Rounded)
                 .padding(Padding::new(2, 2, 0, 0)),
             area,
@@ -8848,12 +9132,15 @@ impl App {
         let (model_label, _) = model_display(&model);
         let header = Paragraph::new(vec![
             Line::from(vec![
-                Span::styled("Reasoning effort", accent().add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    "Reasoning & orchestration",
+                    accent().add_modifier(Modifier::BOLD),
+                ),
                 Span::styled("  for ", muted()),
                 Span::styled(model_label, prompt_style()),
             ]),
             Line::from(Span::styled(
-                "higher effort = deeper thinking, slower + more tokens",
+                "effort controls thinking depth; Ultra adds proactive multi-agent delegation",
                 muted(),
             )),
         ])
@@ -9519,7 +9806,14 @@ impl App {
                 key: "model",
                 value: self.model.model_name().to_string(),
                 description: "The model Medusa sends coding turns to.",
-                action: "enter opens model picker",
+                action: "enter opens model + execution mode picker",
+                editable: true,
+            },
+            SettingsItem {
+                key: "reasoning",
+                value: self.model.reasoning_effort().to_string(),
+                description: "Thinking depth, or Ultra for proactive multi-agent orchestration.",
+                action: "enter opens reasoning picker",
                 editable: true,
             },
             SettingsItem {
@@ -9947,13 +10241,13 @@ const SLASH_COMMANDS: &[SlashCommand] = &[
         name: "/model",
         args: "<name>",
         category: "model",
-        description: "Change the model used for new turns",
+        description: "Choose the model and execution mode for new turns",
     },
     SlashCommand {
         name: "/reasoning",
         args: "[effort]",
         category: "model",
-        description: "Set the reasoning/thinking effort (low…xhigh, model-specific)",
+        description: "Set thinking effort, or Ultra orchestration when supported",
     },
     SlashCommand {
         name: "/permissions",
@@ -9983,7 +10277,7 @@ const SLASH_COMMANDS: &[SlashCommand] = &[
         name: "/workflow",
         args: "<script|task> [args]",
         category: "agent",
-        description: "Run a saved JS workflow script or the built-in subagent pipeline",
+        description: "Run a saved or model-authored JavaScript workflow",
     },
     SlashCommand {
         name: "/sessions",
@@ -10353,7 +10647,7 @@ fn append_quick_memory(workspace: &Path, note: &str) -> Result<()> {
         String::new()
     };
     let updated = quick_memory_content(&existing, note);
-    fs::write(&path, updated).wrap_err_with(|| format!("failed to write {}", path.display()))
+    atomic_write(&path, updated).wrap_err_with(|| format!("failed to write {}", path.display()))
 }
 
 /// Collapse a quick-memory note to a single safe line so it can never forge a
@@ -10792,37 +11086,13 @@ fn decision_answer_text(decision: &DecisionView) -> String {
     lines.join("\n")
 }
 
-fn workflow_view_from_plan(
-    id: String,
-    title: String,
-    task: String,
-    phases: Vec<WorkflowPhasePlan>,
-) -> WorkflowRunView {
+fn workflow_view_started(id: String, title: String, task: String) -> WorkflowRunView {
     WorkflowRunView {
         id,
         title,
         task,
         status: WorkflowViewState::Running,
-        phases: phases
-            .into_iter()
-            .map(|phase| WorkflowPhaseView {
-                name: phase.name,
-                objective: phase.objective,
-                status: WorkflowViewState::Pending,
-                agents: phase
-                    .agents
-                    .into_iter()
-                    .map(|agent| WorkflowAgentView {
-                        name: agent.name,
-                        role: agent.role,
-                        tool_policy: agent.tool_policy,
-                        status: WorkflowViewState::Pending,
-                        output: String::new(),
-                        tool_counts: BTreeMap::new(),
-                    })
-                    .collect(),
-            })
-            .collect(),
+        phases: Vec::new(),
         summary: String::new(),
         expanded: false,
     }
@@ -11659,10 +11929,8 @@ fn input_display_lines(input: &str, cursor: usize, max_lines: usize) -> Vec<Line
                 }
             }
             current_line += 1;
-        } else {
-            if current_line >= visible_start_line {
-                current.push(Span::styled(ch.to_string(), value_style()));
-            }
+        } else if current_line >= visible_start_line {
+            current.push(Span::styled(ch.to_string(), value_style()));
         }
     }
 
@@ -13270,9 +13538,14 @@ fn theme_preview_lines(theme: ThemeKind) -> Vec<Line<'static>> {
     ]
 }
 
-fn model_detail_lines(selected: &str, active: &str) -> Vec<Line<'static>> {
-    let is_active = selected == active;
-    let (display_name, description) = model_display(selected);
+fn model_picker_detail_lines(
+    selected_model: &str,
+    selected_effort: &str,
+    active_model: &str,
+    active_effort: &str,
+) -> Vec<Line<'static>> {
+    let is_active = selected_model == active_model && selected_effort == active_effort;
+    let (display_name, description) = model_display(selected_model);
     let mut lines = vec![Line::from(vec![
         Span::styled(
             display_name.clone(),
@@ -13284,49 +13557,62 @@ fn model_detail_lines(selected: &str, active: &str) -> Vec<Line<'static>> {
             if is_active { success_style() } else { muted() },
         ),
     ])];
-    if display_name != selected {
-        lines.push(Line::from(Span::styled(selected.to_string(), muted())));
+    if display_name != selected_model {
+        lines.push(Line::from(Span::styled(
+            selected_model.to_string(),
+            muted(),
+        )));
     }
     lines.push(Line::from(""));
-    // Backend-provided description, when the Codex model cache has one.
     if let Some(description) = description {
         lines.push(Line::from(Span::styled(description, value_style())));
         lines.push(Line::from(""));
     }
+    lines.push(Line::from(vec![
+        Span::styled(
+            if selected_effort.eq_ignore_ascii_case("ultra") {
+                "mode  "
+            } else {
+                "reasoning  "
+            },
+            muted(),
+        ),
+        Span::styled(
+            selected_effort.to_string(),
+            prompt_style().add_modifier(Modifier::BOLD),
+        ),
+    ]));
+    if let Some(description) = reasoning_description(selected_model, selected_effort) {
+        lines.push(Line::from(Span::styled(description, value_style())));
+    }
+    if selected_effort.eq_ignore_ascii_case("ultra") {
+        lines.push(Line::from(vec![
+            Span::styled("model effort  ", muted()),
+            Span::styled("max", value_style()),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled("orchestration  ", muted()),
+            Span::styled("proactive workflows + subagents", value_style()),
+        ]));
+    }
     lines.extend([
-        Line::from(Span::styled(
-            "The selected model is used for new Medusa turns. Active streams keep the model they started with.",
-            value_style(),
-        )),
-        Line::from(""),
         Line::from(vec![
             Span::styled("backend  ", muted()),
-            Span::styled(model_backend_hint(selected), value_style()),
+            Span::styled(model_backend_hint(selected_model), value_style()),
         ]),
         Line::from(vec![
             Span::styled("config  ", muted()),
             Span::styled(".medusa/settings.json", value_style()),
         ]),
-        Line::from(vec![
-            Span::styled("override  ", muted()),
-            Span::styled("MEDUSA_MODEL", value_style()),
-            Span::styled(" wins for one-off launches", muted()),
-        ]),
-        Line::from(vec![
-            Span::styled("provider  ", muted()),
-            Span::styled("MEDUSA_PROVIDER", value_style()),
-            Span::styled(" can force codex, deepseek, or openai-compatible", muted()),
-        ]),
         Line::from(""),
-        Line::from(vec![
-            Span::styled("custom  ", muted()),
-            Span::styled("/model <provider-model-id>", prompt_style()),
-        ]),
-        Line::from(vec![
-            Span::styled("effort  ", muted()),
-            Span::styled("/reasoning", prompt_style()),
-            Span::styled(" sets thinking depth", muted()),
-        ]),
+        Line::from(Span::styled(
+            if selected_effort.eq_ignore_ascii_case("ultra") {
+                "Ultra is orchestrated by Medusa; it is never sent as a raw reasoning value."
+            } else {
+                "Applies to new turns. Active work keeps its current model and effort."
+            },
+            muted(),
+        )),
     ]);
     lines
 }
@@ -13350,9 +13636,26 @@ fn reasoning_detail_lines(model: &str, selected: &str, active: &str) -> Vec<Line
         lines.push(Line::from(Span::styled(description, value_style())));
         lines.push(Line::from(""));
     }
+    if selected.eq_ignore_ascii_case("ultra") {
+        lines.extend([
+            Line::from(vec![
+                Span::styled("model effort  ", muted()),
+                Span::styled("max", value_style()),
+            ]),
+            Line::from(vec![
+                Span::styled("orchestration  ", muted()),
+                Span::styled("proactive workflows + subagents", value_style()),
+            ]),
+            Line::from(""),
+        ]);
+    }
     lines.extend([
         Line::from(Span::styled(
-            "Applies to new turns; active streams keep the effort they started with.",
+            if selected.eq_ignore_ascii_case("ultra") {
+                "Ultra is a Medusa orchestration mode, not a raw API reasoning value."
+            } else {
+                "Applies to new turns; active streams keep the effort they started with."
+            },
             value_style(),
         )),
         Line::from(""),
@@ -14359,7 +14662,7 @@ fn placeholder_style() -> Style {
 mod tests {
     use super::*;
     use medusa_core::session::{compact_session_id, normalize_session_name, read_session_file};
-    use medusa_core::workflow::{SubagentSpec, SubagentToolPolicy};
+    use medusa_core::workflow::SubagentToolPolicy;
 
     fn app() -> App {
         App::with_model_backend(false)
@@ -14373,6 +14676,12 @@ mod tests {
             checkpoint: app.new_workflow_checkpoint("/workflow test", 0),
             cancel: CancelToken::new(),
         }
+    }
+
+    fn write_saved_workflow(app: &App, name: &str, source: &str) {
+        let directory = app.tools.workspace().join(".medusa/workflows");
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(directory.join(format!("{name}.js")), source).unwrap();
     }
 
     fn line_text(line: &Line<'_>) -> String {
@@ -14849,6 +15158,7 @@ mod tests {
     fn settings_command_opens_settings_modal() {
         let mut app = app();
         let expected_theme = app.theme.name().to_string();
+        let expected_reasoning = app.model.reasoning_effort().to_string();
 
         app.input = "/settings".to_string();
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
@@ -14863,12 +15173,17 @@ mod tests {
         assert!(
             app.settings_rows()
                 .iter()
+                .any(|(key, value)| { *key == "reasoning" && value == &expected_reasoning })
+        );
+        assert!(
+            app.settings_rows()
+                .iter()
                 .any(|(key, value)| { *key == "theme" && value == &expected_theme })
         );
         assert!(
             app.settings_rows()
                 .iter()
-                .any(|(key, value)| { *key == "permissions" && value == "open" })
+                .any(|(key, value)| { *key == "permissions" && value == "guarded" })
         );
     }
 
@@ -14896,7 +15211,61 @@ mod tests {
 
         assert_eq!(app.active_modal, Some(Modal::Models));
         assert_eq!(app.input, "");
-        assert_eq!(app.status_line, "models opened");
+        assert_eq!(app.model_picker_pane, ModelPickerPane::Models);
+        assert_eq!(app.status_line, "model and execution mode picker opened");
+    }
+
+    #[test]
+    fn model_picker_steps_into_reasoning_and_persists_both() {
+        let (mut app, workspace) = app_in_workspace();
+        app.model.set_model_name("custom-test-model");
+        app.model.set_reasoning_effort("medium");
+
+        app.open_models_modal();
+        assert_eq!(app.model_picker_pane, ModelPickerPane::Models);
+        assert_eq!(
+            app.reasoning_selection,
+            reasoning_index("custom-test-model", "medium")
+        );
+
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.active_modal, Some(Modal::Models));
+        assert_eq!(app.model_picker_pane, ModelPickerPane::Reasoning);
+
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert_eq!(app.active_modal, None);
+        assert_eq!(app.model.model_name(), "custom-test-model");
+        assert_eq!(app.model.reasoning_effort(), "high");
+        assert_eq!(
+            app.status_line,
+            "model: custom-test-model · reasoning: high"
+        );
+        let settings = load_app_settings(&workspace).unwrap();
+        assert_eq!(settings.model(), Some("custom-test-model".to_string()));
+        assert_eq!(settings.reasoning_effort(), Some("high".to_string()));
+    }
+
+    #[test]
+    fn model_picker_renders_model_mode_and_selection_panes() {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let mut app = app();
+        app.open_models_modal();
+        let mut terminal = Terminal::new(TestBackend::new(112, 24)).unwrap();
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                app.draw_modal(frame, area);
+            })
+            .unwrap();
+        let rendered = buffer_text(terminal.backend().buffer());
+
+        assert!(rendered.contains("Model & execution mode"), "{rendered}");
+        assert!(rendered.contains("MODEL"), "{rendered}");
+        assert!(rendered.contains("EFFORT / MODE"), "{rendered}");
+        assert!(rendered.contains("SELECTION"), "{rendered}");
     }
 
     #[test]
@@ -14979,6 +15348,14 @@ mod tests {
             load_app_settings(&workspace).unwrap().reasoning_effort(),
             None
         );
+    }
+
+    #[test]
+    fn fresh_workspaces_default_to_guarded_permissions() {
+        let workspace = temp_workspace();
+        let settings = load_app_settings(&workspace).unwrap();
+
+        assert_eq!(settings.permission_mode(), PermissionMode::Guarded);
     }
 
     #[test]
@@ -15148,6 +15525,15 @@ mod tests {
             .unwrap();
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert_eq!(app.active_modal, Some(Modal::Models));
+
+        app.open_settings_modal();
+        app.settings_selection = app
+            .settings_items()
+            .iter()
+            .position(|item| item.key == "reasoning")
+            .unwrap();
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.active_modal, Some(Modal::Reasoning));
 
         app.open_settings_modal();
         app.settings_selection = app
@@ -15957,7 +16343,11 @@ mod tests {
         let mut app = app();
 
         app.open_settings_modal();
-        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        app.settings_selection = app
+            .settings_items()
+            .iter()
+            .position(|item| item.key == "theme")
+            .unwrap();
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
 
         assert_eq!(app.active_modal, Some(Modal::Themes));
@@ -16268,25 +16658,35 @@ mod tests {
     }
 
     #[test]
+    fn workflow_help_describes_only_scripted_workflows() {
+        let mut app = app();
+
+        assert!(app.run_local_tool_command("/workflow"));
+
+        assert!(matches!(
+            app.transcript.last(),
+            Some(TranscriptItem::Message(ChatMessage {
+                role: ChatRole::System,
+                content,
+                ..
+            })) if content.contains("model author and run a task-specific JS workflow")
+        ));
+    }
+
+    #[test]
     fn workflow_events_create_and_finish_transcript_run() {
         let mut app = app();
-        let phases = vec![WorkflowPhasePlan {
-            name: "recon".to_string(),
-            objective: "Map code".to_string(),
-            agents: vec![SubagentSpec {
-                name: "mapper".to_string(),
-                role: "mapper".to_string(),
-                prompt: "inspect".to_string(),
-                allow_mutation: false,
-                tool_policy: SubagentToolPolicy::ReadOnly,
-            }],
-        }];
 
         app.apply_workflow_event(WorkflowEvent::RunStarted {
             run_id: "workflow-test".to_string(),
             title: "inspect code".to_string(),
             task: "inspect code".to_string(),
-            phases,
+        });
+        app.apply_workflow_event(WorkflowEvent::PhaseStarted {
+            run_id: "workflow-test".to_string(),
+            phase_index: 0,
+            name: "scan".to_string(),
+            agent_count: 1,
         });
         app.apply_workflow_event(WorkflowEvent::AgentStarted {
             run_id: "workflow-test".to_string(),
@@ -16334,7 +16734,6 @@ mod tests {
             run_id: "script-test".to_string(),
             title: "script:bug-hunt".to_string(),
             task: "bug-hunt".to_string(),
-            phases: Vec::new(),
         });
         app.apply_workflow_event(WorkflowEvent::PhaseStarted {
             run_id: "script-test".to_string(),
@@ -16379,36 +16778,25 @@ mod tests {
     #[test]
     fn partial_workflow_is_not_rendered_as_total_failure() {
         let mut app = app();
-        let phases = vec![
-            WorkflowPhasePlan {
-                name: "implementation".to_string(),
-                objective: "Make change".to_string(),
-                agents: vec![SubagentSpec {
-                    name: "implementer".to_string(),
-                    role: "implementation agent".to_string(),
-                    prompt: "edit".to_string(),
-                    allow_mutation: true,
-                    tool_policy: SubagentToolPolicy::Edit,
-                }],
-            },
-            WorkflowPhasePlan {
-                name: "verification".to_string(),
-                objective: "Verify".to_string(),
-                agents: vec![SubagentSpec {
-                    name: "verifier".to_string(),
-                    role: "verification agent".to_string(),
-                    prompt: "verify".to_string(),
-                    allow_mutation: false,
-                    tool_policy: SubagentToolPolicy::Verify,
-                }],
-            },
-        ];
 
         app.apply_workflow_event(WorkflowEvent::RunStarted {
             run_id: "workflow-partial".to_string(),
             title: "split tui crate".to_string(),
             task: "split tui crate".to_string(),
-            phases,
+        });
+        app.apply_workflow_event(WorkflowEvent::PhaseStarted {
+            run_id: "workflow-partial".to_string(),
+            phase_index: 0,
+            name: "implementation".to_string(),
+            agent_count: 1,
+        });
+        app.apply_workflow_event(WorkflowEvent::AgentStarted {
+            run_id: "workflow-partial".to_string(),
+            phase_index: 0,
+            agent_index: 0,
+            name: "implementer".to_string(),
+            role: "implementation agent".to_string(),
+            tool_policy: SubagentToolPolicy::Edit,
         });
         app.apply_workflow_event(WorkflowEvent::AgentFinished {
             run_id: "workflow-partial".to_string(),
@@ -16418,6 +16806,20 @@ mod tests {
             status: WorkflowStatus::Succeeded,
             output: "moved terminal helpers".to_string(),
             tool_counts: BTreeMap::new(),
+        });
+        app.apply_workflow_event(WorkflowEvent::PhaseStarted {
+            run_id: "workflow-partial".to_string(),
+            phase_index: 1,
+            name: "verification".to_string(),
+            agent_count: 1,
+        });
+        app.apply_workflow_event(WorkflowEvent::AgentStarted {
+            run_id: "workflow-partial".to_string(),
+            phase_index: 1,
+            agent_index: 0,
+            name: "verifier".to_string(),
+            role: "verification agent".to_string(),
+            tool_policy: SubagentToolPolicy::Verify,
         });
         app.apply_workflow_event(WorkflowEvent::AgentFinished {
             run_id: "workflow-partial".to_string(),
@@ -16517,10 +16919,11 @@ mod tests {
     /// Finding [12]: background workflow tools must carry a checkpoint recorder
     /// (and a cancel token) so subagent file edits are rewindable.
     #[test]
-    fn start_workflow_wires_recorder_and_cancel_onto_worker_runtime() {
+    fn saved_workflow_wires_recorder_and_cancel_onto_worker_runtime() {
         let mut app = App::with_model_backend(true);
+        write_saved_workflow(&app, "checkpoint-test", "return 'done';");
 
-        app.start_workflow("refactor auth");
+        app.start_workflow_script("checkpoint-test", "");
 
         let runtime = app
             .last_workflow_runtime
@@ -16547,8 +16950,9 @@ mod tests {
         let mut app = App::with_model_backend(true);
         let workspace = app.tools.workspace().to_path_buf();
         fs::write(workspace.join("auth.rs"), "old\n").unwrap();
+        write_saved_workflow(&app, "checkpoint-test", "return 'done';");
 
-        app.start_workflow("refactor auth");
+        app.start_workflow_script("checkpoint-test", "");
         // A subagent edits a file through the run's shared recorder (the
         // worker's ToolRuntime holds a clone of this exact recorder).
         let recorder = app.workflow_events.last().unwrap().checkpoint.clone();
@@ -16560,7 +16964,7 @@ mod tests {
             .unwrap();
         let entry = entries
             .iter()
-            .find(|entry| entry.prompt_excerpt == "/workflow refactor auth")
+            .find(|entry| entry.prompt_excerpt == "/workflow checkpoint-test")
             .expect("workflow run must produce a rewindable checkpoint");
 
         // And it actually restores the pre-edit content.
@@ -16576,11 +16980,6 @@ mod tests {
     #[test]
     fn drain_workflow_events_keeps_other_background_jobs_active() {
         let mut app = app();
-        let phases = vec![WorkflowPhasePlan {
-            name: "recon".to_string(),
-            objective: "Map code".to_string(),
-            agents: Vec::new(),
-        }];
         let (finished_sender, finished_receiver) = mpsc::channel();
         let (_active_sender, active_receiver) = mpsc::channel();
         finished_sender
@@ -16588,7 +16987,6 @@ mod tests {
                 run_id: "workflow-test".to_string(),
                 title: "inspect code".to_string(),
                 task: "inspect code".to_string(),
-                phases,
             })
             .unwrap();
         finished_sender
@@ -16791,6 +17189,27 @@ mod tests {
             StartupCommand::Tui(SessionOpenMode::ContinueNamed(
                 "session-123.json".to_string()
             ))
+        );
+    }
+
+    #[test]
+    fn startup_parser_returns_help_and_version_without_exiting() {
+        assert_eq!(
+            parse_startup_command(&["--help".to_string()]).unwrap(),
+            StartupCommand::Print(HELP_TEXT)
+        );
+        assert_eq!(
+            parse_startup_command(&["--version".to_string()]).unwrap(),
+            StartupCommand::Print(VERSION_TEXT)
+        );
+        assert!(VERSION_TEXT.starts_with("medusa "));
+    }
+
+    #[test]
+    fn startup_parser_returns_headless_help_without_exiting() {
+        assert_eq!(
+            parse_startup_command(&["run".to_string(), "--help".to_string()]).unwrap(),
+            StartupCommand::Print(RUN_HELP_TEXT)
         );
     }
 
@@ -17247,7 +17666,6 @@ mod tests {
             run_id: "run-1".to_string(),
             title: "Build".to_string(),
             task: "task".to_string(),
-            phases: Vec::new(),
         });
 
         assert_eq!(app.chat_scroll, 12);
