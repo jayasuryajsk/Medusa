@@ -43,7 +43,7 @@ jobs:
           ref: ${{ env.RELEASE_TAG }}
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@1.90.0
+        uses: dtolnay/rust-toolchain@1.100.0
         with:
           targets: ${{ matrix.target }}
 
