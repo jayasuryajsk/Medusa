@@ -59,6 +59,25 @@ pub(crate) fn sleep_with_cancel(duration: Duration, cancel: &CancelToken) -> Res
     }
 }
 
+const ULTRA_ORCHESTRATION_CONTEXT: &str = "\
+Ultra orchestration mode is active. For substantial tasks with independent research, review, implementation, or verification lanes, proactively use workflow_run early to delegate useful work in parallel. Prefer parallel read-only agents for exploration and review, keep overlapping edits serialized, synthesize their evidence, and independently verify the integrated result. Do not delegate casual conversation, simple lookups, or one-step edits where coordination overhead would outweigh the benefit. The parent agent remains responsible for the final answer and verification.";
+
+fn with_ultra_orchestration_context(
+    base: Option<String>,
+    reasoning_mode: &str,
+    workflows_allowed: bool,
+) -> Option<String> {
+    if !reasoning_mode.eq_ignore_ascii_case("ultra") || !workflows_allowed {
+        return base;
+    }
+    Some(match base {
+        Some(base) if !base.trim().is_empty() => {
+            format!("{base}\n\n{ULTRA_ORCHESTRATION_CONTEXT}")
+        }
+        _ => ULTRA_ORCHESTRATION_CONTEXT.to_string(),
+    })
+}
+
 pub use types::{
     ConversationAttachment, ConversationMessage, DirectCodexBackend, ModelStreamEvent, TokenUsage,
 };
@@ -269,6 +288,11 @@ impl DirectCodexBackend {
             (None, Some(skills)) => Some(skills),
             (None, None) => None,
         };
+        let extra_context = with_ultra_orchestration_context(
+            extra_context,
+            self.reasoning_effort(),
+            tool_policy.allow_workflows(),
+        );
 
         if let Some(error) = tools
             .hooks()
@@ -784,9 +808,10 @@ impl DirectCodexBackend {
             "stream": true,
         });
 
-        if !self.reasoning_effort.eq_ignore_ascii_case("none") {
+        let wire_effort = schema::codex_reasoning_effort(&self.reasoning_effort);
+        if !wire_effort.eq_ignore_ascii_case("none") {
             body["reasoning"] = json!({
-                "effort": self.reasoning_effort,
+                "effort": wire_effort,
                 "summary": "auto",
             });
         }

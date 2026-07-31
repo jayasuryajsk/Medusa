@@ -183,8 +183,8 @@ In the composer:
 |---|---|
 | `/help` | List all commands |
 | `/plan` | Toggle plan mode (explore & propose before editing) |
-| `/model` | Choose the model and reasoning effort (model list populated live from the Codex backend) |
-| `/reasoning` | Set thinking effort (`low`…`xhigh`, choices per model) |
+| `/model` | Choose the model and execution mode (model list populated live from the Codex backend) |
+| `/reasoning` | Set thinking effort (`low`…`max`) or Ultra proactive orchestration when supported |
 | `/permissions` | Change permission mode (open / guarded / readonly) |
 | `/theme` | Cycle color themes (`medusa`, `opencode`, `tokyonight`, `catppuccin`, …) |
 | `/workflow <task>` | Have the model author and run a task-specific JavaScript workflow |
@@ -335,7 +335,7 @@ Selected environment variables:
 |---|---|
 | `MEDUSA_MODEL` | Override the model |
 | `MEDUSA_PROVIDER` | `codex` (default), `openai-compatible`, or `deepseek` |
-| `MEDUSA_REASONING_EFFORT` | Startup thinking effort (`none`/`low`/`medium`/`high`/`xhigh`); overrides the saved `/reasoning` choice |
+| `MEDUSA_REASONING_EFFORT` | Startup thinking effort (`none`/`minimal`/`low`/`medium`/`high`/`xhigh`/`max`) or `ultra` orchestration; overrides the saved `/reasoning` choice |
 | `MEDUSA_CONTEXT_MAX_TOKENS` | Context budget before compaction (default 60k) |
 | `MEDUSA_VERIFY` | `off` disables post-edit verification |
 | `MEDUSA_VERIFY_TIMEOUT_SECS` | Verification command timeout (default 90) |

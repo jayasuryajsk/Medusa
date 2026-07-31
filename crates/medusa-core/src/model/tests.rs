@@ -440,8 +440,37 @@ fn model_provider_is_inferred_from_common_model_ids() {
 fn deepseek_reasoning_effort_maps_codex_names_to_deepseek_values() {
     assert_eq!(schema::deepseek_reasoning_effort("xhigh"), "max");
     assert_eq!(schema::deepseek_reasoning_effort("max"), "max");
+    assert_eq!(schema::deepseek_reasoning_effort("ultra"), "max");
     assert_eq!(schema::deepseek_reasoning_effort("medium"), "high");
     assert_eq!(schema::deepseek_reasoning_effort("low"), "high");
+}
+
+#[test]
+fn codex_ultra_uses_max_as_the_wire_reasoning_effort() {
+    assert_eq!(schema::codex_reasoning_effort("ultra"), "max");
+    assert_eq!(schema::codex_reasoning_effort("ULTRA"), "max");
+    assert_eq!(schema::codex_reasoning_effort("max"), "max");
+    assert_eq!(schema::codex_reasoning_effort("xhigh"), "xhigh");
+    assert_eq!(schema::codex_reasoning_effort("none"), "none");
+}
+
+#[test]
+fn ultra_adds_proactive_orchestration_only_to_workflow_capable_turns() {
+    let context =
+        super::with_ultra_orchestration_context(Some("project context".to_string()), "ultra", true)
+            .expect("ultra context");
+    assert!(context.contains("project context"));
+    assert!(context.contains("Ultra orchestration mode is active"));
+    assert!(context.contains("workflow_run"));
+
+    assert_eq!(
+        super::with_ultra_orchestration_context(Some("base".to_string()), "high", true),
+        Some("base".to_string())
+    );
+    assert_eq!(
+        super::with_ultra_orchestration_context(Some("base".to_string()), "ultra", false),
+        Some("base".to_string())
+    );
 }
 
 #[test]

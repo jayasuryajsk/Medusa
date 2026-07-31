@@ -589,6 +589,18 @@ pub(crate) fn chat_completion_tools(
         .collect()
 }
 
+/// Ultra is a Codex orchestration preset, not a Responses API reasoning value.
+/// Medusa implements its delegation behavior locally and uses the strongest
+/// accepted model effort on the wire.
+pub(crate) fn codex_reasoning_effort(effort: &str) -> &str {
+    let effort = effort.trim();
+    if effort.eq_ignore_ascii_case("ultra") {
+        "max"
+    } else {
+        effort
+    }
+}
+
 pub(crate) fn deepseek_reasoning_effort(effort: &str) -> &'static str {
     match effort
         .trim()
@@ -596,7 +608,7 @@ pub(crate) fn deepseek_reasoning_effort(effort: &str) -> &'static str {
         .replace(['_', '-'], "")
         .as_str()
     {
-        "xhigh" | "max" => "max",
+        "xhigh" | "max" | "ultra" => "max",
         _ => "high",
     }
 }

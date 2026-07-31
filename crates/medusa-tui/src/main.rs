@@ -3478,7 +3478,7 @@ impl App {
         self.model_picker_pane = ModelPickerPane::Models;
         self.model_selection = model_index(self.model.model_name());
         self.sync_model_picker_reasoning_selection();
-        self.status_line = "model and reasoning picker opened".to_string();
+        self.status_line = "model and execution mode picker opened".to_string();
     }
 
     fn open_reasoning_modal(&mut self) {
@@ -8876,7 +8876,7 @@ impl App {
 
     fn draw_models_modal(&self, frame: &mut Frame<'_>, area: Rect) {
         frame.render_widget(
-            modal_block(" Model & reasoning ")
+            modal_block(" Model & execution mode ")
                 .border_type(BorderType::Rounded)
                 .padding(Padding::new(2, 2, 0, 0)),
             area,
@@ -8906,7 +8906,10 @@ impl App {
 
         let header = Paragraph::new(vec![
             Line::from(vec![
-                Span::styled("Model & reasoning", accent().add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    "Model & execution mode",
+                    accent().add_modifier(Modifier::BOLD),
+                ),
                 Span::styled("  ", muted()),
                 Span::styled(self.model.provider_name(), muted()),
                 Span::styled("/", muted()),
@@ -8915,7 +8918,7 @@ impl App {
                 Span::styled(self.model.reasoning_effort().to_string(), prompt_style()),
             ]),
             Line::from(vec![
-                Span::styled("choose both for future turns", muted()),
+                Span::styled("choose effort or Ultra orchestration", muted()),
                 Span::styled("  ·  ", muted()),
                 Span::styled("/model <id>", prompt_style()),
                 Span::styled(" accepts any model id", muted()),
@@ -8968,7 +8971,7 @@ impl App {
                     },
                 ),
                 Span::styled(
-                    "REASONING",
+                    "EFFORT / MODE",
                     if reasoning_pane_active {
                         accent().add_modifier(Modifier::BOLD)
                     } else {
@@ -9101,7 +9104,7 @@ impl App {
 
     fn draw_reasoning_modal(&self, frame: &mut Frame<'_>, area: Rect) {
         frame.render_widget(
-            modal_block(" Reasoning effort ")
+            modal_block(" Reasoning & orchestration ")
                 .border_type(BorderType::Rounded)
                 .padding(Padding::new(2, 2, 0, 0)),
             area,
@@ -9128,12 +9131,15 @@ impl App {
         let (model_label, _) = model_display(&model);
         let header = Paragraph::new(vec![
             Line::from(vec![
-                Span::styled("Reasoning effort", accent().add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    "Reasoning & orchestration",
+                    accent().add_modifier(Modifier::BOLD),
+                ),
                 Span::styled("  for ", muted()),
                 Span::styled(model_label, prompt_style()),
             ]),
             Line::from(Span::styled(
-                "higher effort = deeper thinking, slower + more tokens",
+                "effort controls thinking depth; Ultra adds proactive multi-agent delegation",
                 muted(),
             )),
         ])
@@ -9799,13 +9805,13 @@ impl App {
                 key: "model",
                 value: self.model.model_name().to_string(),
                 description: "The model Medusa sends coding turns to.",
-                action: "enter opens model + reasoning picker",
+                action: "enter opens model + execution mode picker",
                 editable: true,
             },
             SettingsItem {
                 key: "reasoning",
                 value: self.model.reasoning_effort().to_string(),
-                description: "Thinking depth for new model turns.",
+                description: "Thinking depth, or Ultra for proactive multi-agent orchestration.",
                 action: "enter opens reasoning picker",
                 editable: true,
             },
@@ -10234,13 +10240,13 @@ const SLASH_COMMANDS: &[SlashCommand] = &[
         name: "/model",
         args: "<name>",
         category: "model",
-        description: "Choose the model and reasoning effort for new turns",
+        description: "Choose the model and execution mode for new turns",
     },
     SlashCommand {
         name: "/reasoning",
         args: "[effort]",
         category: "model",
-        description: "Set the reasoning/thinking effort (low…xhigh, model-specific)",
+        description: "Set thinking effort, or Ultra orchestration when supported",
     },
     SlashCommand {
         name: "/permissions",
@@ -13562,7 +13568,14 @@ fn model_picker_detail_lines(
         lines.push(Line::from(""));
     }
     lines.push(Line::from(vec![
-        Span::styled("reasoning  ", muted()),
+        Span::styled(
+            if selected_effort.eq_ignore_ascii_case("ultra") {
+                "mode  "
+            } else {
+                "reasoning  "
+            },
+            muted(),
+        ),
         Span::styled(
             selected_effort.to_string(),
             prompt_style().add_modifier(Modifier::BOLD),
@@ -13570,6 +13583,16 @@ fn model_picker_detail_lines(
     ]));
     if let Some(description) = reasoning_description(selected_model, selected_effort) {
         lines.push(Line::from(Span::styled(description, value_style())));
+    }
+    if selected_effort.eq_ignore_ascii_case("ultra") {
+        lines.push(Line::from(vec![
+            Span::styled("model effort  ", muted()),
+            Span::styled("max", value_style()),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled("orchestration  ", muted()),
+            Span::styled("proactive workflows + subagents", value_style()),
+        ]));
     }
     lines.extend([
         Line::from(vec![
@@ -13582,7 +13605,11 @@ fn model_picker_detail_lines(
         ]),
         Line::from(""),
         Line::from(Span::styled(
-            "Applies to new turns. Active work keeps its current model and effort.",
+            if selected_effort.eq_ignore_ascii_case("ultra") {
+                "Ultra is orchestrated by Medusa; it is never sent as a raw reasoning value."
+            } else {
+                "Applies to new turns. Active work keeps its current model and effort."
+            },
             muted(),
         )),
     ]);
@@ -13608,9 +13635,26 @@ fn reasoning_detail_lines(model: &str, selected: &str, active: &str) -> Vec<Line
         lines.push(Line::from(Span::styled(description, value_style())));
         lines.push(Line::from(""));
     }
+    if selected.eq_ignore_ascii_case("ultra") {
+        lines.extend([
+            Line::from(vec![
+                Span::styled("model effort  ", muted()),
+                Span::styled("max", value_style()),
+            ]),
+            Line::from(vec![
+                Span::styled("orchestration  ", muted()),
+                Span::styled("proactive workflows + subagents", value_style()),
+            ]),
+            Line::from(""),
+        ]);
+    }
     lines.extend([
         Line::from(Span::styled(
-            "Applies to new turns; active streams keep the effort they started with.",
+            if selected.eq_ignore_ascii_case("ultra") {
+                "Ultra is a Medusa orchestration mode, not a raw API reasoning value."
+            } else {
+                "Applies to new turns; active streams keep the effort they started with."
+            },
             value_style(),
         )),
         Line::from(""),
@@ -15167,7 +15211,7 @@ mod tests {
         assert_eq!(app.active_modal, Some(Modal::Models));
         assert_eq!(app.input, "");
         assert_eq!(app.model_picker_pane, ModelPickerPane::Models);
-        assert_eq!(app.status_line, "model and reasoning picker opened");
+        assert_eq!(app.status_line, "model and execution mode picker opened");
     }
 
     #[test]
@@ -15203,7 +15247,7 @@ mod tests {
     }
 
     #[test]
-    fn model_picker_renders_model_reasoning_and_selection_panes() {
+    fn model_picker_renders_model_mode_and_selection_panes() {
         use ratatui::{Terminal, backend::TestBackend};
 
         let mut app = app();
@@ -15217,9 +15261,9 @@ mod tests {
             .unwrap();
         let rendered = buffer_text(terminal.backend().buffer());
 
-        assert!(rendered.contains("Model & reasoning"), "{rendered}");
+        assert!(rendered.contains("Model & execution mode"), "{rendered}");
         assert!(rendered.contains("MODEL"), "{rendered}");
-        assert!(rendered.contains("REASONING"), "{rendered}");
+        assert!(rendered.contains("EFFORT / MODE"), "{rendered}");
         assert!(rendered.contains("SELECTION"), "{rendered}");
     }
 
