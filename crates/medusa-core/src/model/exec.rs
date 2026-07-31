@@ -10,7 +10,7 @@ use crate::tools::{
     ExploreBatchResult, ExploreProbe, ExploreProbeKind, FileEditRequest, FileGlobRequest,
     FilePatchRequest, FileReadRequest, FileSearchRequest, FsListRequest, PlanUpdateItem,
     PlanUpdateRequest, PlanUpdateResult, QuestionRequest, TaskUpdateRequest, TerminalExecRequest,
-    ToolRuntime,
+    ToolRuntime, validate_read_only_terminal_command,
 };
 
 /// Tools that neither mutate the workspace nor consult [`ToolLoopState`] —
@@ -260,6 +260,24 @@ pub(crate) fn execute_tool_call(
             };
         }
     };
+
+    if call.name == "terminal_exec"
+        && (!tool_policy.allow_mutation() || !state.native_mutation_allowed())
+    {
+        let command = args
+            .get("command")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if let Err(error) = validate_read_only_terminal_command(command, tools.workspace()) {
+            return ToolExecution {
+                failed: true,
+                output: format!(
+                    "error: terminal.exec is restricted to read-only inspection and verification \
+commands until the current harness route permits mutation: {error}"
+                ),
+            };
+        }
+    }
 
     // MCP tools are resolved through the registry's full-name map, never by
     // parsing the namespaced string. They may have side effects, so they run
@@ -1035,6 +1053,19 @@ pub(crate) fn update_tool_loop_state(
     call: &ToolCall,
     execution: &ToolExecution,
 ) {
+    let changed_files = if execution.failed {
+        Vec::new()
+    } else {
+        mutation_changed_files(&execution.output)
+    };
+    state.orchestrator.record_execution(
+        &call.name,
+        &summarize_tool_call(call),
+        &execution.output,
+        execution.failed,
+        &changed_files,
+    );
+
     match call.name.as_str() {
         "file_edit" | "file_patch" if execution.failed => {
             state.patch_requires_context = true;

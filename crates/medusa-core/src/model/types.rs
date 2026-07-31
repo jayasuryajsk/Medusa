@@ -1,5 +1,8 @@
 use std::path::PathBuf;
 
+use crate::harness::HarnessPolicy;
+use crate::orchestrator::TurnOrchestrator;
+
 const CODEX_BACKEND_URL: &str = "https://chatgpt.com/backend-api/codex";
 const DEEPSEEK_BASE_URL: &str = "https://api.deepseek.com";
 const DEFAULT_MODEL: &str = "gpt-5.5";
@@ -221,9 +224,29 @@ pub(crate) struct ToolCall {
     pub(crate) reasoning_content: Option<String>,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub(crate) struct ToolLoopState {
     pub(crate) patch_requires_context: bool,
+    pub(crate) orchestrator: TurnOrchestrator,
+}
+
+impl ToolLoopState {
+    pub(crate) fn for_policy(policy: HarnessPolicy) -> Self {
+        Self {
+            patch_requires_context: false,
+            orchestrator: TurnOrchestrator::new(policy),
+        }
+    }
+
+    pub(crate) fn native_mutation_allowed(&self) -> bool {
+        !self.patch_requires_context && self.orchestrator.native_mutation_allowed()
+    }
+}
+
+impl Default for ToolLoopState {
+    fn default() -> Self {
+        Self::for_policy(HarnessPolicy::for_user_prompt(""))
+    }
 }
 
 #[derive(Debug, Clone, Copy)]

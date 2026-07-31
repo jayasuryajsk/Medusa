@@ -2156,6 +2156,10 @@ fn validate_explore_terminal_command(command: &str, workspace: &Path) -> Result<
     Ok(())
 }
 
+pub(crate) fn validate_read_only_terminal_command(command: &str, workspace: &Path) -> Result<()> {
+    validate_explore_terminal_command(command, workspace)
+}
+
 /// Best-effort scan of a shell command's whitespace-split tokens for path
 /// arguments that resolve OUTSIDE `workspace`. Returns the offending raw
 /// tokens (empty when every referenced path stays inside the workspace).

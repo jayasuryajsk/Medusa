@@ -277,8 +277,13 @@ impl DirectCodexBackend {
             .map(wire::conversation_message_json)
             .collect::<Vec<_>>();
         let mut total_events = 0;
-        let mut state = types::ToolLoopState::default();
-        let policy = HarnessPolicy::for_user_prompt(&latest_prompt);
+        let policy = HarnessPolicy::for_user_prompt_with_reasoning(
+            &latest_prompt,
+            self.reasoning_effort(),
+            tool_policy.allow_workflows(),
+        );
+        let mut state = types::ToolLoopState::for_policy(policy);
+        let mut no_progress = crate::orchestrator::NoProgressTracker::default();
         let turn_mode = policy.mode_label();
         let skill_context = tools.skills().prompt_context(&latest_prompt);
         let project_context = crate::project::project_instructions_context(&self.workspace);
@@ -331,6 +336,13 @@ impl DirectCodexBackend {
                 }
 
                 if outcome.tool_calls.is_empty() {
+                    if let Some(feedback) = state.orchestrator.completion_feedback() {
+                        input.push(json!({
+                            "role": "developer",
+                            "content": feedback,
+                        }));
+                        continue;
+                    }
                     if let Some(error) = tools
                         .hooks()
                         .run(HookEvent::turn_end(turn_mode, "complete"))
@@ -375,14 +387,42 @@ impl DirectCodexBackend {
                     &mut on_event,
                 )?;
 
+                let attempts = calls
+                    .iter()
+                    .zip(executions.iter())
+                    .map(|(call, execution)| crate::orchestrator::ToolAttempt {
+                        name: &call.name,
+                        arguments: &call.arguments,
+                        output: &execution.output,
+                        failed: execution.failed,
+                        made_durable_progress: !execution.failed
+                            && (exec::tool_call_is_file_mutation(&call.name)
+                                || call.name == "workflow_run"),
+                    })
+                    .collect::<Vec<_>>();
+                let progress = no_progress.observe(&attempts);
+
                 // Model context outputs go back in emission order regardless of
                 // completion order, so the conversation stays deterministic.
-                for (call, execution) in calls.iter().zip(executions) {
+                for (call, execution) in calls.iter().zip(&executions) {
                     input.push(json!({
                         "type": "function_call_output",
                         "call_id": call.call_id,
-                        "output": exec::compact_tool_context_output(call, &execution),
+                        "output": exec::compact_tool_context_output(call, execution),
                     }));
+                }
+
+                match progress {
+                    crate::orchestrator::ProgressSignal::Progress => {}
+                    crate::orchestrator::ProgressSignal::Warning(feedback) => {
+                        input.push(json!({
+                            "role": "developer",
+                            "content": feedback,
+                        }));
+                    }
+                    crate::orchestrator::ProgressSignal::Stalled(error) => {
+                        bail!("{error}");
+                    }
                 }
 
                 crate::context::prune_input_tool_outputs(&mut input, context_budget);
@@ -786,7 +826,7 @@ impl DirectCodexBackend {
             );
         }
 
-        let allow_patch = tool_policy.allow_mutation() && !state.patch_requires_context;
+        let allow_patch = tool_policy.allow_mutation() && state.native_mutation_allowed();
         let mut tool_schemas = schema::medusa_tools(
             allow_patch,
             tool_policy.allow_workflows(),
@@ -863,7 +903,7 @@ impl DirectCodexBackend {
         headers.insert(ACCEPT, HeaderValue::from_static("text/event-stream"));
         headers.insert(USER_AGENT, HeaderValue::from_static("medusa-tui/0.1.0"));
 
-        let allow_patch = tool_policy.allow_mutation() && !state.patch_requires_context;
+        let allow_patch = tool_policy.allow_mutation() && state.native_mutation_allowed();
         let mut body = json!({
             "model": self.model,
             "messages": wire::chat_completion_messages_from_input(

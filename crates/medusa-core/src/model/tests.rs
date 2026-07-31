@@ -1659,9 +1659,33 @@ fn read_only_tool_policy_blocks_mutation_tools() {
 }
 
 #[test]
+fn read_only_tool_policy_blocks_mutating_terminal_commands() {
+    let workspace = temp_workspace();
+    let tools = ToolRuntime::new(&workspace).unwrap();
+    let call = types::ToolCall {
+        name: "terminal_exec".to_string(),
+        call_id: "call_test".to_string(),
+        arguments: r#"{"command":"touch should-not-exist"}"#.to_string(),
+        reasoning_content: None,
+    };
+
+    let execution = exec::execute_tool_call(
+        &tools,
+        &call,
+        &types::ToolLoopState::default(),
+        types::ToolLoopPolicy::read_only(),
+    );
+
+    assert!(execution.failed);
+    assert!(execution.output.contains("restricted to read-only"));
+    assert!(!workspace.join("should-not-exist").exists());
+}
+
+#[test]
 fn terminal_exec_clears_patch_recovery_state() {
     let mut state = types::ToolLoopState {
         patch_requires_context: true,
+        ..types::ToolLoopState::default()
     };
     let call = types::ToolCall {
         name: "terminal_exec".to_string(),
@@ -1683,6 +1707,7 @@ fn terminal_exec_clears_patch_recovery_state() {
 fn structured_read_clears_patch_recovery_state() {
     let mut state = types::ToolLoopState {
         patch_requires_context: true,
+        ..types::ToolLoopState::default()
     };
     let call = types::ToolCall {
         name: "file_read".to_string(),

@@ -39,17 +39,28 @@ For normal chat, answer naturally and concisely. \
 Harness contract: {} \
 Harness law: explore in parallel; act serialized. Use parallel exploration for context gathering and verification, but keep edits/patches/mutating commands in a single coherent lane. \
 Turn mode: {}. \
+Orchestration route: {}. \
+{} \
+{} \
 {}",
         workspace.display(),
         crate::harness::core_harness_contract(),
         policy.mode_label(),
-        policy.instructions()
+        policy.route_label(),
+        policy.instructions(),
+        policy.route_instructions(),
+        policy.completion_contract()
     );
 
     if state.patch_requires_context {
         instructions.push_str(
             " A previous edit/patch failed, so mutation tools are temporarily withheld until you inspect the current file/context with file_read, file_search, fs_list, or terminal_exec. Do not retry blind edits.",
         );
+    }
+
+    if let Some(evidence) = state.orchestrator.context() {
+        instructions.push_str("\n\n");
+        instructions.push_str(&evidence);
     }
 
     if mcp_tools_active {
@@ -531,7 +542,7 @@ pub(crate) fn medusa_tools(
 
     if allow_workflows {
         let mut workflow_description = String::from(
-            "Author and run a deterministic multi-agent workflow: a JavaScript script whose control flow (loops, branching, fan-out) is plain code and whose work steps are fresh subagents. Use for work that benefits from many parallel agents or verification loops — sweeping reviews, adversarial bug hunts, migrations over many files — not for simple tasks you can do directly. Subagent results stay inside the script; only the script's return value comes back to you. Script API: agent(spec) runs one subagent and blocks until done; spec is a prompt string or {prompt, agentType?, label?, tools?: 'read'|'shell'|'edit'|'verify', schema?: <JSON Schema>}. With schema, agent() returns parsed JSON matching it, otherwise the agent's final text. parallel([spec, ...]) runs specs concurrently, returning results in order with null for failed agents. phase('title') groups subsequent agents in the progress UI. log('msg') reports progress. args holds the value you pass in the tool call. Scripts must use `return` for the final result. Subagents cannot launch nested workflows. Default tool policy is 'shell' (read + safe commands); use 'edit' only for agents that must change files, and keep edit agents sequential (one at a time), never inside parallel() with overlapping files.",
+            "Author and run a deterministic multi-agent workflow: a JavaScript script whose control flow (loops, branching, fan-out) is plain code and whose work steps are fresh subagents. Use for work that benefits from many parallel agents or verification loops — sweeping reviews, adversarial bug hunts, migrations over many files — not for simple tasks you can do directly. Subagent results stay inside the script; only the script's return value comes back to you. Script API: agent(spec) runs one subagent and blocks until done; spec is a prompt string or {prompt, agentType?, label?, tools?: 'read'|'shell'|'edit'|'verify', schema?: <JSON Schema>}. With schema, agent() returns parsed JSON matching it, otherwise the agent's final text. parallel([spec, ...]) runs specs concurrently, returning results in order with null for failed agents. phase('title') groups subsequent agents in the progress UI. log('msg') reports progress. args holds the value you pass in the tool call. Scripts must use `return` for the final result. Subagents cannot launch nested workflows. Default tool policy is 'shell' (read + safe commands). Medusa enforces a single writer: parallel() rejects every spec with tools: 'edit', so run each mutating agent sequentially with agent() after parallel exploration.",
         );
         if !workflow_agent_names.is_empty() {
             workflow_description.push_str(&format!(

@@ -1,12 +1,11 @@
 # Medusa
 
-A terminal-native, autonomous coding agent. Medusa inspects, edits, tests, and
-debugs the current workspace through a tight tool loop, rendered in a fast TUI
-that follows the Claude Code / Codex CLI visual language — compact batched tool
-activity, inline colored diffs, and a live plan strip above the composer.
+A terminal-native coding agent built around adaptive parallel work. Medusa
+gathers evidence across independent heads, converges through one controlled
+writer, and verifies the result before calling the task complete.
 
-Built in Rust and distributed as a single binary. Guarded execution on Linux
-also requires `bubblewrap`.
+The Rust TUI keeps that work readable with batched tool activity, inline diffs,
+live plans, checkpoints, and permission controls.
 
 <p align="center">
   <a href="docs/assets/medusa-demo.mp4">
@@ -20,59 +19,32 @@ also requires `bubblewrap`.
 
 ## Features
 
-- **Agent tool loop** — read, search, glob, list, edit, patch, and run terminal
-  commands. Independent read-only calls execute in parallel.
-- **Web tools** — `web_search` (DuckDuckGo) and `web_fetch` let the model look
-  up docs, changelogs, and error messages; fetched HTML is reduced to readable
-  text and private/local addresses are refused.
-- **Checkpoints & `/rewind`** — before the first edit of each turn, Medusa
-  snapshots the pre-image of every file it's about to change under
-  `.medusa/checkpoints/`; `/rewind` restores the workspace to the state before
-  any previous turn.
-- **Sandboxed commands** — model-run shell commands use macOS Seatbelt or Linux
-  bubblewrap: writes stay confined to the workspace and temp dirs, and network
-  is denied unless allowed. A required sandbox fails closed when unavailable;
-  an unsandboxed retry always pauses for your approval.
-- **MCP servers** — declare stdio Model Context Protocol servers in
-  `.medusa/mcp.json`; their tools appear to the model as `mcp_<server>_<tool>`.
-- **Custom agents** — define named subagents in `.medusa/agents/*.md` with
-  their own prompts and tool policies, usable from workflow scripts.
-- **Live plan strip** — the model's plan docks above the composer and updates in
-  place, instead of scrolling away in chat history.
-- **Inline diffs & syntax highlighting** — edits render as colored diffs; code
-  blocks are syntax-highlighted; terminal output keeps its ANSI colors.
-- **Post-edit verification** — after the model's last edit in a turn, Medusa
-  runs a cheap project check (`cargo check`, `go build`, `tsc --noEmit`,
-  `py_compile`) and feeds the pass/fail result straight back to the model, so
-  breakage gets fixed in the next turn instead of discovered later.
-- **Interactive permissions** — approve, always-allow, or deny each mutating
-  action, with three modes: `open`, `guarded`, `readonly`.
-- **JS workflow engine** — `/workflow <task>` has the model author and run a
-  task-specific orchestration; saved scripts use `agent()` / `parallel()` /
-  `phase()` with control flow and intermediate results kept outside the parent
-  conversation. Runs are resource-bounded and journaled under
-  `.medusa/workflow-runs/` for post-failure inspection.
-- **Context engineering** — token budgeting with automatic LLM compaction of
-  older turns so long sessions stay within the model's window; `/context`,
-  `/compact`, and `/cost` show and manage usage on demand.
-- **Composer conveniences** — `@` opens a fuzzy file picker to mention
-  workspace files, a leading `# note` appends the note to `AGENTS.md` as quick
-  memory, `/edit` backtracks to a previous message and resends from there, and
-  a single **Esc** cancels a running turn.
-- **Headless mode** — `medusa run` for one-shot, non-interactive turns and
-  scripting.
-- **Ghostty-tuned** — synchronized output (no tearing), Kitty keyboard protocol,
-  fast change-driven rendering.
+- **Adaptive harness:** small tasks stay in the direct loop, uncertain tasks
+  explore first, and broad tasks can fan out into a dynamic workflow.
+- **Parallel heads, single writer:** independent reads and specialist agents
+  run concurrently; mutation is serialized and read-only heads cannot write
+  through the terminal.
+- **Evidence and convergence:** observations, changed files, and verification
+  state follow the turn. Repeated no-progress cycles stop without imposing an
+  arbitrary tool-call limit.
+- **Safe editing:** native edit and patch tools, inline diffs, automatic
+  post-edit checks, per-turn checkpoints, and `/rewind`.
+- **Permissioned execution:** `open`, `guarded`, and `readonly` modes with
+  explicit approvals and macOS Seatbelt or Linux bubblewrap sandboxing.
+- **Purpose-built TUI:** batched tool activity, Markdown and syntax
+  highlighting, live plans, image previews, themes, and session navigation.
+- **Extensible tools:** web search/fetch, MCP servers, Chrome control, custom
+  agents, lifecycle hooks, and JavaScript workflows.
+- **Long-running work:** context compaction, persistent sessions, background
+  jobs, and a headless `medusa run` mode for scripts and CI.
 
 ## Requirements
 
-- **Rust 1.90+** (2024 edition) — install via [rustup](https://rustup.rs).
-- **Linux guarded/readonly mode:** `bubblewrap` (`bwrap`) must be installed.
-- **A model backend.** By default Medusa reuses your **Codex CLI** OAuth login
-  (see below). OpenAI-compatible and DeepSeek backends are also supported via
-  environment variables.
-- **Optional browser control:** the current stable versions of Chrome,
-  Node.js LTS, and npm.
+- A model backend. Codex OAuth is the default; OpenAI-compatible and DeepSeek
+  endpoints are also supported.
+- Rust 1.90+ only when installing with Cargo or building from source.
+- `bubblewrap` for guarded or readonly execution on Linux.
+- Chrome, Node.js LTS, and npm only for optional browser control.
 
 ## Install
 
@@ -97,22 +69,9 @@ export PATH="$HOME/.cargo/bin:$PATH"
 ### From release binaries
 
 Prebuilt binaries for macOS (Apple Silicon and Intel) and Linux (x86_64) are
-attached to each [GitHub release](https://github.com/jayasuryajsk/Medusa/releases):
-
-```sh
-# pick the tarball for your platform, e.g. Apple Silicon:
-curl -LO https://github.com/jayasuryajsk/Medusa/releases/latest/download/medusa-v0.2.0-aarch64-apple-darwin.tar.gz
-tar xzf medusa-v0.2.0-aarch64-apple-darwin.tar.gz
-cd medusa-v0.2.0-aarch64-apple-darwin
-chmod +x medusa
-mkdir -p ~/.local/bin
-mv medusa ~/.local/bin/          # or anywhere on your PATH
-```
-
-Other targets: `x86_64-apple-darwin`, `x86_64-unknown-linux-gnu`.
-Each release includes a `.sha256` file and GitHub build-provenance
-attestation. Verify a download with `sha256sum -c <archive>.sha256` (Linux) or
-`shasum -a 256 -c <archive>.sha256` (macOS).
+attached to each [GitHub release](https://github.com/jayasuryajsk/Medusa/releases).
+Download the archive for your platform, verify its `.sha256`, and place the
+`medusa` binary somewhere on your `PATH`.
 
 ### From a source checkout
 
@@ -123,18 +82,7 @@ cargo install --locked --path crates/medusa-tui
 ```
 
 This builds an optimized binary and places `medusa` on your `PATH` (usually
-`~/.cargo/bin`). Make sure that directory is on your `PATH`:
-
-```sh
-export PATH="$HOME/.cargo/bin:$PATH"   # add to your shell profile
-```
-
-### Build without installing
-
-```sh
-cargo build --release
-./target/release/medusa
-```
+`~/.cargo/bin`).
 
 ## Authentication
 
@@ -240,169 +188,22 @@ Options: `--model <name>`, `--permission <open|guarded|readonly>`, `--json`,
 ## Configuration
 
 Medusa reads project instructions from an `AGENTS.md` file at the workspace root
-(falling back to `AGENT.md`, `CLAUDE.md`, then `MEDUSA.md`). Quick-memory
-notes (`# <note>` in the composer) are appended to the same file.
+(falling back to `AGENT.md`, `CLAUDE.md`, then `MEDUSA.md`). Fresh workspaces
+start in `guarded` mode; use `/permissions` to switch between `open`,
+`guarded`, and `readonly`.
 
-### Sandboxing
+Project state lives under `.medusa/`. Keep that directory in `.gitignore`
+because it can contain prompts, source excerpts, and model output.
 
-On macOS, model-initiated shell commands run under a `sandbox-exec` Seatbelt
-profile: reads stay broad (toolchains need them), writes are confined to the
-workspace and temp directories, and network access is denied unless enabled.
-On Linux the equivalent policy uses bubblewrap with a read-only host root,
-writable workspace/temp mounts, PID and user namespaces, and an isolated
-network namespace.
+The complete reference covers:
 
-Fresh workspaces default to `guarded`. `open` runs trusted commands
-unsandboxed; `guarded` and `readonly` require the platform sandbox. If Seatbelt
-or bubblewrap is unavailable, Medusa blocks the command instead of silently
-running it on the host. Override the mode-derived sandbox preference with
-`MEDUSA_SANDBOX=on|off`; an explicit unsandboxed model request still requires
-approval.
+- sandboxing and permission modes
+- checkpoints and rewind
+- MCP servers and Chrome control
+- custom agents and lifecycle hooks
+- provider, workflow, context, and UI environment variables
 
-When a sandboxed command fails for a sandbox-plausible reason, the model may
-retry with the sandbox off — that escalation always renders an approval card
-and waits for you. Sandboxed children see `MEDUSA_SANDBOX=seatbelt` or
-`MEDUSA_SANDBOX=bubblewrap` (plus `MEDUSA_SANDBOX_NETWORK_DISABLED=1` when
-network is denied). Platforms without a supported sandbox can use `open` mode
-or an individually approved unsandboxed command.
-
-### Checkpoints & rewind
-
-Before the first mutation of each file in a turn, Medusa stores the file's
-pre-image under `.medusa/checkpoints/`. `/rewind` lists previous turns and
-restores the workspace to the state before the one you pick. Scope: only
-changes made through the edit/patch tools are captured — shell-command side
-effects are not. The store is pruned to `MEDUSA_CHECKPOINT_MAX` checkpoints
-and `MEDUSA_CHECKPOINT_MAX_MB` total size (defaults 50 and 200).
-
-### MCP servers
-
-Declare stdio MCP servers in `.medusa/mcp.json`:
-
-```json
-{
-  "servers": {
-    "docs": {
-      "command": "npx",
-      "args": ["-y", "@example/docs-mcp"],
-      "env": { "DOCS_TOKEN": "..." },
-      "readOnly": true
-    }
-  }
-}
-```
-
-Servers spawn lazily; their tools are advertised to the model as
-`mcp_<server>_<tool>`. Only servers you mark `"readOnly": true` are reachable
-in `readonly` permission mode. `/mcp` shows server status and tools;
-`/mcp restart <server>` restarts a wedged one.
-
-#### Browser control
-
-Medusa can control and inspect Chrome through the official
-[Chrome DevTools MCP server](https://github.com/ChromeDevTools/chrome-devtools-mcp).
-Add this to the workspace's `.medusa/mcp.json`:
-
-```json
-{
-  "servers": {
-    "browser": {
-      "command": "npx",
-      "args": [
-        "-y",
-        "chrome-devtools-mcp@1.6.0",
-        "--isolated=true",
-        "--no-usage-statistics"
-      ],
-      "readOnly": false
-    }
-  }
-}
-```
-
-Restart Medusa or run `/reload`, then use `/mcp` to confirm that `browser` is
-available. The server starts Chrome lazily on the first browser request.
-`--isolated=true` uses a temporary browser profile, keeping normal Chrome
-cookies and logged-in sessions separate. Browser tools are intentionally
-unavailable in Medusa's `readonly` permission mode.
-
-### Custom agents
-
-Drop one Markdown file per agent in `.medusa/agents/`:
-
-```
-name: reviewer
-description: Reviews diffs for correctness issues
-tools: read|shell
-
-You are a meticulous code reviewer. Focus on…
-```
-
-Header lines (`name:`, `description:`, `tools:` — any of
-`read|shell|edit|verify`), then a blank line, then the body used as the
-agent's system prompt. Workflow scripts reference agents by name via the
-`agentType` field; `/agents` lists what's loaded.
-
-### Lifecycle hooks
-
-Trusted project hooks live in `.medusa/hooks.json`. Hooks run at `turn_start`,
-`pre_tool`, `post_tool`, and `turn_end`; object entries can block on failure
-and set a per-hook timeout:
-
-```json
-{
-  "default_timeout_secs": 30,
-  "hooks": {
-    "post_tool": [
-      {
-        "command": "cargo fmt --all -- --check",
-        "cwd": ".",
-        "fail_on_error": true,
-        "timeout_secs": 60
-      }
-    ]
-  }
-}
-```
-
-Hooks are local trusted automation, not model-generated commands, and do not
-run inside the model sandbox. Output is bounded and timed out; never put
-untrusted shell text in hook commands.
-
-### Environment variables
-
-Selected environment variables:
-
-| Variable | Purpose |
-|---|---|
-| `MEDUSA_MODEL` | Override the model |
-| `MEDUSA_PROVIDER` | `codex` (default), `openai-compatible`, or `deepseek` |
-| `MEDUSA_REASONING_EFFORT` | Startup thinking effort (`none`/`minimal`/`low`/`medium`/`high`/`xhigh`/`max`) or `ultra` orchestration; overrides the saved `/reasoning` choice |
-| `MEDUSA_CONTEXT_MAX_TOKENS` | Context budget before compaction (default 60k) |
-| `MEDUSA_VERIFY` | `off` disables post-edit verification |
-| `MEDUSA_VERIFY_TIMEOUT_SECS` | Verification command timeout (default 90) |
-| `MEDUSA_SANDBOX` | `on`/`off` overrides the permission-mode sandbox default |
-| `MEDUSA_CHECKPOINT_MAX` | Max retained checkpoints (default 50) |
-| `MEDUSA_CHECKPOINT_MAX_MB` | Max total checkpoint size in MB (default 200) |
-| `MEDUSA_MCP_CONNECT_TIMEOUT_SECS` | MCP server connect/handshake budget (default 10) |
-| `MEDUSA_MCP_TOOL_TIMEOUT_SECS` | Per-call MCP tool timeout (default 60) |
-| `MEDUSA_MCP_DEBUG` | `1` logs MCP traffic to `.medusa/logs/mcp-<server>.log` |
-| `MEDUSA_WORKFLOW_MAX_SCRIPT_AGENTS` | Maximum agents spawned by one workflow script (default 200) |
-| `MEDUSA_WORKFLOW_MAX_PARALLEL` | Maximum concurrently running workflow agents (default 8) |
-| `MEDUSA_WORKFLOW_SCRIPT_TIMEOUT_SECS` | Workflow JS deadline in seconds (default 3600; `0` disables) |
-| `MEDUSA_WORKFLOW_SCRIPT_MEMORY_MB` | Workflow JS heap cap in MB (default 128, max 1024) |
-| `MEDUSA_HOOK_TIMEOUT_SECS` | Default lifecycle-hook timeout (default 30, max 600) |
-| `MEDUSA_BELL` | `on`/`off` overrides the bell setting (rings after long turns and on approval prompts) |
-| `MEDUSA_THEME` | Startup theme |
-| `CODEX_HOME` | Directory holding `auth.json` (default `~/.codex`) |
-
-Inside sandboxed commands, Medusa identifies the backend in `MEDUSA_SANDBOX`
-and, when network is denied, sets `MEDUSA_SANDBOX_NETWORK_DISABLED=1`.
-
-Per-workspace state (sessions, permission grants, attachments, workflow
-journals) lives in a private `.medusa/` directory and is written atomically.
-Keep it in `.gitignore`; it can contain source excerpts, prompts, and model
-output.
+See [Configuration](docs/configuration.md).
 
 ## Development
 

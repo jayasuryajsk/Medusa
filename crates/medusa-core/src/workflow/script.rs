@@ -327,6 +327,15 @@ impl ScriptHost {
                 &self.agents,
             )?);
         }
+        if specs
+            .iter()
+            .any(|spec| spec.tool_policy == SubagentToolPolicy::Edit)
+        {
+            bail!(
+                "parallel() cannot run agents with tools: 'edit'; Medusa enforces a single writer, \
+so run mutating agents sequentially with agent() after parallel exploration"
+            );
+        }
         self.reserve_agents(specs.len())?;
         self.ensure_phase();
 
@@ -1230,6 +1239,22 @@ mod tests {
         assert!(report.summary.contains("echo:alpha"));
         assert!(report.summary.contains("echo:beta"));
         assert!(report.summary.contains("echo:gamma"));
+    }
+
+    #[test]
+    fn parallel_rejects_mutating_agents_to_enforce_single_writer() {
+        let source = r#"
+            return parallel([
+                { prompt: "inspect", tools: "read" },
+                { prompt: "edit the file", tools: "edit" },
+            ]);
+        "#;
+
+        let (report, _) = run(source, None, echo_runner()).unwrap();
+
+        assert_eq!(report.status, WorkflowStatus::Failed);
+        assert!(report.summary.contains("single writer"));
+        assert!(report.summary.contains("sequentially"));
     }
 
     #[test]
