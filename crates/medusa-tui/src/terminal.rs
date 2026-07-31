@@ -17,6 +17,7 @@ use crossterm::{
         KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
     },
     execute,
+    style::force_color_output,
     terminal::{
         BeginSynchronizedUpdate, EndSynchronizedUpdate, EnterAlternateScreen, LeaveAlternateScreen,
         disable_raw_mode, enable_raw_mode, supports_keyboard_enhancement,
@@ -27,6 +28,15 @@ use ratatui::{Terminal, backend::CrosstermBackend};
 pub(crate) type Tui = Terminal<CrosstermBackend<io::Stdout>>;
 
 static KEYBOARD_ENHANCED: AtomicBool = AtomicBool::new(false);
+
+fn themed_color_output_enabled(override_value: Option<&str>) -> bool {
+    !override_value.is_some_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "never" | "off"
+        )
+    })
+}
 
 /// Restores the user's terminal if startup, rendering, or unwinding exits the
 /// normal shutdown path after raw mode has been enabled.
@@ -53,6 +63,13 @@ impl Drop for TerminalRestoreGuard {
 }
 
 pub(crate) fn init_terminal() -> Result<Tui> {
+    // Medusa is a full-screen themed application, so inherited NO_COLOR values
+    // from a parent process must not silently collapse every theme to the same
+    // monochrome UI. Users who intentionally need monochrome output can opt out
+    // with MEDUSA_COLOR=never.
+    force_color_output(themed_color_output_enabled(
+        env::var("MEDUSA_COLOR").ok().as_deref(),
+    ));
     enable_raw_mode()?;
     let result = (|| -> Result<Tui> {
         let mut stdout = io::stdout();
@@ -198,4 +215,23 @@ pub(crate) fn relaunch_current_executable() -> Result<()> {
     }
     command.spawn().wrap_err("failed to reload Medusa")?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::themed_color_output_enabled;
+
+    #[test]
+    fn themed_tui_enables_color_by_default() {
+        assert!(themed_color_output_enabled(None));
+        assert!(themed_color_output_enabled(Some("always")));
+        assert!(themed_color_output_enabled(Some("auto")));
+    }
+
+    #[test]
+    fn explicit_monochrome_override_disables_color() {
+        for value in ["never", "off", "false", "0", " NEVER "] {
+            assert!(!themed_color_output_enabled(Some(value)));
+        }
+    }
 }
