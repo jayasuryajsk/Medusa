@@ -15,6 +15,8 @@ use std::{
 use color_eyre::eyre::{Result, WrapErr, bail};
 use serde::{Deserialize, Serialize};
 
+use crate::persistence::atomic_write_private;
+
 /// Files larger than this are recorded as `skipped_too_large` instead of
 /// copied, so `.medusa/checkpoints` stays bounded.
 const MAX_CAPTURED_FILE_BYTES: u64 = 50 * 1024 * 1024;
@@ -383,8 +385,8 @@ impl CheckpointRecorder {
     }
 }
 
-/// Atomic manifest rewrite (temp + rename): a crashed turn still leaves a
-/// parseable checkpoint on disk.
+/// Atomic manifest rewrite: a crashed turn still leaves a parseable checkpoint
+/// on disk.
 fn write_manifest(state: &RecorderState) -> Result<()> {
     let parent_id = newest_checkpoint_id_excluding(&state.workspace, &state.id);
     let entry = CheckpointEntry {
@@ -399,16 +401,9 @@ fn write_manifest(state: &RecorderState) -> Result<()> {
     };
     let dir = checkpoints_dir(&state.workspace).join(&state.id);
     let manifest = dir.join("manifest.json");
-    let temp = dir.join("manifest.json.tmp");
     let json = serde_json::to_string_pretty(&entry).wrap_err("failed to encode manifest")?;
-    fs::write(&temp, json)
-        .wrap_err_with(|| format!("failed to write checkpoint manifest {}", temp.display()))?;
-    fs::rename(&temp, &manifest).wrap_err_with(|| {
-        format!(
-            "failed to finalize checkpoint manifest {}",
-            manifest.display()
-        )
-    })
+    atomic_write_private(&manifest, json)
+        .wrap_err_with(|| format!("failed to write checkpoint manifest {}", manifest.display()))
 }
 
 fn newest_checkpoint_id_excluding(workspace: &Path, excluded: &str) -> Option<String> {

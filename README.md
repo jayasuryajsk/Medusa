@@ -2,13 +2,14 @@
 
 A terminal-native, autonomous coding agent. Medusa inspects, edits, tests, and
 debugs the current workspace through a tight tool loop, rendered in a fast TUI
-that follows the Claude Code / Codex CLI visual language — one block per tool
-call, inline colored diffs, a live plan strip above the composer.
+that follows the Claude Code / Codex CLI visual language — compact batched tool
+activity, inline colored diffs, and a live plan strip above the composer.
 
-Built in Rust. Single binary, no runtime dependencies.
+Built in Rust and distributed as a single binary. Guarded execution on Linux
+also requires `bubblewrap`.
 
 ```
- MEDUSA   ● ready   workspace ~/code/myproject                      perm open  git
+ MEDUSA   ● ready   workspace ~/code/myproject                   perm guarded  git
 ─────────────────────────────────────────────────────────────────────────────────
  • read src/parser.rs, src/lexer.rs +3 more
    ⎿ 5 files, 1.2k lines
@@ -36,10 +37,10 @@ Built in Rust. Single binary, no runtime dependencies.
   snapshots the pre-image of every file it's about to change under
   `.medusa/checkpoints/`; `/rewind` restores the workspace to the state before
   any previous turn.
-- **Sandboxed commands (macOS)** — model-run shell commands are wrapped in a
-  Seatbelt profile: writes confined to the workspace and temp dirs, network
-  denied unless allowed. The model can request an unsandboxed retry after a
-  sandbox-caused failure, but escalation always pauses for your approval.
+- **Sandboxed commands** — model-run shell commands use macOS Seatbelt or Linux
+  bubblewrap: writes stay confined to the workspace and temp dirs, and network
+  is denied unless allowed. A required sandbox fails closed when unavailable;
+  an unsandboxed retry always pauses for your approval.
 - **MCP servers** — declare stdio Model Context Protocol servers in
   `.medusa/mcp.json`; their tools appear to the model as `mcp_<server>_<tool>`.
 - **Custom agents** — define named subagents in `.medusa/agents/*.md` with
@@ -54,8 +55,11 @@ Built in Rust. Single binary, no runtime dependencies.
   breakage gets fixed in the next turn instead of discovered later.
 - **Interactive permissions** — approve, always-allow, or deny each mutating
   action, with three modes: `open`, `guarded`, `readonly`.
-- **JS workflow engine** — the model (or you, via `/workflow`) can author and run
-  deterministic multi-agent scripts with `agent()` / `parallel()` / `phase()`.
+- **JS workflow engine** — `/workflow <task>` has the model author and run a
+  task-specific orchestration; saved scripts use `agent()` / `parallel()` /
+  `phase()` with control flow and intermediate results kept outside the parent
+  conversation. Runs are resource-bounded and journaled under
+  `.medusa/workflow-runs/` for post-failure inspection.
 - **Context engineering** — token budgeting with automatic LLM compaction of
   older turns so long sessions stay within the model's window; `/context`,
   `/compact`, and `/cost` show and manage usage on demand.
@@ -70,7 +74,8 @@ Built in Rust. Single binary, no runtime dependencies.
 
 ## Requirements
 
-- **Rust 1.85+** (2024 edition) — install via [rustup](https://rustup.rs).
+- **Rust 1.90+** (2024 edition) — install via [rustup](https://rustup.rs).
+- **Linux guarded/readonly mode:** `bubblewrap` (`bwrap`) must be installed.
 - **A model backend.** By default Medusa reuses your **Codex CLI** OAuth login
   (see below). OpenAI-compatible and DeepSeek backends are also supported via
   environment variables.
@@ -92,13 +97,16 @@ mv medusa ~/.local/bin/          # or anywhere on your PATH
 ```
 
 Other targets: `x86_64-apple-darwin`, `x86_64-unknown-linux-gnu`.
+Each release includes a `.sha256` file and GitHub build-provenance
+attestation. Verify a download with `sha256sum -c <archive>.sha256` (Linux) or
+`shasum -a 256 -c <archive>.sha256` (macOS).
 
 ### From source
 
 ```sh
 git clone https://github.com/jayasuryajsk/Medusa.git
 cd Medusa
-cargo install --path crates/medusa-tui
+cargo install --locked --path crates/medusa-tui
 ```
 
 This builds an optimized binary and places `medusa` on your `PATH` (usually
@@ -179,7 +187,8 @@ In the composer:
 | `/reasoning` | Set thinking effort (`low`…`xhigh`, choices per model) |
 | `/permissions` | Change permission mode (open / guarded / readonly) |
 | `/theme` | Cycle color themes (`medusa`, `opencode`, `tokyonight`, `catppuccin`, …) |
-| `/workflow <script> [args]` | Run a `.medusa/workflows/*.js` workflow |
+| `/workflow <task>` | Have the model author and run a task-specific JavaScript workflow |
+| `/workflow <script> [args]` | Run a saved `.medusa/workflows/*.js` workflow |
 | `/rewind` | Restore files to the state before a previous turn |
 | `/edit` | Backtrack: edit a previous message and resend from there |
 | `/review` | Seed the composer with a code-review prompt for pending changes |
@@ -221,19 +230,28 @@ Medusa reads project instructions from an `AGENTS.md` file at the workspace root
 (falling back to `AGENT.md`, `CLAUDE.md`, then `MEDUSA.md`). Quick-memory
 notes (`# <note>` in the composer) are appended to the same file.
 
-### Sandboxing (macOS)
+### Sandboxing
 
 On macOS, model-initiated shell commands run under a `sandbox-exec` Seatbelt
 profile: reads stay broad (toolchains need them), writes are confined to the
 workspace and temp directories, and network access is denied unless enabled.
-`open` permission mode runs trusted (unsandboxed) by default; `guarded` and
-`readonly` sandbox. Override either way with `MEDUSA_SANDBOX=on|off`.
+On Linux the equivalent policy uses bubblewrap with a read-only host root,
+writable workspace/temp mounts, PID and user namespaces, and an isolated
+network namespace.
+
+Fresh workspaces default to `guarded`. `open` runs trusted commands
+unsandboxed; `guarded` and `readonly` require the platform sandbox. If Seatbelt
+or bubblewrap is unavailable, Medusa blocks the command instead of silently
+running it on the host. Override the mode-derived sandbox preference with
+`MEDUSA_SANDBOX=on|off`; an explicit unsandboxed model request still requires
+approval.
 
 When a sandboxed command fails for a sandbox-plausible reason, the model may
 retry with the sandbox off — that escalation always renders an approval card
-and waits for you. Sandboxed children see `MEDUSA_SANDBOX=seatbelt` (and
-`MEDUSA_SANDBOX_NETWORK_DISABLED=1` when the network is denied) in their
-environment so scripts and hooks can adapt. Other platforms run unsandboxed.
+and waits for you. Sandboxed children see `MEDUSA_SANDBOX=seatbelt` or
+`MEDUSA_SANDBOX=bubblewrap` (plus `MEDUSA_SANDBOX_NETWORK_DISABLED=1` when
+network is denied). Platforms without a supported sandbox can use `open` mode
+or an individually approved unsandboxed command.
 
 ### Checkpoints & rewind
 
@@ -283,6 +301,32 @@ Header lines (`name:`, `description:`, `tools:` — any of
 agent's system prompt. Workflow scripts reference agents by name via the
 `agentType` field; `/agents` lists what's loaded.
 
+### Lifecycle hooks
+
+Trusted project hooks live in `.medusa/hooks.json`. Hooks run at `turn_start`,
+`pre_tool`, `post_tool`, and `turn_end`; object entries can block on failure
+and set a per-hook timeout:
+
+```json
+{
+  "default_timeout_secs": 30,
+  "hooks": {
+    "post_tool": [
+      {
+        "command": "cargo fmt --all -- --check",
+        "cwd": ".",
+        "fail_on_error": true,
+        "timeout_secs": 60
+      }
+    ]
+  }
+}
+```
+
+Hooks are local trusted automation, not model-generated commands, and do not
+run inside the model sandbox. Output is bounded and timed out; never put
+untrusted shell text in hook commands.
+
 ### Environment variables
 
 Selected environment variables:
@@ -295,28 +339,36 @@ Selected environment variables:
 | `MEDUSA_CONTEXT_MAX_TOKENS` | Context budget before compaction (default 60k) |
 | `MEDUSA_VERIFY` | `off` disables post-edit verification |
 | `MEDUSA_VERIFY_TIMEOUT_SECS` | Verification command timeout (default 90) |
-| `MEDUSA_SANDBOX` | `on`/`off` overrides the permission-mode sandbox default (macOS) |
+| `MEDUSA_SANDBOX` | `on`/`off` overrides the permission-mode sandbox default |
 | `MEDUSA_CHECKPOINT_MAX` | Max retained checkpoints (default 50) |
 | `MEDUSA_CHECKPOINT_MAX_MB` | Max total checkpoint size in MB (default 200) |
 | `MEDUSA_MCP_CONNECT_TIMEOUT_SECS` | MCP server connect/handshake budget (default 10) |
 | `MEDUSA_MCP_TOOL_TIMEOUT_SECS` | Per-call MCP tool timeout (default 60) |
 | `MEDUSA_MCP_DEBUG` | `1` logs MCP traffic to `.medusa/logs/mcp-<server>.log` |
+| `MEDUSA_WORKFLOW_MAX_SCRIPT_AGENTS` | Maximum agents spawned by one workflow script (default 200) |
+| `MEDUSA_WORKFLOW_MAX_PARALLEL` | Maximum concurrently running workflow agents (default 8) |
+| `MEDUSA_WORKFLOW_SCRIPT_TIMEOUT_SECS` | Workflow JS deadline in seconds (default 3600; `0` disables) |
+| `MEDUSA_WORKFLOW_SCRIPT_MEMORY_MB` | Workflow JS heap cap in MB (default 128, max 1024) |
+| `MEDUSA_HOOK_TIMEOUT_SECS` | Default lifecycle-hook timeout (default 30, max 600) |
 | `MEDUSA_BELL` | `on`/`off` overrides the bell setting (rings after long turns and on approval prompts) |
 | `MEDUSA_THEME` | Startup theme |
 | `CODEX_HOME` | Directory holding `auth.json` (default `~/.codex`) |
 
-Inside sandboxed commands, Medusa sets `MEDUSA_SANDBOX=seatbelt` and (when the
-network is denied) `MEDUSA_SANDBOX_NETWORK_DISABLED=1` for child processes.
+Inside sandboxed commands, Medusa identifies the backend in `MEDUSA_SANDBOX`
+and, when network is denied, sets `MEDUSA_SANDBOX_NETWORK_DISABLED=1`.
 
-Per-workspace state (sessions, permission grants) lives in a `.medusa/`
-directory, which you'll usually want in `.gitignore`.
+Per-workspace state (sessions, permission grants, attachments, workflow
+journals) lives in a private `.medusa/` directory and is written atomically.
+Keep it in `.gitignore`; it can contain source excerpts, prompts, and model
+output.
 
 ## Development
 
 ```sh
-cargo test --workspace      # run the test suite
-cargo clippy --workspace    # lint
-cargo build --release       # optimized build
+cargo fmt --all -- --check
+cargo clippy --locked --workspace --all-targets -- -D warnings
+cargo test --locked --workspace
+cargo build --locked --release
 ```
 
 The workspace has two crates: `medusa-core` (agent loop, tools, model backends,
@@ -325,3 +377,7 @@ workflow engine) and `medusa-tui` (the terminal interface and headless CLI).
 ## License
 
 MIT © Jaya Surya Kommireddy. See [LICENSE](LICENSE).
+
+Security reports are handled through [GitHub private vulnerability
+reporting](SECURITY.md). Please do not open a public issue for a suspected
+credential leak or sandbox escape.

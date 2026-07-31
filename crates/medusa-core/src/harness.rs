@@ -3,6 +3,7 @@ pub enum TurnMode {
     Chat,
     Goal,
     PlanFirst,
+    Workflow,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -22,6 +23,7 @@ impl HarnessPolicy {
             TurnMode::Chat => "chat",
             TurnMode::Goal => "goal",
             TurnMode::PlanFirst => "plan",
+            TurnMode::Workflow => "workflow",
         }
     }
 
@@ -36,6 +38,9 @@ impl HarnessPolicy {
             TurnMode::PlanFirst => {
                 "Current turn mode hint: plan. Explore and reason before changing files. Prefer concise architecture, tradeoff, or workflow guidance. The full toolset stays available; implement once the plan is settled or the user asks."
             }
+            TurnMode::Workflow => {
+                "Current turn mode: workflow. The user explicitly requested a dynamic workflow. Author a task-specific JavaScript orchestration and invoke workflow_run. The script, not a fixed phase template, owns loops, branching, fan-out, verification, and stopping conditions. Use only as many subagents as the task warrants, keep intermediate results in script variables, and return the final result to this turn."
+            }
         }
     }
 }
@@ -48,6 +53,10 @@ fn classify_turn_mode(prompt: &str) -> TurnMode {
     let text = prompt.trim().to_ascii_lowercase();
     if text.is_empty() || is_small_talk(&text) {
         return TurnMode::Chat;
+    }
+
+    if text.starts_with("/workflow ") {
+        return TurnMode::Workflow;
     }
 
     if contains_any(&text, GOAL_MARKERS) {
@@ -165,5 +174,15 @@ mod tests {
             HarnessPolicy::for_user_prompt("let's talk about backend architecture").mode,
             TurnMode::PlanFirst
         );
+    }
+
+    #[test]
+    fn explicit_workflow_command_uses_dynamic_workflow_mode() {
+        let policy = HarnessPolicy::for_user_prompt("/workflow audit every route");
+
+        assert_eq!(policy.mode, TurnMode::Workflow);
+        assert_eq!(policy.mode_label(), "workflow");
+        assert!(policy.instructions().contains("invoke workflow_run"));
+        assert!(policy.instructions().contains("task-specific JavaScript"));
     }
 }

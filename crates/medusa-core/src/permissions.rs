@@ -6,6 +6,8 @@ use std::{
 use color_eyre::eyre::{Result, WrapErr, bail};
 use serde::{Deserialize, Serialize};
 
+use crate::persistence::{atomic_write_private, ensure_private_dir};
+
 #[derive(Debug, Clone)]
 pub struct PermissionPolicy {
     config: PermissionConfig,
@@ -148,7 +150,7 @@ impl PermissionPolicy {
             serde_json::from_str(&text)
                 .wrap_err_with(|| format!("failed to parse {}", path.display()))?
         } else {
-            PermissionConfig::default()
+            config_for_mode(PermissionMode::Guarded)
         };
 
         Ok(Self { config, workspace })
@@ -194,13 +196,14 @@ impl PermissionPolicy {
         }
 
         if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)
+            ensure_private_dir(parent)
                 .wrap_err_with(|| format!("failed to create {}", parent.display()))?;
         }
 
         let json =
             serde_json::to_string_pretty(&config).wrap_err("failed to encode permissions")?;
-        fs::write(&path, json).wrap_err_with(|| format!("failed to write {}", path.display()))
+        atomic_write_private(&path, json)
+            .wrap_err_with(|| format!("failed to write {}", path.display()))
     }
 
     pub fn check_terminal_command(&self, command: &str) -> Result<()> {
@@ -400,12 +403,13 @@ impl PermissionPolicy {
         }
 
         if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)
+            ensure_private_dir(parent)
                 .wrap_err_with(|| format!("failed to create {}", parent.display()))?;
         }
         let json =
             serde_json::to_string_pretty(&config).wrap_err("failed to encode permissions")?;
-        fs::write(&path, json).wrap_err_with(|| format!("failed to write {}", path.display()))
+        atomic_write_private(&path, json)
+            .wrap_err_with(|| format!("failed to write {}", path.display()))
     }
 }
 
@@ -643,10 +647,12 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
-    fn missing_permissions_allow_by_default() {
+    fn missing_permissions_use_guarded_default() {
         let policy = PermissionPolicy::load(temp_workspace()).unwrap();
 
-        policy.check_terminal_command("rm -rf target").unwrap();
+        assert_eq!(policy.effective_mode(), PermissionMode::Guarded);
+        assert!(policy.check_terminal_command("rm -rf target").is_err());
+        policy.check_terminal_command("git status").unwrap();
         policy
             .check_patch_paths(&["src/main.rs".to_string()])
             .unwrap();

@@ -4,10 +4,16 @@ use std::{
     fs,
     path::{Component, Path, PathBuf},
     process::Command,
+    time::Duration,
 };
 
 use color_eyre::eyre::{Result, WrapErr, bail};
 use serde::Deserialize;
+
+use crate::cancel::CancelToken;
+
+const DEFAULT_HOOK_TIMEOUT_SECS: u64 = 30;
+const MAX_HOOK_TIMEOUT_SECS: u64 = 600;
 
 #[derive(Debug, Clone)]
 pub struct HookRuntime {
@@ -19,6 +25,8 @@ pub struct HookRuntime {
 struct HookConfig {
     #[serde(default)]
     hooks: BTreeMap<String, Vec<HookCommandConfig>>,
+    #[serde(default)]
+    default_timeout_secs: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -30,6 +38,8 @@ enum HookCommandConfig {
         cwd: Option<PathBuf>,
         #[serde(default)]
         fail_on_error: bool,
+        #[serde(default)]
+        timeout_secs: Option<u64>,
     },
 }
 
@@ -129,7 +139,8 @@ impl HookRuntime {
         };
 
         let shell = std::env::var_os("SHELL").unwrap_or_else(|| OsStr::new("sh").to_os_string());
-        match Command::new(shell)
+        let mut child = Command::new(shell);
+        child
             .arg("-lc")
             .arg(&command_text)
             .current_dir(cwd)
@@ -142,16 +153,41 @@ impl HookRuntime {
                 "MEDUSA_TOOL_SUMMARY",
                 event.tool_summary.unwrap_or_default(),
             )
-            .env("MEDUSA_TOOL_STATUS", event.tool_status.unwrap_or_default())
-            .output()
-        {
+            .env("MEDUSA_TOOL_STATUS", event.tool_status.unwrap_or_default());
+        let timeout_secs = command
+            .timeout_secs()
+            .or(self.config.default_timeout_secs)
+            .or_else(|| {
+                std::env::var("MEDUSA_HOOK_TIMEOUT_SECS")
+                    .ok()
+                    .and_then(|value| value.parse().ok())
+            })
+            .unwrap_or(DEFAULT_HOOK_TIMEOUT_SECS)
+            .clamp(1, MAX_HOOK_TIMEOUT_SECS);
+
+        match crate::proc::run_command(
+            child,
+            Some(Duration::from_secs(timeout_secs)),
+            &CancelToken::default(),
+        ) {
             Ok(output) => HookRun {
                 event: event_name,
                 command: command_text,
-                code: output.status.code(),
-                stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-                stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-                failed: !output.status.success(),
+                code: output.code,
+                stdout: output.stdout,
+                stderr: if output.timed_out {
+                    format!(
+                        "hook timed out after {timeout_secs}s{}",
+                        if output.stderr.trim().is_empty() {
+                            String::new()
+                        } else {
+                            format!(": {}", output.stderr.trim())
+                        }
+                    )
+                } else {
+                    output.stderr
+                },
+                failed: !output.success,
                 fail_on_error,
             },
             Err(error) => HookRun {
@@ -309,6 +345,13 @@ impl HookCommandConfig {
             Self::Object { fail_on_error, .. } => *fail_on_error,
         }
     }
+
+    fn timeout_secs(&self) -> Option<u64> {
+        match self {
+            Self::Shell(_) => None,
+            Self::Object { timeout_secs, .. } => *timeout_secs,
+        }
+    }
 }
 
 fn compact(value: &str, max_chars: usize) -> String {
@@ -398,6 +441,29 @@ mod tests {
         let report = hooks.run(HookEvent::pre_tool("goal", "terminal.exec", "$ pwd"));
 
         assert!(report.blocking_failure_summary().is_some());
+    }
+
+    #[test]
+    fn hook_timeout_terminates_hung_processes() {
+        let workspace = temp_workspace();
+        fs::create_dir_all(workspace.join(".medusa")).unwrap();
+        fs::write(
+            workspace.join(".medusa/hooks.json"),
+            r#"{"hooks":{"pre_tool":[{"command":"sleep 30","timeout_secs":1,"fail_on_error":true}]}}"#,
+        )
+        .unwrap();
+
+        let started = std::time::Instant::now();
+        let hooks = HookRuntime::load(&workspace).unwrap();
+        let report = hooks.run(HookEvent::pre_tool("goal", "terminal.exec", "$ pwd"));
+
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        assert!(
+            report
+                .blocking_failure_summary()
+                .unwrap()
+                .contains("timed out after 1s")
+        );
     }
 
     fn temp_workspace() -> PathBuf {

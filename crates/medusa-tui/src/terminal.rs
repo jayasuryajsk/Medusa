@@ -11,6 +11,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use color_eyre::eyre::{Result, WrapErr, bail};
 use crossterm::{
+    cursor::Show,
     event::{
         DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
         KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
@@ -27,29 +28,59 @@ pub(crate) type Tui = Terminal<CrosstermBackend<io::Stdout>>;
 
 static KEYBOARD_ENHANCED: AtomicBool = AtomicBool::new(false);
 
-pub(crate) fn init_terminal() -> Result<Tui> {
-    enable_raw_mode()?;
-    let mut stdout = io::stdout();
-    execute!(
-        stdout,
-        EnterAlternateScreen,
-        EnableBracketedPaste,
-        EnableMouseCapture
-    )?;
+/// Restores the user's terminal if startup, rendering, or unwinding exits the
+/// normal shutdown path after raw mode has been enabled.
+pub(crate) struct TerminalRestoreGuard {
+    armed: bool,
+}
 
-    // Kitty keyboard protocol (Ghostty, Kitty, WezTerm, foot): disambiguates
-    // modified keys so Shift+Enter / Alt+Enter reach the composer instead of
-    // collapsing to plain Enter.
-    if matches!(supports_keyboard_enhancement(), Ok(true)) {
-        execute!(
-            stdout,
-            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
-        )?;
-        KEYBOARD_ENHANCED.store(true, Ordering::Relaxed);
+impl TerminalRestoreGuard {
+    pub(crate) fn armed() -> Self {
+        Self { armed: true }
     }
 
-    let backend = CrosstermBackend::new(stdout);
-    Ok(Terminal::new(backend)?)
+    pub(crate) fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for TerminalRestoreGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            restore_terminal_best_effort();
+        }
+    }
+}
+
+pub(crate) fn init_terminal() -> Result<Tui> {
+    enable_raw_mode()?;
+    let result = (|| -> Result<Tui> {
+        let mut stdout = io::stdout();
+        execute!(
+            stdout,
+            EnterAlternateScreen,
+            EnableBracketedPaste,
+            EnableMouseCapture
+        )?;
+
+        // Kitty keyboard protocol (Ghostty, Kitty, WezTerm, foot):
+        // disambiguates modified keys so Shift+Enter / Alt+Enter reach the
+        // composer instead of collapsing to plain Enter.
+        if matches!(supports_keyboard_enhancement(), Ok(true)) {
+            execute!(
+                stdout,
+                PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+            )?;
+            KEYBOARD_ENHANCED.store(true, Ordering::Relaxed);
+        }
+
+        let backend = CrosstermBackend::new(stdout);
+        Ok(Terminal::new(backend)?)
+    })();
+    if result.is_err() {
+        restore_terminal_best_effort();
+    }
+    result
 }
 
 pub(crate) fn restore_terminal(terminal: &mut Tui) -> Result<()> {
@@ -65,6 +96,21 @@ pub(crate) fn restore_terminal(terminal: &mut Tui) -> Result<()> {
     )?;
     terminal.show_cursor()?;
     Ok(())
+}
+
+fn restore_terminal_best_effort() {
+    let _ = disable_raw_mode();
+    let mut stdout = io::stdout();
+    if KEYBOARD_ENHANCED.swap(false, Ordering::Relaxed) {
+        let _ = execute!(stdout, PopKeyboardEnhancementFlags);
+    }
+    let _ = execute!(
+        stdout,
+        DisableMouseCapture,
+        DisableBracketedPaste,
+        LeaveAlternateScreen,
+        Show
+    );
 }
 
 /// Run `draw` inside a synchronized-output block (DEC mode 2026). Terminals

@@ -6,16 +6,18 @@ use std::{
     rc::Rc,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         mpsc::Sender,
     },
     thread,
+    time::{Duration, Instant},
 };
 
 use color_eyre::eyre::{Result, bail, eyre};
 use rquickjs::{Context, Ctx, Exception, Function, Runtime as JsRuntime, Value as JsValue};
 use serde_json::Value;
 
+use super::journal::WorkflowJournal;
 use super::{
     SubagentReport, SubagentToolPolicy, WorkflowEvent, WorkflowPhaseReport, WorkflowRunReport,
     WorkflowRuntime, WorkflowStatus, compact, phase_status_from_reports, tool_result_failed,
@@ -23,6 +25,7 @@ use super::{
 };
 use crate::{
     agents::AgentRegistry,
+    cancel::CancelToken,
     model::{ConversationMessage, DirectCodexBackend, ModelStreamEvent},
     tools::ToolRuntime,
 };
@@ -31,6 +34,9 @@ const DEFAULT_MAX_SCRIPT_AGENTS: usize = 200;
 const DEFAULT_MAX_PARALLEL_AGENTS: usize = 8;
 const AGENT_RESULT_MAX_CHARS: usize = 24_000;
 const WORKFLOW_SCRIPT_DIR: &str = ".medusa/workflows";
+const DEFAULT_SCRIPT_TIMEOUT_SECS: u64 = 60 * 60;
+const DEFAULT_SCRIPT_MEMORY_MB: usize = 128;
+const MAX_SCRIPT_MEMORY_MB: usize = 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkflowScript {
@@ -531,8 +537,9 @@ impl WorkflowRuntime {
     where
         F: FnMut(WorkflowEvent) -> Result<()>,
     {
+        let cancel = tools.cancel_token().clone();
         let runner = self.script_agent_runner(backend, tools);
-        self.run_script_with_runner(script, args, runner, &mut emit)
+        self.run_script_with_runner_and_cancel(script, args, runner, cancel, &mut emit)
     }
 
     fn script_agent_runner(&self, backend: DirectCodexBackend, tools: ToolRuntime) -> AgentRunner {
@@ -585,6 +592,7 @@ impl WorkflowRuntime {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn run_script_with_runner<F>(
         &self,
         script: &WorkflowScript,
@@ -595,9 +603,24 @@ impl WorkflowRuntime {
     where
         F: FnMut(WorkflowEvent) -> Result<()>,
     {
+        self.run_script_with_runner_and_cancel(script, args, runner, CancelToken::default(), emit)
+    }
+
+    fn run_script_with_runner_and_cancel<F>(
+        &self,
+        script: &WorkflowScript,
+        args: Option<Value>,
+        runner: AgentRunner,
+        cancel: CancelToken,
+        emit: &mut F,
+    ) -> Result<WorkflowRunReport>
+    where
+        F: FnMut(WorkflowEvent) -> Result<()>,
+    {
         let (sender, receiver) = std::sync::mpsc::channel();
         let script = script.clone();
         let agents = self.agent_registry.clone();
+        let workspace = self.workspace.clone();
         let max_agents = max_script_agents();
         let max_parallel = max_parallel_agents();
 
@@ -605,21 +628,69 @@ impl WorkflowRuntime {
             run_script_thread(
                 script,
                 args,
-                runner,
-                agents,
-                sender,
-                max_agents,
-                max_parallel,
+                ScriptThreadContext {
+                    runner,
+                    agents,
+                    events: sender,
+                    max_agents,
+                    max_parallel,
+                    cancel,
+                },
             )
         });
 
+        let mut journal = None;
+        let mut journal_started = false;
+        let mut journal_error = None;
+        let mut emit_error = None;
         for event in receiver {
-            emit(event)?;
+            if !journal_started {
+                journal_started = true;
+                match WorkflowJournal::start(&workspace, event.run_id()) {
+                    Ok(value) => journal = Some(value),
+                    Err(error) => journal_error = Some(error),
+                }
+            }
+            if journal_error.is_none()
+                && let Some(active_journal) = journal.as_mut()
+                && let Err(error) = active_journal.append(&event)
+            {
+                journal_error = Some(error);
+                journal = None;
+            }
+            if emit_error.is_none()
+                && let Err(error) = emit(event)
+            {
+                // Keep draining and join the worker. Returning early here
+                // would detach a workflow that may still be mutating files.
+                emit_error = Some(error);
+            }
         }
 
-        worker
+        let report = worker
             .join()
-            .map_err(|_| eyre!("workflow script thread panicked"))?
+            .map_err(|_| eyre!("workflow script thread panicked"))??;
+        if journal_error.is_none() {
+            match journal.as_mut() {
+                Some(active_journal) => {
+                    if let Err(error) = active_journal.finish(&report) {
+                        journal_error = Some(error);
+                    }
+                }
+                None if !journal_started => {
+                    journal_error = Some(eyre!("workflow ended without emitting RunStarted"));
+                }
+                None => {}
+            }
+        }
+
+        if let Some(error) = journal_error {
+            return Err(error);
+        }
+        if let Some(error) = emit_error {
+            return Err(error);
+        }
+        Ok(report)
     }
 }
 
@@ -639,15 +710,28 @@ fn max_parallel_agents() -> usize {
         .unwrap_or(DEFAULT_MAX_PARALLEL_AGENTS)
 }
 
-fn run_script_thread(
-    script: WorkflowScript,
-    args: Option<Value>,
+struct ScriptThreadContext {
     runner: AgentRunner,
     agents: AgentRegistry,
     events: Sender<WorkflowEvent>,
     max_agents: usize,
     max_parallel: usize,
+    cancel: CancelToken,
+}
+
+fn run_script_thread(
+    script: WorkflowScript,
+    args: Option<Value>,
+    context: ScriptThreadContext,
 ) -> Result<WorkflowRunReport> {
+    let ScriptThreadContext {
+        runner,
+        agents,
+        events,
+        max_agents,
+        max_parallel,
+        cancel,
+    } = context;
     let run_id = workflow_run_id();
     let title = format!("script:{}", script.name);
     let task = args
@@ -658,7 +742,6 @@ fn run_script_thread(
         run_id: run_id.clone(),
         title: title.clone(),
         task: task.clone(),
-        phases: Vec::new(),
     });
 
     let host = Rc::new(RefCell::new(ScriptHost {
@@ -675,7 +758,7 @@ fn run_script_thread(
         finished_phases: Vec::new(),
     }));
 
-    let eval_result = eval_workflow_script(&script.source, args, Rc::clone(&host));
+    let eval_result = eval_workflow_script(&script.source, args, Rc::clone(&host), cancel);
 
     let (finished_phases, total_agents) = {
         let mut host = host.borrow_mut();
@@ -747,13 +830,50 @@ fn eval_workflow_script(
     source: &str,
     args: Option<Value>,
     host: Rc<RefCell<ScriptHost>>,
+    cancel: CancelToken,
+) -> Result<Option<Value>> {
+    eval_workflow_script_with_limits(
+        source,
+        args,
+        host,
+        cancel,
+        workflow_script_timeout(),
+        workflow_script_memory_bytes(),
+    )
+}
+
+fn eval_workflow_script_with_limits(
+    source: &str,
+    args: Option<Value>,
+    host: Rc<RefCell<ScriptHost>>,
+    cancel: CancelToken,
+    timeout: Option<Duration>,
+    memory_limit: usize,
 ) -> Result<Option<Value>> {
     let js_runtime =
         JsRuntime::new().map_err(|error| eyre!("failed to start JS runtime: {error}"))?;
+    js_runtime.set_memory_limit(memory_limit);
+    js_runtime.set_max_stack_size(1024 * 1024);
+    let deadline = timeout.map(|timeout| Instant::now() + timeout);
+    let timed_out = Arc::new(AtomicBool::new(false));
+    let interrupted_by_cancel = Arc::new(AtomicBool::new(false));
+    let timeout_flag = Arc::clone(&timed_out);
+    let cancel_flag = Arc::clone(&interrupted_by_cancel);
+    js_runtime.set_interrupt_handler(Some(Box::new(move || {
+        if cancel.is_cancelled() {
+            cancel_flag.store(true, Ordering::Relaxed);
+            return true;
+        }
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            timeout_flag.store(true, Ordering::Relaxed);
+            return true;
+        }
+        false
+    })));
     let context =
         Context::full(&js_runtime).map_err(|error| eyre!("failed to build JS context: {error}"))?;
 
-    context.with(|ctx| -> Result<Option<Value>> {
+    let result = context.with(|ctx| -> Result<Option<Value>> {
         register_host_functions(&ctx, host).map_err(|error| eyre!("{error}"))?;
 
         let args_value = json_to_js(&ctx, &args.unwrap_or(Value::Null))
@@ -769,7 +889,35 @@ fn eval_workflow_script(
             Err(rquickjs::Error::Exception) => Err(eyre!(format_js_exception(&ctx))),
             Err(error) => Err(eyre!("workflow script error: {error}")),
         }
-    })
+    });
+    if interrupted_by_cancel.load(Ordering::Relaxed) {
+        bail!("cancelled: workflow JavaScript interrupted by user");
+    }
+    if timed_out.load(Ordering::Relaxed) {
+        bail!(
+            "workflow JavaScript exceeded its {}s execution deadline",
+            timeout.map_or(0, |duration| duration.as_secs())
+        );
+    }
+    result
+}
+
+fn workflow_script_timeout() -> Option<Duration> {
+    let seconds = std::env::var("MEDUSA_WORKFLOW_SCRIPT_TIMEOUT_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_SCRIPT_TIMEOUT_SECS);
+    (seconds > 0).then(|| Duration::from_secs(seconds))
+}
+
+fn workflow_script_memory_bytes() -> usize {
+    std::env::var("MEDUSA_WORKFLOW_SCRIPT_MEMORY_MB")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_SCRIPT_MEMORY_MB)
+        .min(MAX_SCRIPT_MEMORY_MB)
+        .saturating_mul(1024 * 1024)
 }
 
 fn format_js_exception(ctx: &Ctx<'_>) -> String {
@@ -985,6 +1133,57 @@ mod tests {
                 failed_tools: false,
             })
         })
+    }
+
+    fn empty_host() -> Rc<RefCell<ScriptHost>> {
+        let (events, _receiver) = std::sync::mpsc::channel();
+        Rc::new(RefCell::new(ScriptHost {
+            run_id: workflow_run_id(),
+            events,
+            runner: echo_runner(),
+            agents: AgentRegistry::default(),
+            max_agents: 4,
+            max_parallel: 2,
+            total_agents: 0,
+            phase_open: false,
+            phase_name: String::new(),
+            phase_agents: Vec::new(),
+            finished_phases: Vec::new(),
+        }))
+    }
+
+    #[test]
+    fn runaway_javascript_is_interrupted_by_deadline() {
+        let started = Instant::now();
+        let error = eval_workflow_script_with_limits(
+            "while (true) {}",
+            None,
+            empty_host(),
+            CancelToken::default(),
+            Some(Duration::from_millis(50)),
+            16 * 1024 * 1024,
+        )
+        .unwrap_err();
+
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(error.to_string().contains("execution deadline"));
+    }
+
+    #[test]
+    fn runaway_javascript_observes_turn_cancellation() {
+        let cancel = CancelToken::new();
+        cancel.cancel();
+        let error = eval_workflow_script_with_limits(
+            "while (true) {}",
+            None,
+            empty_host(),
+            cancel,
+            None,
+            16 * 1024 * 1024,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("interrupted by user"));
     }
 
     #[test]

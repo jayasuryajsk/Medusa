@@ -50,6 +50,7 @@ use medusa_core::model::{
     ConversationAttachment, ConversationMessage, DirectCodexBackend, ModelStreamEvent, TokenUsage,
 };
 use medusa_core::permissions::{PermissionMode, PermissionPolicy};
+use medusa_core::persistence::{atomic_write, atomic_write_private};
 use medusa_core::session::{
     SessionOpenMode, SessionStore as CoreSessionStore, compact_session_id, human_bytes,
 };
@@ -58,8 +59,7 @@ use medusa_core::tools::{
     TerminalExecRequest, TerminalExecResult, ToolRuntime,
 };
 use medusa_core::workflow::{
-    SubagentToolPolicy, WorkflowEvent, WorkflowPhasePlan, WorkflowRuntime, WorkflowScript,
-    WorkflowStatus,
+    SubagentToolPolicy, WorkflowEvent, WorkflowRuntime, WorkflowScript, WorkflowStatus,
 };
 
 mod animation;
@@ -67,30 +67,34 @@ mod terminal;
 
 #[cfg(test)]
 use terminal::maybe_rebuild_before_reload;
-use terminal::{Tui, init_terminal, relaunch_current_executable, restore_terminal};
+use terminal::{
+    TerminalRestoreGuard, Tui, init_terminal, relaunch_current_executable, restore_terminal,
+};
 
 type SessionStore = CoreSessionStore<TranscriptItem>;
 
 fn main() -> Result<()> {
     color_eyre::install()?;
 
-    let startup_command = parse_args()?;
-    if let StartupCommand::Headless(options) = startup_command {
-        return run_headless(options);
-    }
-
-    let StartupCommand::Tui(startup_session) = startup_command else {
-        unreachable!("headless command returned above");
+    let startup_session = match parse_args()? {
+        StartupCommand::Tui(startup_session) => startup_session,
+        StartupCommand::Headless(options) => return run_headless(options),
+        StartupCommand::Print(text) => {
+            println!("{text}");
+            return Ok(());
+        }
     };
 
     let mut terminal = init_terminal()?;
+    let mut restore_guard = TerminalRestoreGuard::armed();
     let mut app = App::new(startup_session)?;
     let app_result = app.run(&mut terminal);
     let restart_requested = app.restart_requested;
-    restore_terminal(&mut terminal)?;
     // Reap MCP server children deterministically (stdin EOF, then a bounded
     // kill) instead of leaning on process exit.
     app.mcp.shutdown();
+    restore_terminal(&mut terminal)?;
+    restore_guard.disarm();
 
     app_result?;
 
@@ -127,7 +131,36 @@ struct SettingsItem {
 enum StartupCommand {
     Tui(SessionOpenMode),
     Headless(HeadlessOptions),
+    Print(&'static str),
 }
+
+const HELP_TEXT: &str = "Usage: medusa [continue [session]]
+       medusa run [options] [--] <task>
+
+Commands:
+  continue            Resume the last Medusa TUI session in this workspace
+  continue <session>  Resume a specific session from .medusa/sessions
+  run                 Run one non-interactive headless agent turn
+
+Run options:
+  --model <name>                 Override the model for this run
+  --permission <open|guarded|readonly>
+  --json                         Print a machine-readable JSON result
+  --no-stream                    Print only the final answer
+
+If <task> is omitted, medusa run reads the task from stdin.";
+
+const RUN_HELP_TEXT: &str = "Usage: medusa run [options] [--] <task>
+
+Options:
+  --model <name>                 Override the model for this run
+  --permission <open|guarded|readonly>
+  --json                         Print a machine-readable JSON result
+  --no-stream                    Print only the final answer
+
+If <task> is omitted, medusa run reads the task from stdin.";
+
+const VERSION_TEXT: &str = concat!("medusa ", env!("CARGO_PKG_VERSION"));
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct HeadlessOptions {
@@ -165,11 +198,9 @@ fn parse_startup_command(args: &[String]) -> Result<StartupCommand> {
             SessionOpenMode::ContinueNamed(session.to_string()),
         )),
         [command, rest @ ..] if command == "run" => parse_headless_options(rest),
-        [command] if command == "--help" || command == "-h" => {
-            println!(
-                "Usage: medusa [continue [session]]\n       medusa run [options] [--] <task>\n\nCommands:\n  continue            Resume the last Medusa TUI session in this workspace\n  continue <session>  Resume a specific session from .medusa/sessions\n  run                 Run one non-interactive headless agent turn\n\nRun options:\n  --model <name>                 Override the model for this run\n  --permission <open|guarded|readonly>\n  --json                         Print a machine-readable JSON result\n  --no-stream                    Print only the final answer\n\nIf <task> is omitted, medusa run reads the task from stdin."
-            );
-            std::process::exit(0);
+        [command] if command == "--help" || command == "-h" => Ok(StartupCommand::Print(HELP_TEXT)),
+        [command] if command == "--version" || command == "-V" => {
+            Ok(StartupCommand::Print(VERSION_TEXT))
         }
         [command] => bail!("unknown command `{command}` (try `medusa run` or `medusa continue`)"),
         _ => bail!(
@@ -227,12 +258,7 @@ fn parse_headless_options(args: &[String]) -> Result<StartupCommand> {
                     })?);
                 index += 2;
             }
-            "--help" | "-h" => {
-                println!(
-                    "Usage: medusa run [options] [--] <task>\n\nOptions:\n  --model <name>                 Override the model for this run\n  --permission <open|guarded|readonly>\n  --json                         Print a machine-readable JSON result\n  --no-stream                    Print only the final answer\n\nIf <task> is omitted, medusa run reads the task from stdin."
-                );
-                std::process::exit(0);
-            }
+            "--help" | "-h" => return Ok(StartupCommand::Print(RUN_HELP_TEXT)),
             value if value.starts_with('-') && task_parts.is_empty() => {
                 bail!("unknown medusa run option `{value}`");
             }
@@ -527,7 +553,7 @@ impl AppSettings {
         self.permission_mode
             .as_deref()
             .and_then(PermissionMode::from_name)
-            .unwrap_or(PermissionMode::Open)
+            .unwrap_or(PermissionMode::Guarded)
     }
 }
 
@@ -548,13 +574,9 @@ fn load_app_settings(workspace: &Path) -> Result<AppSettings> {
 
 fn save_app_settings(workspace: &Path, settings: &AppSettings) -> Result<()> {
     let path = app_settings_path(workspace);
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .wrap_err_with(|| format!("failed to create {}", parent.display()))?;
-    }
-
     let json = serde_json::to_string_pretty(settings).wrap_err("failed to encode settings")?;
-    fs::write(&path, json).wrap_err_with(|| format!("failed to write {}", path.display()))
+    atomic_write_private(&path, json)
+        .wrap_err_with(|| format!("failed to write {}", path.display()))
 }
 
 fn save_theme_preference(workspace: &Path, theme: ThemeKind) -> Result<()> {
@@ -2756,9 +2778,9 @@ impl App {
         let safe_name = sanitize_attachment_name(name_hint, extension);
         let file_name = format!("{id}-{safe_name}");
         let dir = self.attachment_dir()?;
-        fs::create_dir_all(&dir).wrap_err("failed to create attachments directory")?;
         let path = dir.join(file_name);
-        fs::write(&path, &bytes).wrap_err_with(|| format!("failed to write {}", path.display()))?;
+        atomic_write_private(&path, &bytes)
+            .wrap_err_with(|| format!("failed to write {}", path.display()))?;
         Ok(ImageAttachment {
             id,
             name: safe_name,
@@ -4602,7 +4624,7 @@ impl App {
             };
             self.transcript
                 .push(TranscriptItem::Message(ChatMessage::system(format!(
-                    "usage: /workflow <script-name> [args]  — run a saved JS workflow script\n       /workflow <task>               — run the built-in recon/implement/verify pipeline\n\n{script_lines}",
+                    "usage: /workflow <script-name> [args]  — run a saved JS workflow script\n       /workflow <task>               — have the model author and run a task-specific JS workflow\n\n{script_lines}",
                 ))));
             self.touch_transcript();
             self.status_line = "workflow needs a task or script".to_string();
@@ -4611,16 +4633,7 @@ impl App {
         }
 
         if let Some(workflow_task) = task.strip_prefix("/workflow ") {
-            let workflow_task = workflow_task.trim();
-            let (first, rest) = match workflow_task.split_once(char::is_whitespace) {
-                Some((first, rest)) => (first, rest.trim()),
-                None => (workflow_task, ""),
-            };
-            if WorkflowScript::list(self.tools.workspace()).contains(&first.to_string()) {
-                self.start_workflow_script(first, rest);
-            } else {
-                self.start_workflow(workflow_task);
-            }
+            self.start_workflow_request(workflow_task);
             return true;
         }
 
@@ -5874,7 +5887,20 @@ impl App {
         self.should_quit = true;
     }
 
-    fn start_workflow(&mut self, task: &str) {
+    fn start_workflow_request(&mut self, request: &str) {
+        let request = request.trim();
+        let (first, rest) = match request.split_once(char::is_whitespace) {
+            Some((first, rest)) => (first, rest.trim()),
+            None => (request, ""),
+        };
+        if WorkflowScript::list(self.tools.workspace()).contains(&first.to_string()) {
+            self.start_workflow_script(first, rest);
+        } else {
+            self.start_model_authored_workflow(request);
+        }
+    }
+
+    fn start_model_authored_workflow(&mut self, task: &str) {
         if task.trim().is_empty() {
             self.status_line = "workflow needs a task".to_string();
             self.toast("Workflow task required", ToastKind::Warning);
@@ -5898,61 +5924,14 @@ impl App {
         }
 
         let command = format!("/workflow {}", task.trim());
-        let user_index = self.transcript.len();
         self.transcript
             .push(TranscriptItem::Message(ChatMessage::user(command.clone())));
         self.touch_transcript();
         self.persist_session();
         self.scroll_chat_to_bottom();
 
-        let runtime = WorkflowRuntime::new(self.tools.workspace().to_path_buf())
-            .with_memory_context(self.session_state_context_text());
-        self.denied_this_turn.clear();
-        self.denied_edits_this_turn.clear();
-        let backend = self.model.clone();
-        // Per-run checkpoint recorder + cancel token so subagent file edits are
-        // captured (rewindable) and the run's tools are cancellable — parity
-        // with the model-turn path.
-        let recorder = self.new_workflow_checkpoint(&command, user_index);
-        let cancel = CancelToken::new();
-        let tools = self
-            .tools
-            .clone()
-            .with_approval_handler(self.approval_handler.clone())
-            .with_checkpoint_recorder(recorder.clone())
-            .with_cancel_token(cancel.clone());
-        #[cfg(test)]
-        {
-            self.last_workflow_runtime = Some(tools.clone());
-        }
-        let task = task.trim().to_string();
-        let (sender, receiver) = mpsc::channel();
-        self.workflow_events.push(BackgroundWorkflow {
-            events: receiver,
-            checkpoint: recorder,
-            cancel,
-        });
-        if !self.is_working() {
-            self.status_line = "background workflow starting".to_string();
-        }
-        self.toast("Background workflow started", ToastKind::Info);
-
-        thread::spawn(move || {
-            let result = runtime.run_task(task, backend, tools, |event| {
-                sender.send(event).map_err(|error| {
-                    color_eyre::eyre::eyre!("failed to send workflow event: {error}")
-                })?;
-                Ok(())
-            });
-
-            if let Err(error) = result {
-                let _ = sender.send(WorkflowEvent::RunFinished {
-                    run_id: "workflow-error".to_string(),
-                    status: WorkflowStatus::Failed,
-                    summary: format!("workflow failed: {error}"),
-                });
-            }
-        });
+        self.status_line = "authoring dynamic workflow".to_string();
+        self.start_model_turn(&command);
     }
 
     fn start_workflow_script(&mut self, name: &str, raw_args: &str) {
@@ -6724,9 +6703,8 @@ impl App {
                 run_id,
                 title,
                 task,
-                phases,
             } => {
-                let view = workflow_view_from_plan(run_id, title, task, phases);
+                let view = workflow_view_started(run_id, title, task);
                 self.set_workflow_status_line(format!("workflow: {}", truncate(&view.title, 48)));
                 self.workflows.push(view.clone());
                 self.transcript.push(TranscriptItem::Workflow(view));
@@ -6910,7 +6888,7 @@ impl App {
 
         if let Some(workflow_task) = task.strip_prefix("/workflow ") {
             self.status_line = "starting queued workflow".to_string();
-            self.start_workflow(workflow_task);
+            self.start_workflow_request(workflow_task);
             return;
         }
 
@@ -9983,7 +9961,7 @@ const SLASH_COMMANDS: &[SlashCommand] = &[
         name: "/workflow",
         args: "<script|task> [args]",
         category: "agent",
-        description: "Run a saved JS workflow script or the built-in subagent pipeline",
+        description: "Run a saved or model-authored JavaScript workflow",
     },
     SlashCommand {
         name: "/sessions",
@@ -10353,7 +10331,7 @@ fn append_quick_memory(workspace: &Path, note: &str) -> Result<()> {
         String::new()
     };
     let updated = quick_memory_content(&existing, note);
-    fs::write(&path, updated).wrap_err_with(|| format!("failed to write {}", path.display()))
+    atomic_write(&path, updated).wrap_err_with(|| format!("failed to write {}", path.display()))
 }
 
 /// Collapse a quick-memory note to a single safe line so it can never forge a
@@ -10792,37 +10770,13 @@ fn decision_answer_text(decision: &DecisionView) -> String {
     lines.join("\n")
 }
 
-fn workflow_view_from_plan(
-    id: String,
-    title: String,
-    task: String,
-    phases: Vec<WorkflowPhasePlan>,
-) -> WorkflowRunView {
+fn workflow_view_started(id: String, title: String, task: String) -> WorkflowRunView {
     WorkflowRunView {
         id,
         title,
         task,
         status: WorkflowViewState::Running,
-        phases: phases
-            .into_iter()
-            .map(|phase| WorkflowPhaseView {
-                name: phase.name,
-                objective: phase.objective,
-                status: WorkflowViewState::Pending,
-                agents: phase
-                    .agents
-                    .into_iter()
-                    .map(|agent| WorkflowAgentView {
-                        name: agent.name,
-                        role: agent.role,
-                        tool_policy: agent.tool_policy,
-                        status: WorkflowViewState::Pending,
-                        output: String::new(),
-                        tool_counts: BTreeMap::new(),
-                    })
-                    .collect(),
-            })
-            .collect(),
+        phases: Vec::new(),
         summary: String::new(),
         expanded: false,
     }
@@ -14359,7 +14313,7 @@ fn placeholder_style() -> Style {
 mod tests {
     use super::*;
     use medusa_core::session::{compact_session_id, normalize_session_name, read_session_file};
-    use medusa_core::workflow::{SubagentSpec, SubagentToolPolicy};
+    use medusa_core::workflow::SubagentToolPolicy;
 
     fn app() -> App {
         App::with_model_backend(false)
@@ -14373,6 +14327,12 @@ mod tests {
             checkpoint: app.new_workflow_checkpoint("/workflow test", 0),
             cancel: CancelToken::new(),
         }
+    }
+
+    fn write_saved_workflow(app: &App, name: &str, source: &str) {
+        let directory = app.tools.workspace().join(".medusa/workflows");
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(directory.join(format!("{name}.js")), source).unwrap();
     }
 
     fn line_text(line: &Line<'_>) -> String {
@@ -14868,7 +14828,7 @@ mod tests {
         assert!(
             app.settings_rows()
                 .iter()
-                .any(|(key, value)| { *key == "permissions" && value == "open" })
+                .any(|(key, value)| { *key == "permissions" && value == "guarded" })
         );
     }
 
@@ -14979,6 +14939,14 @@ mod tests {
             load_app_settings(&workspace).unwrap().reasoning_effort(),
             None
         );
+    }
+
+    #[test]
+    fn fresh_workspaces_default_to_guarded_permissions() {
+        let workspace = temp_workspace();
+        let settings = load_app_settings(&workspace).unwrap();
+
+        assert_eq!(settings.permission_mode(), PermissionMode::Guarded);
     }
 
     #[test]
@@ -16268,25 +16236,35 @@ mod tests {
     }
 
     #[test]
+    fn workflow_help_describes_only_scripted_workflows() {
+        let mut app = app();
+
+        assert!(app.run_local_tool_command("/workflow"));
+
+        assert!(matches!(
+            app.transcript.last(),
+            Some(TranscriptItem::Message(ChatMessage {
+                role: ChatRole::System,
+                content,
+                ..
+            })) if content.contains("model author and run a task-specific JS workflow")
+        ));
+    }
+
+    #[test]
     fn workflow_events_create_and_finish_transcript_run() {
         let mut app = app();
-        let phases = vec![WorkflowPhasePlan {
-            name: "recon".to_string(),
-            objective: "Map code".to_string(),
-            agents: vec![SubagentSpec {
-                name: "mapper".to_string(),
-                role: "mapper".to_string(),
-                prompt: "inspect".to_string(),
-                allow_mutation: false,
-                tool_policy: SubagentToolPolicy::ReadOnly,
-            }],
-        }];
 
         app.apply_workflow_event(WorkflowEvent::RunStarted {
             run_id: "workflow-test".to_string(),
             title: "inspect code".to_string(),
             task: "inspect code".to_string(),
-            phases,
+        });
+        app.apply_workflow_event(WorkflowEvent::PhaseStarted {
+            run_id: "workflow-test".to_string(),
+            phase_index: 0,
+            name: "scan".to_string(),
+            agent_count: 1,
         });
         app.apply_workflow_event(WorkflowEvent::AgentStarted {
             run_id: "workflow-test".to_string(),
@@ -16334,7 +16312,6 @@ mod tests {
             run_id: "script-test".to_string(),
             title: "script:bug-hunt".to_string(),
             task: "bug-hunt".to_string(),
-            phases: Vec::new(),
         });
         app.apply_workflow_event(WorkflowEvent::PhaseStarted {
             run_id: "script-test".to_string(),
@@ -16379,36 +16356,25 @@ mod tests {
     #[test]
     fn partial_workflow_is_not_rendered_as_total_failure() {
         let mut app = app();
-        let phases = vec![
-            WorkflowPhasePlan {
-                name: "implementation".to_string(),
-                objective: "Make change".to_string(),
-                agents: vec![SubagentSpec {
-                    name: "implementer".to_string(),
-                    role: "implementation agent".to_string(),
-                    prompt: "edit".to_string(),
-                    allow_mutation: true,
-                    tool_policy: SubagentToolPolicy::Edit,
-                }],
-            },
-            WorkflowPhasePlan {
-                name: "verification".to_string(),
-                objective: "Verify".to_string(),
-                agents: vec![SubagentSpec {
-                    name: "verifier".to_string(),
-                    role: "verification agent".to_string(),
-                    prompt: "verify".to_string(),
-                    allow_mutation: false,
-                    tool_policy: SubagentToolPolicy::Verify,
-                }],
-            },
-        ];
 
         app.apply_workflow_event(WorkflowEvent::RunStarted {
             run_id: "workflow-partial".to_string(),
             title: "split tui crate".to_string(),
             task: "split tui crate".to_string(),
-            phases,
+        });
+        app.apply_workflow_event(WorkflowEvent::PhaseStarted {
+            run_id: "workflow-partial".to_string(),
+            phase_index: 0,
+            name: "implementation".to_string(),
+            agent_count: 1,
+        });
+        app.apply_workflow_event(WorkflowEvent::AgentStarted {
+            run_id: "workflow-partial".to_string(),
+            phase_index: 0,
+            agent_index: 0,
+            name: "implementer".to_string(),
+            role: "implementation agent".to_string(),
+            tool_policy: SubagentToolPolicy::Edit,
         });
         app.apply_workflow_event(WorkflowEvent::AgentFinished {
             run_id: "workflow-partial".to_string(),
@@ -16418,6 +16384,20 @@ mod tests {
             status: WorkflowStatus::Succeeded,
             output: "moved terminal helpers".to_string(),
             tool_counts: BTreeMap::new(),
+        });
+        app.apply_workflow_event(WorkflowEvent::PhaseStarted {
+            run_id: "workflow-partial".to_string(),
+            phase_index: 1,
+            name: "verification".to_string(),
+            agent_count: 1,
+        });
+        app.apply_workflow_event(WorkflowEvent::AgentStarted {
+            run_id: "workflow-partial".to_string(),
+            phase_index: 1,
+            agent_index: 0,
+            name: "verifier".to_string(),
+            role: "verification agent".to_string(),
+            tool_policy: SubagentToolPolicy::Verify,
         });
         app.apply_workflow_event(WorkflowEvent::AgentFinished {
             run_id: "workflow-partial".to_string(),
@@ -16517,10 +16497,11 @@ mod tests {
     /// Finding [12]: background workflow tools must carry a checkpoint recorder
     /// (and a cancel token) so subagent file edits are rewindable.
     #[test]
-    fn start_workflow_wires_recorder_and_cancel_onto_worker_runtime() {
+    fn saved_workflow_wires_recorder_and_cancel_onto_worker_runtime() {
         let mut app = App::with_model_backend(true);
+        write_saved_workflow(&app, "checkpoint-test", "return 'done';");
 
-        app.start_workflow("refactor auth");
+        app.start_workflow_script("checkpoint-test", "");
 
         let runtime = app
             .last_workflow_runtime
@@ -16547,8 +16528,9 @@ mod tests {
         let mut app = App::with_model_backend(true);
         let workspace = app.tools.workspace().to_path_buf();
         fs::write(workspace.join("auth.rs"), "old\n").unwrap();
+        write_saved_workflow(&app, "checkpoint-test", "return 'done';");
 
-        app.start_workflow("refactor auth");
+        app.start_workflow_script("checkpoint-test", "");
         // A subagent edits a file through the run's shared recorder (the
         // worker's ToolRuntime holds a clone of this exact recorder).
         let recorder = app.workflow_events.last().unwrap().checkpoint.clone();
@@ -16560,7 +16542,7 @@ mod tests {
             .unwrap();
         let entry = entries
             .iter()
-            .find(|entry| entry.prompt_excerpt == "/workflow refactor auth")
+            .find(|entry| entry.prompt_excerpt == "/workflow checkpoint-test")
             .expect("workflow run must produce a rewindable checkpoint");
 
         // And it actually restores the pre-edit content.
@@ -16576,11 +16558,6 @@ mod tests {
     #[test]
     fn drain_workflow_events_keeps_other_background_jobs_active() {
         let mut app = app();
-        let phases = vec![WorkflowPhasePlan {
-            name: "recon".to_string(),
-            objective: "Map code".to_string(),
-            agents: Vec::new(),
-        }];
         let (finished_sender, finished_receiver) = mpsc::channel();
         let (_active_sender, active_receiver) = mpsc::channel();
         finished_sender
@@ -16588,7 +16565,6 @@ mod tests {
                 run_id: "workflow-test".to_string(),
                 title: "inspect code".to_string(),
                 task: "inspect code".to_string(),
-                phases,
             })
             .unwrap();
         finished_sender
@@ -16791,6 +16767,27 @@ mod tests {
             StartupCommand::Tui(SessionOpenMode::ContinueNamed(
                 "session-123.json".to_string()
             ))
+        );
+    }
+
+    #[test]
+    fn startup_parser_returns_help_and_version_without_exiting() {
+        assert_eq!(
+            parse_startup_command(&["--help".to_string()]).unwrap(),
+            StartupCommand::Print(HELP_TEXT)
+        );
+        assert_eq!(
+            parse_startup_command(&["--version".to_string()]).unwrap(),
+            StartupCommand::Print(VERSION_TEXT)
+        );
+        assert!(VERSION_TEXT.starts_with("medusa "));
+    }
+
+    #[test]
+    fn startup_parser_returns_headless_help_without_exiting() {
+        assert_eq!(
+            parse_startup_command(&["run".to_string(), "--help".to_string()]).unwrap(),
+            StartupCommand::Print(RUN_HELP_TEXT)
         );
     }
 
@@ -17247,7 +17244,6 @@ mod tests {
             run_id: "run-1".to_string(),
             title: "Build".to_string(),
             task: "task".to_string(),
-            phases: Vec::new(),
         });
 
         assert_eq!(app.chat_scroll, 12);

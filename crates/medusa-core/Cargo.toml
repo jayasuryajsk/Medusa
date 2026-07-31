@@ -2,8 +2,14 @@
 name = "medusa-core"
 version = "0.2.0"
 edition = "2024"
+rust-version = "1.90"
 description = "Medusa coding harness engine"
 license = "MIT"
+repository = "https://github.com/jayasuryajsk/Medusa"
+homepage = "https://github.com/jayasuryajsk/Medusa"
+readme = "../../README.md"
+keywords = ["agent", "coding-agent", "terminal", "automation"]
+categories = ["command-line-utilities", "development-tools"]
 
 [dependencies]
 base64 = "0.22.1"

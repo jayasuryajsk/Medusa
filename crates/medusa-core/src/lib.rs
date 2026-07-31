@@ -9,6 +9,7 @@ pub mod mcp;
 pub mod model;
 pub mod models;
 pub mod permissions;
+pub mod persistence;
 mod proc;
 pub mod project;
 pub mod sandbox;

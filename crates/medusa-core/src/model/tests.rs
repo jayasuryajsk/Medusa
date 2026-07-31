@@ -1713,9 +1713,14 @@ fn mcp_call(name: &str, arguments: &str, call_id: &str) -> types::ToolCall {
 #[test]
 fn execute_tool_call_dispatches_mcp_tools_through_the_registry() {
     let workspace = crate::mcp::tests::write_fake_server_workspace("fake", &[], false);
+    crate::permissions::PermissionPolicy::write_mode(
+        &workspace,
+        crate::permissions::PermissionMode::Open,
+    )
+    .unwrap();
     let registry = crate::mcp::McpRegistry::load(&workspace).unwrap();
     let tools = ToolRuntime::new(&workspace).unwrap().with_mcp(registry);
-    // Open mode (default) trusts the config: this approves the server launch
+    // Explicit open mode trusts the config: this approves the server launch
     // and discovers its tools so the namespaced dispatch resolves.
     tools.mcp_tool_schemas(true);
     let state = types::ToolLoopState::default();
@@ -1763,6 +1768,11 @@ fn execute_tool_call_dispatches_mcp_tools_through_the_registry() {
 #[test]
 fn read_only_turns_omit_mcp_schemas_and_read_only_servers_survive() {
     let workspace = crate::mcp::tests::write_fake_server_workspace("fake", &[], false);
+    crate::permissions::PermissionPolicy::write_mode(
+        &workspace,
+        crate::permissions::PermissionMode::Open,
+    )
+    .unwrap();
     let registry = crate::mcp::McpRegistry::load(&workspace).unwrap();
     let tools = ToolRuntime::new(&workspace).unwrap().with_mcp(registry);
 
@@ -1847,5 +1857,10 @@ fn temp_workspace() -> std::path::PathBuf {
     let pid = std::process::id();
     let path = std::env::temp_dir().join(format!("medusa-model-test-{pid}-{suffix}-{index}"));
     fs::create_dir_all(&path).unwrap();
+    crate::permissions::PermissionPolicy::write_mode(
+        &path,
+        crate::permissions::PermissionMode::Open,
+    )
+    .unwrap();
     path.canonicalize().unwrap()
 }

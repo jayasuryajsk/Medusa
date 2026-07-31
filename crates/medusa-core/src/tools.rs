@@ -21,6 +21,7 @@ use crate::checkpoint::CheckpointRecorder;
 use crate::hooks::HookRuntime;
 use crate::mcp::{McpRegistry, McpToolOutcome};
 use crate::permissions::{PermissionCheck, PermissionMode, PermissionPolicy};
+use crate::persistence::atomic_write;
 use crate::sandbox::{SandboxAvailability, SandboxPolicy};
 use crate::skills::SkillRegistry;
 
@@ -507,12 +508,9 @@ impl ToolRuntime {
         let strict = preapproved;
 
         if request.background {
-            let (mut command, sandboxed) =
-                self.build_shell_command(&request.command, &cwd, strict, request.unsandboxed);
-            let mut child = command
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
+            let (command, sandboxed) =
+                self.build_shell_command(&request.command, &cwd, strict, request.unsandboxed)?;
+            let child = crate::proc::spawn_command(command)
                 .wrap_err_with(|| format!("failed to start command: {}", request.command))?;
 
             let pid = child.id();
@@ -529,15 +527,15 @@ impl ToolRuntime {
                 let finish_id = id.clone();
                 let fail_id = id.clone();
                 thread::spawn(move || {
-                    let event = match child.wait_with_output() {
+                    let event = match crate::proc::wait_for_child(child) {
                         Ok(output) => BackgroundJobEvent::Finished {
                             id: finish_id,
                             pid,
                             command,
                             cwd: event_cwd,
-                            code: output.status.code(),
-                            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-                            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+                            code: output.code,
+                            stdout: output.stdout,
+                            stderr: output.stderr,
                         },
                         Err(error) => BackgroundJobEvent::Failed {
                             id: fail_id,
@@ -551,7 +549,7 @@ impl ToolRuntime {
                 });
             } else {
                 thread::spawn(move || {
-                    let _ = child.wait();
+                    let _ = crate::proc::wait_for_child(child);
                 });
             }
 
@@ -573,7 +571,7 @@ impl ToolRuntime {
         self.cancel.bail_if_cancelled()?;
 
         let (command, sandboxed) =
-            self.build_shell_command(&request.command, &cwd, strict, request.unsandboxed);
+            self.build_shell_command(&request.command, &cwd, strict, request.unsandboxed)?;
         let outcome = crate::proc::run_command(command, None, &self.cancel)
             .wrap_err_with(|| format!("failed to run command: {}", request.command))?;
         if outcome.cancelled {
@@ -594,31 +592,42 @@ impl ToolRuntime {
     }
 
     /// Build `$SHELL -lc <command>` for both terminal_exec paths, wrapped in
-    /// macOS Seatbelt when the policy (or a strict explore probe) asks for it
-    /// and the sandbox is available. Returns whether the command is sandboxed;
-    /// non-macOS platforms and approved escalations get the plain command.
+    /// the platform sandbox when the policy (or a strict explore probe) asks
+    /// for it. Sandbox-required commands fail closed when the backend is
+    /// unavailable; only an explicit, approved escalation gets a plain shell.
     fn build_shell_command(
         &self,
         command_text: &str,
         cwd: &Path,
         strict: bool,
         unsandboxed: bool,
-    ) -> (Command, bool) {
+    ) -> Result<(Command, bool)> {
         let shell = std::env::var_os("SHELL").unwrap_or_else(|| OsStr::new("sh").to_os_string());
-        if !unsandboxed
-            && (self.sandbox.should_sandbox() || strict)
-            && *crate::sandbox::sandbox_availability() == SandboxAvailability::Available
-        {
-            let spec = self.sandbox.spec(&self.workspace, strict);
-            return (
-                crate::sandbox::wrap_command(&spec, &shell, command_text, cwd),
-                true,
-            );
+        if !unsandboxed && (self.sandbox.should_sandbox() || strict) {
+            match crate::sandbox::sandbox_availability() {
+                SandboxAvailability::Available => {
+                    let spec = self.sandbox.spec(&self.workspace, strict);
+                    return Ok((
+                        crate::sandbox::wrap_command(&spec, &shell, command_text, cwd),
+                        true,
+                    ));
+                }
+                SandboxAvailability::Broken(reason) => {
+                    bail!(
+                        "sandbox-required command blocked: {reason}. Install/fix the platform sandbox, switch to open permissions, or request an explicit unsandboxed run for user approval"
+                    );
+                }
+                SandboxAvailability::UnsupportedPlatform => {
+                    bail!(
+                        "sandbox-required command blocked: this platform has no supported Medusa sandbox. Switch to open permissions or request an explicit unsandboxed run for user approval"
+                    );
+                }
+            }
         }
 
         let mut command = Command::new(shell);
         command.arg("-lc").arg(command_text).current_dir(cwd);
-        (command, false)
+        Ok((command, false))
     }
 
     pub fn file_read(&self, request: FileReadRequest) -> Result<FileReadResult> {
@@ -880,7 +889,7 @@ impl ToolRuntime {
             // .medusa) a file reached through an out-of-workspace symlink,
             // poisoning the manifest with a host path. Records `absent`.
             self.capture_checkpoint(std::slice::from_ref(&path))?;
-            fs::write(&candidate, request.new_string)
+            atomic_write(&candidate, request.new_string)
                 .wrap_err_with(|| format!("failed to write {}", candidate.display()))?;
             return Ok(FileEditResult {
                 path,
@@ -932,7 +941,7 @@ impl ToolRuntime {
         } else {
             content.replacen(&request.old_string, &request.new_string, 1)
         };
-        fs::write(&resolved, new_content)
+        atomic_write(&resolved, new_content)
             .wrap_err_with(|| format!("failed to write {}", resolved.display()))?;
 
         Ok(FileEditResult {
@@ -2352,6 +2361,121 @@ struct PatchHunk {
 
 fn apply_codex_patch(workspace: &Path, diff: &str) -> Result<Vec<String>> {
     let ops = parse_codex_patch(diff)?;
+    let snapshots = snapshot_codex_patch_paths(workspace, &ops)?;
+    match apply_codex_patch_ops(workspace, ops) {
+        Ok(changed) => Ok(changed),
+        Err(apply_error) => match restore_codex_patch_paths(&snapshots) {
+            Ok(()) => Err(apply_error.wrap_err("Codex patch rolled back without changes")),
+            Err(rollback_error) => Err(apply_error.wrap_err(format!(
+                "Codex patch failed and rollback was incomplete: {rollback_error:#}"
+            ))),
+        },
+    }
+}
+
+#[derive(Debug)]
+struct PatchPathSnapshot {
+    path: PathBuf,
+    content: Option<Vec<u8>>,
+    permissions: Option<fs::Permissions>,
+}
+
+fn snapshot_codex_patch_paths(workspace: &Path, ops: &[PatchOp]) -> Result<Vec<PatchPathSnapshot>> {
+    let mut paths = BTreeSet::new();
+    for op in ops {
+        match op {
+            PatchOp::Add { path, .. } | PatchOp::Delete { path } => {
+                validate_relative_path(path)?;
+                paths.insert(path.as_str());
+            }
+            PatchOp::Update { path, move_to, .. } => {
+                validate_relative_path(path)?;
+                paths.insert(path.as_str());
+                if let Some(move_to) = move_to {
+                    validate_relative_path(move_to)?;
+                    paths.insert(move_to.as_str());
+                }
+            }
+        }
+    }
+
+    paths
+        .into_iter()
+        .map(|relative| {
+            let path = workspace.join(relative);
+            match fs::symlink_metadata(&path) {
+                Ok(metadata) if metadata.file_type().is_symlink() => {
+                    bail!("patch path is a symlink; refusing to follow it: {relative}")
+                }
+                Ok(metadata) if !metadata.is_file() => {
+                    bail!("patch target is not a regular file: {relative}")
+                }
+                Ok(metadata) => Ok(PatchPathSnapshot {
+                    content: Some(
+                        fs::read(&path)
+                            .wrap_err_with(|| format!("failed to snapshot {}", path.display()))?,
+                    ),
+                    permissions: Some(metadata.permissions()),
+                    path,
+                }),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    Ok(PatchPathSnapshot {
+                        path,
+                        content: None,
+                        permissions: None,
+                    })
+                }
+                Err(error) => Err(error)
+                    .wrap_err_with(|| format!("failed to inspect patch path {}", path.display())),
+            }
+        })
+        .collect()
+}
+
+fn restore_codex_patch_paths(snapshots: &[PatchPathSnapshot]) -> Result<()> {
+    let mut failures = Vec::new();
+    for snapshot in snapshots.iter().rev() {
+        let result = match &snapshot.content {
+            Some(content) => atomic_write(&snapshot.path, content).and_then(|()| {
+                if let Some(permissions) = &snapshot.permissions {
+                    fs::set_permissions(&snapshot.path, permissions.clone()).wrap_err_with(
+                        || {
+                            format!(
+                                "failed to restore permissions for {}",
+                                snapshot.path.display()
+                            )
+                        },
+                    )?;
+                }
+                Ok(())
+            }),
+            None => match fs::symlink_metadata(&snapshot.path) {
+                Ok(metadata) if metadata.is_file() || metadata.file_type().is_symlink() => {
+                    fs::remove_file(&snapshot.path)
+                        .wrap_err_with(|| format!("failed to remove {}", snapshot.path.display()))
+                }
+                Ok(_) => Err(color_eyre::eyre::eyre!(
+                    "rollback target became a directory: {}",
+                    snapshot.path.display()
+                )),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(error) => Err(error)
+                    .wrap_err_with(|| format!("failed to inspect {}", snapshot.path.display())),
+            },
+        };
+        if let Err(error) = result {
+            failures.push(error.to_string());
+        }
+    }
+
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        bail!("{}", failures.join("; "))
+    }
+}
+
+fn apply_codex_patch_ops(workspace: &Path, ops: Vec<PatchOp>) -> Result<Vec<String>> {
     let mut changed = BTreeSet::new();
 
     for op in ops {
@@ -2366,7 +2490,7 @@ fn apply_codex_patch(workspace: &Path, diff: &str) -> Result<Vec<String>> {
                     fs::create_dir_all(parent)
                         .wrap_err_with(|| format!("failed to create {}", parent.display()))?;
                 }
-                fs::write(&resolved, content)
+                atomic_write(&resolved, content)
                     .wrap_err_with(|| format!("failed to write {}", resolved.display()))?;
                 changed.insert(path);
             }
@@ -2410,16 +2534,21 @@ fn apply_codex_patch(workspace: &Path, diff: &str) -> Result<Vec<String>> {
                 let final_path = move_to.unwrap_or_else(|| path.clone());
                 let final_resolved = workspace.join(&final_path);
                 if final_path != path {
+                    if final_resolved.exists() {
+                        bail!("Move target already exists: {final_path}");
+                    }
                     if let Some(parent) = final_resolved.parent() {
                         fs::create_dir_all(parent)
                             .wrap_err_with(|| format!("failed to create {}", parent.display()))?;
                     }
+                }
+                atomic_write(&final_resolved, content)
+                    .wrap_err_with(|| format!("failed to write {}", final_resolved.display()))?;
+                if final_path != path {
                     fs::remove_file(&resolved).wrap_err_with(|| {
                         format!("failed to remove moved source {}", resolved.display())
                     })?;
                 }
-                fs::write(&final_resolved, content)
-                    .wrap_err_with(|| format!("failed to write {}", final_resolved.display()))?;
                 changed.insert(path);
                 changed.insert(final_path);
             }
@@ -2807,7 +2936,7 @@ mod tests {
 
     #[test]
     fn terminal_exec_runs_command() {
-        let runtime = ToolRuntime::new(std::env::current_dir().unwrap()).unwrap();
+        let runtime = ToolRuntime::new(temp_workspace()).unwrap();
 
         let result = runtime
             .terminal_exec(TerminalExecRequest::new("printf medusa"))
@@ -2819,11 +2948,7 @@ mod tests {
 
     fn ask_workspace() -> PathBuf {
         let workspace = temp_workspace();
-        crate::permissions::PermissionPolicy::write_mode(
-            &workspace,
-            crate::permissions::PermissionMode::Ask,
-        )
-        .unwrap();
+        write_permissions(&workspace, r#"{"mode":"ask","sandbox":{"enabled":false}}"#);
         workspace
     }
 
@@ -3137,8 +3262,9 @@ mod tests {
             .with_sandbox(SandboxPolicy::new(false, true, Vec::new()));
 
         // Strict (explore-probe) commands still sandbox, with network denied.
-        let (command, sandboxed) =
-            runtime.build_shell_command("cat README.md", runtime.workspace(), true, false);
+        let (command, sandboxed) = runtime
+            .build_shell_command("cat README.md", runtime.workspace(), true, false)
+            .unwrap();
         assert!(sandboxed);
         assert_eq!(command.get_program(), OsStr::new("/usr/bin/sandbox-exec"));
         assert!(command.get_envs().any(|(key, value)| {
@@ -3146,8 +3272,9 @@ mod tests {
         }));
 
         // Ordinary commands under a disabled policy stay plain.
-        let (_, sandboxed) =
-            runtime.build_shell_command("echo hi", runtime.workspace(), false, false);
+        let (_, sandboxed) = runtime
+            .build_shell_command("echo hi", runtime.workspace(), false, false)
+            .unwrap();
         assert!(!sandboxed);
     }
 
@@ -3181,7 +3308,19 @@ mod tests {
             })
             .unwrap();
 
-        assert_eq!(result.failed, 0);
+        match crate::sandbox::sandbox_availability() {
+            SandboxAvailability::Available => assert_eq!(result.failed, 0),
+            SandboxAvailability::Broken(_) | SandboxAvailability::UnsupportedPlatform => {
+                assert_eq!(result.failed, 1);
+                assert!(
+                    result.probes[0]
+                        .output
+                        .contains("sandbox-required command blocked"),
+                    "{}",
+                    result.probes[0].output
+                );
+            }
+        }
     }
 
     #[test]
@@ -3586,6 +3725,38 @@ diff --git a/hello.txt b/hello.txt
         assert_eq!(
             fs::read_to_string(workspace.join("moved.txt")).unwrap(),
             "move\n"
+        );
+    }
+
+    #[test]
+    fn codex_patch_rolls_back_earlier_files_when_a_later_hunk_fails() {
+        let workspace = temp_workspace();
+        fs::write(workspace.join("first.txt"), "old first\n").unwrap();
+        fs::write(workspace.join("second.txt"), "old second\n").unwrap();
+        let runtime = ToolRuntime::new(&workspace).unwrap();
+
+        let diff = r#"*** Begin Patch
+*** Update File: first.txt
+@@
+-old first
++new first
+*** Update File: second.txt
+@@
+-content that is not present
++new second
+*** End Patch
+"#;
+
+        let error = runtime.file_patch(FilePatchRequest::new(diff)).unwrap_err();
+
+        assert!(error.to_string().contains("rolled back"), "{error:#}");
+        assert_eq!(
+            fs::read_to_string(workspace.join("first.txt")).unwrap(),
+            "old first\n"
+        );
+        assert_eq!(
+            fs::read_to_string(workspace.join("second.txt")).unwrap(),
+            "old second\n"
         );
     }
 
@@ -4396,6 +4567,11 @@ diff --git a/hello.txt b/hello.txt
         let pid = std::process::id();
         let path = std::env::temp_dir().join(format!("medusa-tools-test-{pid}-{suffix}-{index}"));
         fs::create_dir_all(&path).unwrap();
+        crate::permissions::PermissionPolicy::write_mode(
+            &path,
+            crate::permissions::PermissionMode::Open,
+        )
+        .unwrap();
         path
     }
 }

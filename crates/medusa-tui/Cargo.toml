@@ -2,8 +2,14 @@
 name = "medusa-tui"
 version = "0.2.0"
 edition = "2024"
+rust-version = "1.90"
 description = "Medusa terminal UI coding harness"
 license = "MIT"
+repository = "https://github.com/jayasuryajsk/Medusa"
+homepage = "https://github.com/jayasuryajsk/Medusa"
+readme = "../../README.md"
+keywords = ["agent", "coding-agent", "terminal", "tui"]
+categories = ["command-line-utilities", "development-tools"]
 
 [[bin]]
 name = "medusa"
@@ -14,7 +20,7 @@ color-eyre = "0.6.5"
 arboard = "3.6.1"
 crossterm = "0.29.0"
 image = { version = "0.25.8", default-features = false, features = ["png", "jpeg"] }
-medusa-core = { path = "../medusa-core" }
+medusa-core = { version = "0.2.0", path = "../medusa-core" }
 ratatui = "0.30.2"
 ratatui-image = { version = "11.0.5", default-features = false, features = ["crossterm"] }
 serde = { version = "1.0.228", features = ["derive"] }
