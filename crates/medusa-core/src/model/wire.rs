@@ -44,9 +44,18 @@ pub(crate) fn conversation_message_json(message: &ConversationMessage) -> Value 
     json!({ "role": message.role, "content": content })
 }
 
+#[cfg(test)]
 pub(crate) fn chat_completion_messages_from_input(
     input: Vec<Value>,
     instructions: &str,
+) -> Vec<Value> {
+    chat_completion_messages_from_input_with_images(input, instructions, false)
+}
+
+pub(crate) fn chat_completion_messages_from_input_with_images(
+    input: Vec<Value>,
+    instructions: &str,
+    images_supported: bool,
 ) -> Vec<Value> {
     let mut messages = vec![json!({
         "role": "system",
@@ -55,8 +64,11 @@ pub(crate) fn chat_completion_messages_from_input(
 
     for item in input {
         if let Some(role) = item.get("role").and_then(Value::as_str) {
-            let content = chat_completion_content_text(item.get("content").unwrap_or(&Value::Null));
-            if !content.trim().is_empty() {
+            let content = chat_completion_content(
+                item.get("content").unwrap_or(&Value::Null),
+                images_supported,
+            );
+            if !chat_completion_content_is_empty(&content) {
                 messages.push(json!({
                     "role": role,
                     "content": content,
@@ -77,25 +89,34 @@ pub(crate) fn chat_completion_messages_from_input(
                     .get("arguments")
                     .and_then(Value::as_str)
                     .unwrap_or("{}");
-                let mut message = json!({
-                    "role": "assistant",
-                    "content": Value::Null,
-                    "tool_calls": [{
-                        "id": call_id,
-                        "type": "function",
-                        "function": {
-                            "name": name,
-                            "arguments": arguments,
-                        }
-                    }],
+                let tool_call = json!({
+                    "id": call_id,
+                    "type": "function",
+                    "function": {
+                        "name": name,
+                        "arguments": arguments,
+                    }
                 });
-                if let Some(reasoning_content) =
-                    item.get("reasoning_content").and_then(Value::as_str)
-                    && !reasoning_content.trim().is_empty()
-                {
-                    message["reasoning_content"] = json!(reasoning_content);
+                let extends_parallel_batch = messages.last().is_some_and(|message| {
+                    message.get("role").and_then(Value::as_str) == Some("assistant")
+                        && message.get("tool_calls").is_some_and(Value::is_array)
+                });
+                if extends_parallel_batch {
+                    let message = messages.last_mut().expect("parallel batch message");
+                    message["tool_calls"]
+                        .as_array_mut()
+                        .expect("tool_calls array")
+                        .push(tool_call);
+                    apply_chat_tool_reasoning(message, &item);
+                } else {
+                    let mut message = json!({
+                        "role": "assistant",
+                        "content": Value::Null,
+                        "tool_calls": [tool_call],
+                    });
+                    apply_chat_tool_reasoning(&mut message, &item);
+                    messages.push(message);
                 }
-                messages.push(message);
             }
             Some("function_call_output") => {
                 let Some(call_id) = item.get("call_id").and_then(Value::as_str) else {
@@ -113,6 +134,64 @@ pub(crate) fn chat_completion_messages_from_input(
     }
 
     messages
+}
+
+fn apply_chat_tool_reasoning(message: &mut Value, item: &Value) {
+    if let Some(reasoning_content) = item.get("reasoning_content").and_then(Value::as_str)
+        && !reasoning_content.trim().is_empty()
+    {
+        message["reasoning_content"] = json!(reasoning_content);
+    }
+    if let Some(reasoning_details) = item.get("reasoning_details").and_then(Value::as_array)
+        && !reasoning_details.is_empty()
+    {
+        // OpenRouter requires these blocks to round-trip byte-for-byte in
+        // logical content and order across tool rounds.
+        message["reasoning_details"] = json!(reasoning_details);
+    }
+}
+
+fn chat_completion_content(content: &Value, images_supported: bool) -> Value {
+    let has_image = content.as_array().is_some_and(|parts| {
+        parts.iter().any(|part| {
+            part.get("type")
+                .and_then(Value::as_str)
+                .is_some_and(|kind| kind.contains("image"))
+        })
+    });
+    if !has_image || !images_supported {
+        return Value::String(chat_completion_content_text(content));
+    }
+
+    let parts = content
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|part| {
+            if let Some(text) = part
+                .get("text")
+                .or_else(|| part.get("content"))
+                .and_then(Value::as_str)
+            {
+                return Some(json!({ "type": "text", "text": text }));
+            }
+            let image_url = part.get("image_url").and_then(Value::as_str)?;
+            Some(json!({
+                "type": "image_url",
+                "image_url": { "url": image_url },
+            }))
+        })
+        .collect::<Vec<_>>();
+    Value::Array(parts)
+}
+
+fn chat_completion_content_is_empty(content: &Value) -> bool {
+    match content {
+        Value::String(text) => text.trim().is_empty(),
+        Value::Array(parts) => parts.is_empty(),
+        Value::Null => true,
+        _ => false,
+    }
 }
 
 pub(crate) fn chat_completion_content_text(content: &Value) -> String {
@@ -361,6 +440,7 @@ where
     Ok(TurnOutcome {
         event_count,
         tool_calls,
+        reasoning_details: None,
         usage,
     })
 }
@@ -411,6 +491,7 @@ where
 {
     let mut event_count = 0;
     let mut reasoning_content = String::new();
+    let mut reasoning_details = Vec::new();
     let mut tool_calls: BTreeMap<usize, PartialChatToolCall> = BTreeMap::new();
     let mut usage = None;
 
@@ -444,11 +525,30 @@ where
                 continue;
             };
 
-            if let Some(reasoning) = delta.get("reasoning_content").and_then(Value::as_str)
-                && !reasoning.is_empty()
-            {
+            let reasoning = delta
+                .get("reasoning_content")
+                .or_else(|| delta.get("reasoning"))
+                .and_then(Value::as_str)
+                .filter(|reasoning| !reasoning.is_empty());
+            if let Some(reasoning) = reasoning {
                 reasoning_content.push_str(reasoning);
                 on_event(ModelStreamEvent::ReasoningDelta(reasoning.to_string()))?;
+            }
+
+            if let Some(details) = delta.get("reasoning_details").and_then(Value::as_array) {
+                if reasoning.is_none() {
+                    for detail in details {
+                        if let Some(text) = detail
+                            .get("text")
+                            .or_else(|| detail.get("summary"))
+                            .and_then(Value::as_str)
+                            .filter(|text| !text.is_empty())
+                        {
+                            on_event(ModelStreamEvent::ReasoningDelta(text.to_string()))?;
+                        }
+                    }
+                }
+                reasoning_details.extend(details.iter().cloned());
             }
 
             if let Some(content) = delta.get("content").and_then(Value::as_str)
@@ -520,6 +620,7 @@ where
     Ok(TurnOutcome {
         event_count,
         tool_calls,
+        reasoning_details: (!reasoning_details.is_empty()).then_some(reasoning_details),
         usage,
     })
 }
@@ -527,7 +628,8 @@ where
 /// Parse a usage object from either wire dialect: Responses-style
 /// (input_tokens/output_tokens + input_tokens_details.cached_tokens) or
 /// chat-completions-style (prompt_tokens/completion_tokens +
-/// prompt_tokens_details.cached_tokens).
+/// prompt_tokens_details.cached_tokens), or DeepSeek's top-level
+/// prompt_cache_hit_tokens.
 pub(crate) fn parse_token_usage(value: &Value) -> Option<TokenUsage> {
     let input = value
         .get("input_tokens")
@@ -546,6 +648,7 @@ pub(crate) fn parse_token_usage(value: &Value) -> Option<TokenUsage> {
         .or_else(|| value.get("prompt_tokens_details"))
         .and_then(|details| details.get("cached_tokens"))
         .and_then(Value::as_u64)
+        .or_else(|| value.get("prompt_cache_hit_tokens").and_then(Value::as_u64))
         .unwrap_or(0);
 
     Some(TokenUsage {
@@ -615,7 +718,7 @@ pub(crate) fn parse_sse_response(stream: &str) -> Result<ModelChatResult> {
     }
 
     if text.trim().is_empty() {
-        bail!("Codex backend completed without output text");
+        bail!("model backend completed without output text");
     }
 
     Ok(ModelChatResult {

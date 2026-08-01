@@ -29,7 +29,7 @@ impl App {
         let cwd = env::current_dir().unwrap_or_else(|_| Path::new(".").to_path_buf());
         let session = SessionStore::open(&cwd, startup_session)?;
         let transcript = session.load_transcript_with_legacy(TranscriptItem::Message)?;
-        let mut app = Self::build(model_enabled, Some(session));
+        let mut app = Self::try_build_in(model_enabled, Some(session), None)?;
         if !transcript.is_empty() {
             app.transcript = transcript;
             app.touch_transcript();
@@ -40,15 +40,26 @@ impl App {
         Ok(app)
     }
 
+    #[cfg(test)]
     pub(crate) fn build(model_enabled: bool, session: Option<SessionStore>) -> Self {
         Self::build_in(model_enabled, session, None)
     }
 
+    #[cfg(test)]
     pub(crate) fn build_in(
         model_enabled: bool,
         session: Option<SessionStore>,
         workspace: Option<PathBuf>,
     ) -> Self {
+        Self::try_build_in(model_enabled, session, workspace)
+            .expect("test app model gateway should initialize")
+    }
+
+    fn try_build_in(
+        model_enabled: bool,
+        session: Option<SessionStore>,
+        workspace: Option<PathBuf>,
+    ) -> Result<Self> {
         let cwd = workspace
             .or_else(|| env::current_dir().ok())
             .unwrap_or_else(|| Path::new(".").to_path_buf());
@@ -65,12 +76,12 @@ impl App {
         // confined mode (Open mode trusts the workspace config). See
         // ToolRuntime::mcp_tool_schemas / authorize_mcp_launch.
         let app_settings = load_app_settings(tools.workspace()).unwrap_or_default();
-        let mut model =
-            DirectCodexBackend::new(tools.workspace().to_path_buf()).expect("HTTP client builds");
+        let mut model = ModelGateway::new(tools.workspace().to_path_buf())
+            .wrap_err("failed to initialize model providers")?;
         if env::var_os("MEDUSA_MODEL").is_none()
             && let Some(model_name) = app_settings.model()
         {
-            model.set_model_name(model_name);
+            let _ = model.try_set_model_name(model_name);
         }
         // Env override wins for one-off launches; else the saved preference.
         if env::var_os("MEDUSA_REASONING_EFFORT").is_none()
@@ -192,7 +203,7 @@ impl App {
         if let Some(error) = mcp_load_error {
             app.toast(format!("MCP config ignored: {error}"), ToastKind::Warning);
         }
-        app
+        Ok(app)
     }
 
     pub(crate) fn run(&mut self, terminal: &mut Tui) -> Result<()> {

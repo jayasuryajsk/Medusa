@@ -325,9 +325,8 @@ fn preview_delete_refuses_sent_image() {
 
 #[test]
 fn image_input_warning_only_shows_for_chat_backends() {
-    assert_eq!(image_input_warning("codex"), None);
-    assert!(image_input_warning("deepseek").is_some());
-    assert!(image_input_warning("openai-compatible").is_some());
+    assert_eq!(image_input_warning(true), None);
+    assert!(image_input_warning(false).is_some());
 }
 
 #[test]
@@ -421,7 +420,7 @@ fn settings_command_opens_settings_modal() {
     assert!(
         app.settings_rows()
             .iter()
-            .any(|(key, value)| { *key == "model" && value == "gpt-5.5" })
+            .any(|(key, value)| { *key == "model" && value == "codex/gpt-5.5" })
     );
     assert!(
         app.settings_rows()
@@ -448,10 +447,10 @@ fn model_command_switches_model_and_persists_setting() {
     app.input_cursor = app.input_len();
     app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
 
-    assert_eq!(app.model.model_name(), "gpt-test-model");
-    assert_eq!(app.status_line, "model: gpt-test-model");
+    assert_eq!(app.model.model_name(), "codex/gpt-test-model");
+    assert_eq!(app.status_line, "model: codex/gpt-test-model");
     let settings = load_app_settings(&workspace).unwrap();
-    assert_eq!(settings.model(), Some("gpt-test-model".to_string()));
+    assert_eq!(settings.model(), Some("codex/gpt-test-model".to_string()));
 }
 
 #[test]
@@ -478,7 +477,7 @@ fn model_picker_steps_into_reasoning_and_persists_both() {
     assert_eq!(app.model_picker_pane, ModelPickerPane::Models);
     assert_eq!(
         app.reasoning_selection,
-        reasoning_index("custom-test-model", "medium")
+        reasoning_index("codex/custom-test-model", "medium")
     );
 
     app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
@@ -489,14 +488,17 @@ fn model_picker_steps_into_reasoning_and_persists_both() {
     app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
 
     assert_eq!(app.active_modal, None);
-    assert_eq!(app.model.model_name(), "custom-test-model");
+    assert_eq!(app.model.model_name(), "codex/custom-test-model");
     assert_eq!(app.model.reasoning_effort(), "high");
     assert_eq!(
         app.status_line,
-        "model: custom-test-model · reasoning: high"
+        "model: codex/custom-test-model · reasoning: high"
     );
     let settings = load_app_settings(&workspace).unwrap();
-    assert_eq!(settings.model(), Some("custom-test-model".to_string()));
+    assert_eq!(
+        settings.model(),
+        Some("codex/custom-test-model".to_string())
+    );
     assert_eq!(settings.reasoning_effort(), Some("high".to_string()));
 }
 
@@ -651,7 +653,8 @@ fn conversation_history_includes_permission_context() {
     app.transcript
         .push(TranscriptItem::Message(ChatMessage::user("read codebase")));
 
-    let messages = app.conversation_history();
+    let mut messages = app.conversation_history();
+    insert_runtime_session_state(&mut messages, app.session_state_context_text());
 
     assert_eq!(
         messages.first().map(|message| message.role.as_str()),
@@ -688,14 +691,15 @@ fn conversation_history_includes_rolling_session_state() {
             ))));
     }
 
-    let messages = app.conversation_history();
-
-    assert_eq!(
-        messages.get(1).map(|message| message.role.as_str()),
-        Some("system")
-    );
-    assert!(messages[1].content.contains("Medusa rolling session state"));
-    assert!(messages[1].content.contains("old task 39"));
+    let mut messages = app.conversation_history();
+    insert_runtime_session_state(&mut messages, app.session_state_context_text());
+    let state_index = messages
+        .iter()
+        .position(|message| message.content.contains("Medusa rolling session state"))
+        .expect("rolling state message");
+    assert_eq!(messages[state_index].role, "system");
+    assert!(messages[state_index].content.contains("old task 39"));
+    assert_eq!(messages[state_index + 1].content, "old task 39");
     // Full history flows through; the ContextEngine compacts at turn
     // start only when the token budget requires it.
     assert!(
@@ -728,11 +732,16 @@ fn session_state_preserves_semantic_memory_outside_recent_window() {
             ))));
     }
 
-    let messages = app.conversation_history();
+    let mut messages = app.conversation_history();
+    insert_runtime_session_state(&mut messages, app.session_state_context_text());
+    let state = messages
+        .iter()
+        .find(|message| message.content.contains("Medusa rolling session state"))
+        .expect("rolling state message");
 
-    assert!(messages[1].content.contains("semantic memory"));
+    assert!(state.content.contains("semantic memory"));
     assert!(
-        messages[1]
+        state
             .content
             .contains("preference: I prefer concise answers")
     );
@@ -753,17 +762,18 @@ fn session_state_summarizes_tool_file_mentions() {
         group_expanded: false,
     }));
 
-    let messages = app.conversation_history();
+    let mut messages = app.conversation_history();
+    insert_runtime_session_state(&mut messages, app.session_state_context_text());
+    let state = messages
+        .iter()
+        .find(|message| message.content.contains("Medusa rolling session state"))
+        .expect("rolling state message");
 
-    assert!(messages[1].content.contains("tool history"));
-    assert!(messages[1].content.contains("file.patch succeeded"));
-    assert!(messages[1].content.contains("changed or referenced files"));
-    assert!(
-        messages[1]
-            .content
-            .contains("crates/medusa-tui/src/main.rs")
-    );
-    assert!(messages[1].content.contains("README.md"));
+    assert!(state.content.contains("tool history"));
+    assert!(state.content.contains("file.patch succeeded"));
+    assert!(state.content.contains("changed or referenced files"));
+    assert!(state.content.contains("crates/medusa-tui/src/main.rs"));
+    assert!(state.content.contains("README.md"));
 }
 
 #[test]

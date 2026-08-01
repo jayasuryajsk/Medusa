@@ -1,4 +1,5 @@
 pub mod exec;
+pub mod provider;
 pub mod schema;
 #[cfg(test)]
 pub mod tests;
@@ -13,12 +14,13 @@ use std::{
 use color_eyre::eyre::{Result, WrapErr, bail};
 use reqwest::{
     blocking::Client,
-    header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue, USER_AGENT},
+    header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue, USER_AGENT},
 };
 use serde_json::{Value, json};
 
 use crate::auth::load_codex_oauth_credentials;
 use crate::cancel::CancelToken;
+use crate::credentials::CredentialStore;
 use crate::harness::HarnessPolicy;
 use crate::tools::ToolRuntime;
 
@@ -79,7 +81,8 @@ fn with_ultra_orchestration_context(
 }
 
 pub use types::{
-    ConversationAttachment, ConversationMessage, DirectCodexBackend, ModelStreamEvent, TokenUsage,
+    ConversationAttachment, ConversationMessage, DirectCodexBackend, ModelGateway,
+    ModelStreamEvent, TokenUsage,
 };
 
 fn finish_tool_call<F>(
@@ -97,61 +100,142 @@ where
     })
 }
 
-impl DirectCodexBackend {
-    pub fn new(workspace: impl Into<PathBuf>) -> Result<Self> {
-        use types::ModelProvider;
+fn runtime_context_item(content: &str) -> Value {
+    json!({
+        "role": "system",
+        "content": content,
+    })
+}
 
+fn sort_tool_schemas(tools: &mut [Value]) {
+    tools.sort_by(|left, right| tool_schema_name(left).cmp(tool_schema_name(right)));
+}
+
+fn tool_schema_name(tool: &Value) -> &str {
+    tool.get("name")
+        .or_else(|| {
+            tool.get("function")
+                .and_then(|function| function.get("name"))
+        })
+        .and_then(Value::as_str)
+        .unwrap_or("")
+}
+
+impl ModelGateway {
+    pub fn new(workspace: impl Into<PathBuf>) -> Result<Self> {
+        let workspace = workspace.into();
         let client = Client::builder()
             .timeout(Duration::from_secs(120))
             .build()
             .wrap_err("failed to build HTTP client")?;
-        let env_model = std::env::var("MEDUSA_MODEL").ok();
+        let registry = provider::ProviderRegistry::load(&workspace)?;
+        let env_model = std::env::var("MEDUSA_MODEL")
+            .ok()
+            .filter(|value| !value.trim().is_empty());
         let env_provider = std::env::var("MEDUSA_PROVIDER")
             .ok()
-            .and_then(|value| ModelProvider::from_name(&value));
-        let provider_locked = env_provider.is_some();
-        let provider = env_provider
-            .or_else(|| {
-                env_model
-                    .as_deref()
-                    .and_then(ModelProvider::infer_from_model)
-            })
-            .unwrap_or(ModelProvider::Codex);
-        let model = env_model.unwrap_or_else(|| provider.default_model().to_string());
+            .filter(|value| !value.trim().is_empty());
+        let provider_hint = env_provider.as_deref().map(provider::canonical_provider_id);
+        let selection = match env_model {
+            Some(model) => registry.select(&model, env_provider.as_deref())?,
+            None => registry.default_reference_for(env_provider.as_deref().unwrap_or("codex"))?,
+        };
+        let model_reference = selection.as_string();
         let reasoning_effort = std::env::var("MEDUSA_REASONING_EFFORT")
             .unwrap_or_else(|_| "medium".to_string())
             .trim()
             .to_string();
-        let chat_base_url = provider.base_url();
-        let chat_api_key = provider.api_key();
 
         Ok(Self {
-            workspace: workspace.into(),
-            provider,
-            provider_locked,
-            model,
+            workspace,
+            registry,
+            selection,
+            model_reference,
+            provider_hint,
             reasoning_effort,
-            chat_base_url,
-            chat_api_key,
+            credentials: CredentialStore::load(),
             client,
         })
     }
 
     pub fn model_name(&self) -> &str {
-        &self.model
+        &self.model_reference
     }
 
-    pub fn provider_name(&self) -> &'static str {
-        self.provider.label()
+    pub fn model_reference(&self) -> &str {
+        &self.model_reference
+    }
+
+    fn wire_model_name(&self) -> &str {
+        self.selection.model()
+    }
+
+    pub fn provider_name(&self) -> &str {
+        self.selection.provider()
+    }
+
+    pub fn model_capabilities(&self) -> provider::ModelCapabilities {
+        self.provider_definition()
+            .map(|provider| provider.model_capabilities(self.wire_model_name()))
+            .unwrap_or_default()
+    }
+
+    pub fn available_models(&self) -> Vec<crate::models::ModelInfo> {
+        self.registry.model_catalog()
+    }
+
+    pub fn provider_status_lines(&self) -> Vec<String> {
+        let Ok(provider) = self.provider_definition() else {
+            return vec![format!(
+                "provider: {} (not configured)",
+                self.provider_name()
+            )];
+        };
+        let protocol = match provider.protocol {
+            provider::ProviderProtocol::CodexResponses => "Codex Responses",
+            provider::ProviderProtocol::OpenAiResponses => "OpenAI Responses",
+            provider::ProviderProtocol::OpenAiChat => "OpenAI Chat Completions",
+        };
+        let auth = match provider.auth {
+            provider::ProviderAuth::CodexOauth => load_codex_oauth_credentials()
+                .map(|_| "ready (Codex OAuth)".to_string())
+                .unwrap_or_else(|error| format!("missing ({error})")),
+            provider::ProviderAuth::Bearer => self
+                .credentials
+                .api_key(provider)
+                .map(|_| "ready (API key)".to_string())
+                .unwrap_or_else(|| format!("missing ({})", provider.auth_hint())),
+            provider::ProviderAuth::None => "not required".to_string(),
+        };
+        vec![
+            format!("provider: {} ({})", provider.display_name, provider.id),
+            format!("model: {}", self.model_reference()),
+            format!("protocol: {protocol}"),
+            format!("endpoint: {}", provider.base_url),
+            format!("auth: {auth}"),
+        ]
     }
 
     pub fn set_model_name(&mut self, model: impl Into<String>) {
-        self.model = model.into();
-        if !self.provider_locked
-            && let Some(provider) = types::ModelProvider::infer_from_model(&self.model)
-        {
-            self.set_provider(provider);
-        }
+        let _ = self.try_set_model_name(model);
+    }
+
+    pub fn try_set_model_name(&mut self, model: impl Into<String>) -> Result<()> {
+        let model = model.into();
+        let normalized = model.trim().to_ascii_lowercase();
+        let provider_hint = if model.contains('/') {
+            None
+        } else if let Some(provider) = self.provider_hint.clone() {
+            Some(provider)
+        } else if normalized.starts_with("gpt-") || normalized.starts_with("deepseek") {
+            None
+        } else {
+            Some(self.provider_name().to_string())
+        };
+        let selection = self.registry.select(&model, provider_hint.as_deref())?;
+        self.model_reference = selection.as_string();
+        self.selection = selection;
+        Ok(())
     }
 
     pub fn reasoning_effort(&self) -> &str {
@@ -162,10 +246,8 @@ impl DirectCodexBackend {
         self.reasoning_effort = effort.into().trim().to_string();
     }
 
-    fn set_provider(&mut self, provider: types::ModelProvider) {
-        self.provider = provider;
-        self.chat_base_url = provider.base_url();
-        self.chat_api_key = provider.api_key();
+    fn provider_definition(&self) -> Result<&provider::ProviderDefinition> {
+        self.registry.resolve(&self.selection)
     }
 
     #[cfg(test)]
@@ -179,7 +261,7 @@ impl DirectCodexBackend {
         })?;
         let response = response.trim().to_string();
         if response.is_empty() {
-            bail!("Codex backend completed without output text");
+            bail!("model backend completed without output text");
         }
 
         Ok(types::ModelChatResult {
@@ -310,7 +392,16 @@ impl DirectCodexBackend {
         // Dynamic MCP tool schemas, fetched once per turn on this worker
         // thread (first use lazily connects the servers, which can block).
         // Read-only turns only see servers the user marked "readOnly": true.
-        let mcp_tools = tools.mcp_tool_schemas(tool_policy.allow_mutation());
+        let mut mcp_tools = tools.mcp_tool_schemas(tool_policy.allow_mutation());
+        sort_tool_schemas(&mut mcp_tools);
+
+        // Runtime context is input, not part of the stable instruction prefix.
+        // Keep every emitted snapshot in the canonical input so each request
+        // is an append-only extension of the previous one. This is the shape
+        // provider prompt caches can reuse most effectively.
+        let mut runtime_context =
+            schema::medusa_runtime_context(&state, policy, extra_context.as_deref());
+        input.push(runtime_context_item(&runtime_context));
 
         let cancel = tools.cancel_token().clone();
         let result = (|| -> Result<usize> {
@@ -319,10 +410,7 @@ impl DirectCodexBackend {
 
                 let outcome = self.stream_turn(
                     input.clone(),
-                    &state,
-                    policy,
                     tool_policy,
-                    extra_context.as_deref(),
                     &mcp_tools,
                     &cancel,
                     &mut on_event,
@@ -353,6 +441,7 @@ impl DirectCodexBackend {
                     return Ok(total_events);
                 }
 
+                let response_reasoning_details = outcome.reasoning_details;
                 let calls = outcome.tool_calls;
 
                 // Announce every call up front (in emission order) so the
@@ -368,6 +457,11 @@ impl DirectCodexBackend {
                         && !reasoning_content.trim().is_empty()
                     {
                         call_item["reasoning_content"] = json!(reasoning_content);
+                    }
+                    if let Some(reasoning_details) = response_reasoning_details.as_ref()
+                        && !reasoning_details.is_empty()
+                    {
+                        call_item["reasoning_details"] = json!(reasoning_details);
                     }
                     input.push(call_item);
 
@@ -423,6 +517,13 @@ impl DirectCodexBackend {
                     crate::orchestrator::ProgressSignal::Stalled(error) => {
                         bail!("{error}");
                     }
+                }
+
+                let updated_runtime_context =
+                    schema::medusa_runtime_context(&state, policy, extra_context.as_deref());
+                if updated_runtime_context != runtime_context {
+                    input.push(runtime_context_item(&updated_runtime_context));
+                    runtime_context = updated_runtime_context;
                 }
 
                 crate::context::prune_input_tool_outputs(&mut input, context_budget);
@@ -615,77 +716,52 @@ impl DirectCodexBackend {
             Ok(())
         };
 
-        match self.provider {
-            types::ModelProvider::Codex => {
-                let credentials = load_codex_oauth_credentials()?;
-                let mut headers = HeaderMap::new();
-                headers.insert(
-                    AUTHORIZATION,
-                    HeaderValue::from_str(&format!("Bearer {}", credentials.bearer_token()))
-                        .wrap_err("failed to build auth header")?,
-                );
-                headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-                headers.insert(ACCEPT, HeaderValue::from_static("text/event-stream"));
-                headers.insert(USER_AGENT, HeaderValue::from_static("medusa-tui/0.1.0"));
-                if let Some(account_id) = credentials.account_id() {
-                    headers.insert(
-                        "ChatGPT-Account-ID",
-                        HeaderValue::from_str(account_id)
-                            .wrap_err("failed to build account header")?,
-                    );
-                }
-
-                let body = json!({
-                    "model": self.model,
+        let provider = self.provider_definition()?.clone();
+        let headers = self.provider_headers(&provider)?;
+        match provider.protocol {
+            provider::ProviderProtocol::CodexResponses
+            | provider::ProviderProtocol::OpenAiResponses => {
+                let mut body = json!({
+                    "model": self.wire_model_name(),
                     "instructions": instructions,
                     "input": input,
                     "tools": [],
                     "store": false,
                     "stream": true,
-                    "reasoning": { "effort": "low" },
                 });
+                if provider
+                    .model_capabilities(self.wire_model_name())
+                    .reasoning
+                {
+                    body["reasoning"] = json!({ "effort": "low" });
+                }
+                let url = provider.endpoint("responses");
                 let response = self.send_model_request(
-                    || {
-                        self.client
-                            .post("https://chatgpt.com/backend-api/codex/responses")
-                            .headers(headers.clone())
-                            .json(&body)
-                    },
-                    "Codex backend",
+                    || self.client.post(&url).headers(headers.clone()).json(&body),
+                    &provider.display_name,
                     cancel,
                 )?;
                 wire::read_sse_response(response, cancel, &mut on_event)?;
             }
-            types::ModelProvider::DeepSeek | types::ModelProvider::OpenAiCompatible => {
-                let Some(api_key) = self.chat_api_key.as_ref() else {
-                    bail!(
-                        "{} backend requires {}",
-                        self.provider.label(),
-                        self.provider.auth_hint()
-                    );
-                };
-                let mut headers = HeaderMap::new();
-                headers.insert(
-                    AUTHORIZATION,
-                    HeaderValue::from_str(&format!("Bearer {api_key}"))
-                        .wrap_err("failed to build auth header")?,
-                );
-                headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-                headers.insert(ACCEPT, HeaderValue::from_static("text/event-stream"));
-                headers.insert(USER_AGENT, HeaderValue::from_static("medusa-tui/0.1.0"));
-
-                let body = json!({
-                    "model": self.model,
-                    "messages": wire::chat_completion_messages_from_input(input, instructions),
+            provider::ProviderProtocol::OpenAiChat => {
+                let capabilities = provider.model_capabilities(self.wire_model_name());
+                let mut body = json!({
+                    "model": self.wire_model_name(),
+                    "messages": wire::chat_completion_messages_from_input_with_images(
+                        input,
+                        instructions,
+                        capabilities.images,
+                    ),
                     "stream": true,
+                    "stream_options": { "include_usage": true },
                 });
-                let url = format!(
-                    "{}/chat/completions",
-                    self.chat_base_url.trim_end_matches('/')
-                );
+                if capabilities.reasoning {
+                    schema::apply_chat_reasoning(&mut body, provider.thinking, "low");
+                }
+                let url = provider.endpoint("chat/completions");
                 let response = self.send_model_request(
                     || self.client.post(&url).headers(headers.clone()).json(&body),
-                    self.provider.label(),
+                    &provider.display_name,
                     cancel,
                 )?;
                 wire::read_chat_completions_sse_response(response, cancel, &mut on_event)?;
@@ -742,14 +818,61 @@ impl DirectCodexBackend {
         }
     }
 
+    fn provider_headers(&self, provider: &provider::ProviderDefinition) -> Result<HeaderMap> {
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        headers.insert(ACCEPT, HeaderValue::from_static("text/event-stream"));
+        headers.insert(USER_AGENT, HeaderValue::from_static("medusa-tui/0.2.0"));
+
+        match provider.auth {
+            provider::ProviderAuth::CodexOauth => {
+                let credentials = load_codex_oauth_credentials()?;
+                headers.insert(
+                    AUTHORIZATION,
+                    HeaderValue::from_str(&format!("Bearer {}", credentials.bearer_token()))
+                        .wrap_err("failed to build auth header")?,
+                );
+                if let Some(account_id) = credentials.account_id() {
+                    headers.insert(
+                        "ChatGPT-Account-ID",
+                        HeaderValue::from_str(account_id)
+                            .wrap_err("failed to build account header")?,
+                    );
+                }
+            }
+            provider::ProviderAuth::Bearer => {
+                let api_key = self.credentials.api_key(provider).ok_or_else(|| {
+                    color_eyre::eyre::eyre!(
+                        "{} provider requires {}",
+                        provider.display_name,
+                        provider.auth_hint()
+                    )
+                })?;
+                headers.insert(
+                    AUTHORIZATION,
+                    HeaderValue::from_str(&format!("Bearer {api_key}"))
+                        .wrap_err("failed to build auth header")?,
+                );
+            }
+            provider::ProviderAuth::None => {}
+        }
+
+        for (name, value) in &provider.headers {
+            headers.insert(
+                HeaderName::from_bytes(name.as_bytes())
+                    .wrap_err_with(|| format!("invalid header name `{name}`"))?,
+                HeaderValue::from_str(value)
+                    .wrap_err_with(|| format!("invalid value for provider header `{name}`"))?,
+            );
+        }
+        Ok(headers)
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn stream_turn<F>(
         &self,
         input: Vec<Value>,
-        state: &types::ToolLoopState,
-        policy: HarnessPolicy,
         tool_policy: types::ToolLoopPolicy,
-        extra_context: Option<&str>,
         extra_tools: &[Value],
         cancel: &CancelToken,
         on_event: &mut F,
@@ -757,28 +880,14 @@ impl DirectCodexBackend {
     where
         F: FnMut(types::ModelStreamEvent) -> Result<()>,
     {
-        match self.provider {
-            types::ModelProvider::Codex => self.stream_codex_turn(
-                input,
-                state,
-                policy,
-                tool_policy,
-                extra_context,
-                extra_tools,
-                cancel,
-                on_event,
-            ),
-            types::ModelProvider::DeepSeek | types::ModelProvider::OpenAiCompatible => self
-                .stream_chat_completions_turn(
-                    input,
-                    state,
-                    policy,
-                    tool_policy,
-                    extra_context,
-                    extra_tools,
-                    cancel,
-                    on_event,
-                ),
+        match self.provider_definition()?.protocol {
+            provider::ProviderProtocol::CodexResponses
+            | provider::ProviderProtocol::OpenAiResponses => {
+                self.stream_responses_turn(input, tool_policy, extra_tools, cancel, on_event)
+            }
+            provider::ProviderProtocol::OpenAiChat => {
+                self.stream_chat_completions_turn(input, tool_policy, extra_tools, cancel, on_event)
+            }
         }
     }
 
@@ -795,13 +904,10 @@ impl DirectCodexBackend {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn stream_codex_turn<F>(
+    fn stream_responses_turn<F>(
         &self,
         input: Vec<Value>,
-        state: &types::ToolLoopState,
-        policy: HarnessPolicy,
         tool_policy: types::ToolLoopPolicy,
-        extra_context: Option<&str>,
         extra_tools: &[Value],
         cancel: &CancelToken,
         on_event: &mut F,
@@ -809,37 +915,29 @@ impl DirectCodexBackend {
     where
         F: FnMut(types::ModelStreamEvent) -> Result<()>,
     {
-        let credentials = load_codex_oauth_credentials()?;
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            AUTHORIZATION,
-            HeaderValue::from_str(&format!("Bearer {}", credentials.bearer_token()))
-                .wrap_err("failed to build auth header")?,
-        );
-        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-        headers.insert(ACCEPT, HeaderValue::from_static("text/event-stream"));
-        headers.insert(USER_AGENT, HeaderValue::from_static("medusa-tui/0.1.0"));
-        if let Some(account_id) = credentials.account_id() {
-            headers.insert(
-                "ChatGPT-Account-ID",
-                HeaderValue::from_str(account_id).wrap_err("failed to build account header")?,
-            );
-        }
+        let provider = self.provider_definition()?.clone();
+        let headers = self.provider_headers(&provider)?;
 
-        let allow_patch = tool_policy.allow_mutation() && state.native_mutation_allowed();
-        let mut tool_schemas = schema::medusa_tools(
-            allow_patch,
-            tool_policy.allow_workflows(),
-            &self.workflow_agent_names(tool_policy),
-        );
-        tool_schemas.extend_from_slice(extra_tools);
+        // Tool availability is stable for the whole turn. Orchestration gates
+        // are enforced by the executor, avoiding schema churn after reads.
+        let capabilities = provider.model_capabilities(self.wire_model_name());
+        let allow_patch = tool_policy.allow_mutation();
+        let mut tool_schemas = if capabilities.tools {
+            schema::medusa_tools(
+                allow_patch,
+                tool_policy.allow_workflows(),
+                &self.workflow_agent_names(tool_policy),
+            )
+        } else {
+            Vec::new()
+        };
+        if capabilities.tools {
+            tool_schemas.extend_from_slice(extra_tools);
+        }
         let mut body = json!({
-            "model": self.model,
+            "model": self.wire_model_name(),
             "instructions": schema::medusa_instructions(
                 &self.workspace,
-                state,
-                policy,
-                extra_context,
                 !extra_tools.is_empty(),
             ),
             "input": input,
@@ -847,23 +945,22 @@ impl DirectCodexBackend {
             "store": false,
             "stream": true,
         });
+        if capabilities.tools {
+            body["parallel_tool_calls"] = json!(capabilities.parallel_tools);
+        }
 
         let wire_effort = schema::codex_reasoning_effort(&self.reasoning_effort);
-        if !wire_effort.eq_ignore_ascii_case("none") {
+        if capabilities.reasoning && !wire_effort.eq_ignore_ascii_case("none") {
             body["reasoning"] = json!({
                 "effort": wire_effort,
                 "summary": "auto",
             });
         }
 
+        let url = provider.endpoint("responses");
         let response = self.send_model_request(
-            || {
-                self.client
-                    .post("https://chatgpt.com/backend-api/codex/responses")
-                    .headers(headers.clone())
-                    .json(&body)
-            },
-            "Codex backend",
+            || self.client.post(&url).headers(headers.clone()).json(&body),
+            &provider.display_name,
             cancel,
         )?;
 
@@ -874,10 +971,7 @@ impl DirectCodexBackend {
     fn stream_chat_completions_turn<F>(
         &self,
         input: Vec<Value>,
-        state: &types::ToolLoopState,
-        policy: HarnessPolicy,
         tool_policy: types::ToolLoopPolicy,
-        extra_context: Option<&str>,
         extra_tools: &[Value],
         cancel: &CancelToken,
         on_event: &mut F,
@@ -885,69 +979,50 @@ impl DirectCodexBackend {
     where
         F: FnMut(types::ModelStreamEvent) -> Result<()>,
     {
-        let Some(api_key) = self.chat_api_key.as_ref() else {
-            bail!(
-                "{} backend requires {}",
-                self.provider.label(),
-                self.provider.auth_hint()
-            );
-        };
+        let provider = self.provider_definition()?.clone();
+        let headers = self.provider_headers(&provider)?;
 
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            AUTHORIZATION,
-            HeaderValue::from_str(&format!("Bearer {api_key}"))
-                .wrap_err("failed to build auth header")?,
-        );
-        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-        headers.insert(ACCEPT, HeaderValue::from_static("text/event-stream"));
-        headers.insert(USER_AGENT, HeaderValue::from_static("medusa-tui/0.1.0"));
-
-        let allow_patch = tool_policy.allow_mutation() && state.native_mutation_allowed();
+        // Keep schemas stable inside a turn; runtime enforcement remains the
+        // source of truth for exploration and recovery gates.
+        let capabilities = provider.model_capabilities(self.wire_model_name());
+        let allow_patch = tool_policy.allow_mutation();
         let mut body = json!({
-            "model": self.model,
-            "messages": wire::chat_completion_messages_from_input(
+            "model": self.wire_model_name(),
+            "messages": wire::chat_completion_messages_from_input_with_images(
                 input,
                 &schema::medusa_instructions(
                     &self.workspace,
-                    state,
-                    policy,
-                    extra_context,
                     !extra_tools.is_empty(),
                 ),
+                capabilities.images,
             ),
-            "tools": schema::chat_completion_tools(
-                allow_patch,
-                tool_policy.allow_workflows(),
-                &self.workflow_agent_names(tool_policy),
-                extra_tools,
-            ),
-            "tool_choice": "auto",
             "stream": true,
             // Ask for the final usage chunk (OpenAI omits it by default).
             "stream_options": { "include_usage": true },
         });
+        if capabilities.tools {
+            body["tools"] = json!(schema::chat_completion_tools(
+                allow_patch,
+                tool_policy.allow_workflows(),
+                &self.workflow_agent_names(tool_policy),
+                extra_tools,
+            ));
+            body["tool_choice"] = json!("auto");
+            body["parallel_tool_calls"] = json!(capabilities.parallel_tools);
+        }
 
-        if self.provider == types::ModelProvider::DeepSeek
-            && !self.reasoning_effort.eq_ignore_ascii_case("none")
+        if capabilities.reasoning
             && !std::env::var("MEDUSA_THINKING")
                 .map(|value| value.eq_ignore_ascii_case("disabled"))
                 .unwrap_or(false)
         {
-            body["thinking"] = json!({
-                "type": "enabled",
-            });
-            body["reasoning_effort"] =
-                json!(schema::deepseek_reasoning_effort(&self.reasoning_effort));
+            schema::apply_chat_reasoning(&mut body, provider.thinking, &self.reasoning_effort);
         }
 
-        let url = format!(
-            "{}/chat/completions",
-            self.chat_base_url.trim_end_matches('/')
-        );
+        let url = provider.endpoint("chat/completions");
         let response = self.send_model_request(
             || self.client.post(&url).headers(headers.clone()).json(&body),
-            self.provider.label(),
+            &provider.display_name,
             cancel,
         )?;
 

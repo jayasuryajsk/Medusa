@@ -413,7 +413,7 @@ impl App {
         if task == "/auth" {
             self.transcript
                 .push(TranscriptItem::Message(ChatMessage::system(
-                    probe_codex_auth().summary_lines().join("\n"),
+                    self.model.provider_status_lines().join("\n"),
                 )));
             self.touch_transcript();
             self.status_line = "auth probed".to_string();
@@ -509,10 +509,18 @@ impl App {
             return;
         }
 
-        self.model.set_model_name(model.to_string());
-        self.model_selection = model_index(model);
+        if let Err(error) = self.model.try_set_model_name(model.to_string()) {
+            self.toast(format!("Model unavailable: {error}"), ToastKind::Error);
+            self.status_line = "model unchanged".to_string();
+            return;
+        }
+        let model = self.model.model_name().to_string();
+        let effort = preferred_reasoning_for_model(&model, self.model.reasoning_effort());
+        self.model.set_reasoning_effort(effort.clone());
+        self.model_selection = model_index(&model);
+        self.reasoning_selection = reasoning_index(&model, &effort);
         self.status_line = format!("model: {model}");
-        match save_model_preference(self.tools.workspace(), model) {
+        match save_model_picker_preferences(self.tools.workspace(), &model, &effort) {
             Ok(()) => self.toast(format!("Model set to {model}"), ToastKind::Success),
             Err(error) => self.toast(format!("Model set, save failed: {error}"), ToastKind::Error),
         }

@@ -420,16 +420,26 @@ fn retry_helpers_classify_and_back_off() {
 }
 
 #[test]
-fn model_provider_is_inferred_from_common_model_ids() {
+fn provider_registry_upgrades_legacy_model_ids() {
+    let registry = crate::model::provider::ProviderRegistry::builtins();
     assert_eq!(
-        types::ModelProvider::infer_from_model("deepseek-v4-flash"),
-        Some(types::ModelProvider::DeepSeek)
+        registry
+            .select("deepseek-v4-flash", None)
+            .unwrap()
+            .as_string(),
+        "deepseek/deepseek-v4-flash"
     );
     assert_eq!(
-        types::ModelProvider::infer_from_model("gpt-5.5"),
-        Some(types::ModelProvider::Codex)
+        registry.select("gpt-5.5", None).unwrap().as_string(),
+        "codex/gpt-5.5"
     );
-    assert_eq!(types::ModelProvider::infer_from_model("custom-model"), None);
+    assert_eq!(
+        registry
+            .select("custom-model", Some("ollama"))
+            .unwrap()
+            .as_string(),
+        "ollama/custom-model"
+    );
 }
 
 #[test]
@@ -439,6 +449,28 @@ fn deepseek_reasoning_effort_maps_codex_names_to_deepseek_values() {
     assert_eq!(schema::deepseek_reasoning_effort("ultra"), "max");
     assert_eq!(schema::deepseek_reasoning_effort("medium"), "high");
     assert_eq!(schema::deepseek_reasoning_effort("low"), "high");
+}
+
+#[test]
+fn chat_reasoning_dialects_emit_provider_specific_fields() {
+    use crate::model::provider::ThinkingDialect;
+
+    let mut openai = json!({});
+    schema::apply_chat_reasoning(&mut openai, ThinkingDialect::Openai, "high");
+    assert_eq!(openai["reasoning_effort"], json!("high"));
+
+    let mut openrouter = json!({});
+    schema::apply_chat_reasoning(&mut openrouter, ThinkingDialect::Openrouter, "xhigh");
+    assert_eq!(openrouter["reasoning"]["effort"], json!("xhigh"));
+
+    let mut deepseek = json!({});
+    schema::apply_chat_reasoning(&mut deepseek, ThinkingDialect::Deepseek, "xhigh");
+    assert_eq!(deepseek["thinking"]["type"], json!("enabled"));
+    assert_eq!(deepseek["reasoning_effort"], json!("max"));
+
+    let mut disabled = json!({});
+    schema::apply_chat_reasoning(&mut disabled, ThinkingDialect::Openrouter, "none");
+    assert_eq!(disabled, json!({}));
 }
 
 #[test]
@@ -561,6 +593,65 @@ fn chat_completion_messages_convert_responses_tool_items() {
 }
 
 #[test]
+fn chat_completion_messages_coalesce_parallel_calls_and_preserve_reasoning_details() {
+    let details = json!([{
+        "type": "reasoning.summary",
+        "summary": "Inspect both files",
+        "id": "reasoning-1",
+        "format": "anthropic-claude-v1",
+        "index": 0
+    }]);
+    let messages = wire::chat_completion_messages_from_input(
+        vec![
+            json!({"role": "user", "content": "inspect both"}),
+            json!({
+                "type": "function_call",
+                "call_id": "call_1",
+                "name": "file_read",
+                "arguments": "{\"paths\":[\"README.md\"]}",
+                "reasoning_details": details,
+            }),
+            json!({
+                "type": "function_call",
+                "call_id": "call_2",
+                "name": "file_read",
+                "arguments": "{\"paths\":[\"Cargo.toml\"]}",
+                "reasoning_details": details,
+            }),
+            json!({"type": "function_call_output", "call_id": "call_1", "output": "a"}),
+            json!({"type": "function_call_output", "call_id": "call_2", "output": "b"}),
+        ],
+        "system",
+    );
+
+    assert_eq!(messages.len(), 5);
+    assert_eq!(messages[2]["tool_calls"].as_array().unwrap().len(), 2);
+    assert_eq!(messages[2]["reasoning_details"], details);
+    assert_eq!(messages[3]["tool_call_id"], json!("call_1"));
+    assert_eq!(messages[4]["tool_call_id"], json!("call_2"));
+}
+
+#[test]
+fn chat_completion_messages_preserve_images_when_provider_supports_them() {
+    let messages = wire::chat_completion_messages_from_input_with_images(
+        vec![json!({
+            "role": "user",
+            "content": [
+                {"type": "input_text", "text": "inspect this"},
+                {"type": "input_image", "image_url": "data:image/png;base64,AA=="}
+            ]
+        })],
+        "system",
+        true,
+    );
+
+    assert_eq!(
+        messages[1]["content"][1]["image_url"]["url"],
+        json!("data:image/png;base64,AA==")
+    );
+}
+
+#[test]
 fn chat_completion_messages_preserve_deepseek_reasoning_content() {
     let messages = wire::chat_completion_messages_from_input(
         vec![
@@ -658,6 +749,45 @@ fn parses_chat_completion_stream_deltas_reasoning_and_tool_calls() {
 }
 
 #[test]
+fn parses_openrouter_reasoning_details_for_tool_continuations() {
+    let detail = json!({
+        "type": "reasoning.summary",
+        "summary": "Need repository context",
+        "id": "reasoning-1",
+        "format": "anthropic-claude-v1",
+        "index": 0
+    });
+    let stream = format!(
+        "data: {}\ndata: [DONE]\n",
+        json!({
+            "choices": [{
+                "delta": {
+                    "reasoning_details": [detail.clone()],
+                    "tool_calls": [{
+                        "index": 0,
+                        "id": "call_1",
+                        "function": {"name": "fs_list", "arguments": "{}"}
+                    }]
+                }
+            }]
+        })
+    );
+    let mut events = Vec::new();
+
+    let outcome =
+        wire::read_chat_completions_sse_reader(std::io::Cursor::new(stream), &mut |event| {
+            events.push(event);
+            Ok(())
+        })
+        .unwrap();
+
+    assert_eq!(outcome.reasoning_details, Some(vec![detail]));
+    assert!(events.contains(&types::ModelStreamEvent::ReasoningDelta(
+        "Need repository context".to_string()
+    )));
+}
+
+#[test]
 fn responses_stream_captures_usage_from_response_completed() {
     let stream = concat!(
         "data: {\"type\":\"response.created\"}\n",
@@ -744,6 +874,21 @@ fn parse_token_usage_accepts_both_field_families_and_rejects_junk() {
         })
     );
 
+    let deepseek_style = json!({
+        "prompt_tokens": 100,
+        "completion_tokens": 5,
+        "prompt_cache_hit_tokens": 72,
+        "prompt_cache_miss_tokens": 28
+    });
+    assert_eq!(
+        wire::parse_token_usage(&deepseek_style),
+        Some(types::TokenUsage {
+            input: 100,
+            output: 5,
+            cached: 72
+        })
+    );
+
     // Only one side reported still counts; a usage-shaped object with
     // neither token family does not.
     let output_only = json!({"completion_tokens": 9});
@@ -756,6 +901,19 @@ fn parse_token_usage_accepts_both_field_families_and_rejects_junk() {
         })
     );
     assert_eq!(wire::parse_token_usage(&json!({"other": 1})), None);
+}
+
+#[test]
+fn token_usage_reports_cache_hit_rate_and_uncached_input() {
+    let usage = types::TokenUsage {
+        input: 1_000,
+        output: 50,
+        cached: 800,
+    };
+
+    assert_eq!(usage.uncached_input(), 200);
+    assert_eq!(usage.cache_hit_percent(), Some(80.0));
+    assert_eq!(types::TokenUsage::default().cache_hit_percent(), None);
 }
 
 #[test]

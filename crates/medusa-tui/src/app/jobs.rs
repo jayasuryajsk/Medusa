@@ -145,11 +145,6 @@ impl App {
             content: permission_context_text(self.permission_mode).to_string(),
             attachments: Vec::new(),
         });
-        messages.push(ConversationMessage {
-            role: "system".to_string(),
-            content: self.session_state_context_text(),
-            attachments: Vec::new(),
-        });
         if self.plan_mode {
             messages.push(ConversationMessage {
                 role: "system".to_string(),
@@ -158,6 +153,9 @@ impl App {
             });
         }
 
+        // Keep this history stable for ContextEngine index accounting. The
+        // regenerated rolling session state is inserted after compaction in
+        // start_model_turn, immediately before the latest user message.
         messages.extend(self.recent_conversation_messages());
         messages
     }

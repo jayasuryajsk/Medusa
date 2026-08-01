@@ -125,16 +125,94 @@ Hooks are trusted local automation, not model-generated commands. They run
 outside the model sandbox, so never interpolate untrusted text into hook
 commands.
 
+## Model Providers
+
+Medusa's agent loop talks to a provider-neutral model gateway. A model is
+identified as `provider/model`; the provider selects an auth strategy and wire
+protocol while the model ID is sent unchanged to that endpoint.
+
+Built-ins:
+
+| Provider | Protocol | Credentials |
+|---|---|---|
+| `codex` | Codex Responses | Codex CLI OAuth cache |
+| `openai` | OpenAI Responses | `medusa auth set openai` or `OPENAI_API_KEY` |
+| `deepseek` | OpenAI Chat | `medusa auth set deepseek` or `DEEPSEEK_API_KEY` |
+| `openrouter` | OpenAI Chat | `medusa auth set openrouter` or `OPENROUTER_API_KEY` |
+| `ollama` | OpenAI Chat | none; defaults to `http://localhost:11434/v1` |
+| `lmstudio` | OpenAI Chat | none; defaults to `http://localhost:1234/v1` |
+
+Credential commands write `~/.local/share/medusa/auth.json` atomically with
+owner-only permissions:
+
+```sh
+medusa auth list
+medusa auth set deepseek
+medusa auth remove deepseek
+```
+
+Stored keys take precedence over environment variables. Codex OAuth remains in
+`~/.codex/auth.json`; Medusa never copies that token.
+
+### Custom Providers
+
+Provider overlays are loaded in this order: built-ins, global
+`~/.config/medusa/providers.json`, then workspace `.medusa/providers.json`.
+Later definitions override earlier ones. Set `MEDUSA_CONFIG_HOME` to move the
+global Medusa config directory.
+
+```json
+{
+  "providers": {
+    "company": {
+      "name": "Company Gateway",
+      "protocol": "openai-chat",
+      "auth": "bearer",
+      "thinking": "openai",
+      "baseUrl": "https://models.company.example/v1",
+      "apiKeyEnv": ["COMPANY_MODEL_KEY"],
+      "headers": { "X-Client": "medusa" },
+      "defaultModel": "coder-v2",
+      "capabilities": {
+        "tools": true,
+        "reasoning": true,
+        "images": false,
+        "parallelTools": true,
+        "promptCache": true
+      },
+      "models": {
+        "coder-v2": {
+          "name": "Coder V2",
+          "description": "Internal coding model",
+          "defaultReasoning": "medium",
+          "reasoning": ["none", "low", "medium", "high"]
+        }
+      }
+    }
+  }
+}
+```
+
+Supported protocols are `codex-responses`, `openai-responses`, and
+`openai-chat`. Supported auth modes are `codex-oauth`, `bearer`, and `none`.
+Chat reasoning dialects are `openai` (`reasoning_effort`), `openrouter`
+(`reasoning.effort`), `deepseek`, and `none`.
+Per-model capabilities override provider defaults and control tool schemas,
+parallel tool requests, image payloads, and reasoning choices.
+
 ## Environment Variables
 
 | Variable | Purpose |
 |---|---|
-| `MEDUSA_MODEL` | Override the model |
-| `MEDUSA_PROVIDER` | `codex`, `openai-compatible`, or `deepseek` |
+| `MEDUSA_MODEL` | Override the `provider/model` selection (bare legacy IDs still resolve) |
+| `MEDUSA_PROVIDER` | Legacy/provider hint for a bare `MEDUSA_MODEL` |
 | `MEDUSA_REASONING_EFFORT` | `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, or `ultra` |
 | `MEDUSA_OPENAI_API_KEY` | API key for OpenAI-compatible providers |
 | `MEDUSA_OPENAI_BASE_URL` | Base URL for an OpenAI-compatible endpoint |
 | `DEEPSEEK_API_KEY` | DeepSeek API key |
+| `OPENROUTER_API_KEY` | OpenRouter API key |
+| `MEDUSA_CONFIG_HOME` | Global configuration directory; default `~/.config/medusa` |
+| `MEDUSA_DATA_HOME` | Private state directory; default `~/.local/share/medusa` |
 | `MEDUSA_CONTEXT_MAX_TOKENS` | Context budget before compaction; default 60k |
 | `MEDUSA_VERIFY` | Set to `off` to disable post-edit verification |
 | `MEDUSA_VERIFY_TIMEOUT_SECS` | Verification timeout; default 90 |

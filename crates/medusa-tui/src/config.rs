@@ -12,7 +12,7 @@ use medusa_core::persistence::atomic_write_private;
 use ratatui::style::Color;
 use serde::{Deserialize, Serialize};
 
-use crate::constants::{BELL_MIN_WORKING_DURATION, DEFAULT_MODEL_CHOICES};
+use crate::constants::BELL_MIN_WORKING_DURATION;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub(crate) struct AppSettings {
@@ -82,12 +82,6 @@ pub(crate) fn save_app_settings(workspace: &Path, settings: &AppSettings) -> Res
 pub(crate) fn save_theme_preference(workspace: &Path, theme: ThemeKind) -> Result<()> {
     let mut settings = load_app_settings(workspace).unwrap_or_default();
     settings.theme = Some(theme.name().to_string());
-    save_app_settings(workspace, &settings)
-}
-
-pub(crate) fn save_model_preference(workspace: &Path, model: &str) -> Result<()> {
-    let mut settings = load_app_settings(workspace).unwrap_or_default();
-    settings.model = Some(model.trim().to_string());
     save_app_settings(workspace, &settings)
 }
 
@@ -664,26 +658,14 @@ pub(crate) fn theme_at_offset(theme: ThemeKind, offset: isize) -> ThemeKind {
     themes[next]
 }
 
-/// Selectable model slugs. Primary source is Codex's own backend model cache
-/// (`~/.codex/models_cache.json`), so the picker reflects exactly what the
-/// account can use — new models appear with no code change. Falls back to a
-/// built-in list when the cache is absent (non-Codex provider / fresh install).
-/// The current model is always present, pinned first if the source omits it.
+/// Selectable provider/model references from Medusa's provider registry. The
+/// current model is always present, pinned first if config omits it.
 pub(crate) fn model_choices(current: &str) -> Vec<String> {
-    let mut choices = medusa_core::models::codex_backend_models()
-        .map(|models| {
-            models
-                .into_iter()
-                .map(|model| model.slug)
-                .collect::<Vec<_>>()
-        })
-        .filter(|slugs: &Vec<String>| !slugs.is_empty())
-        .unwrap_or_else(|| {
-            DEFAULT_MODEL_CHOICES
-                .iter()
-                .map(|model| (*model).to_string())
-                .collect()
-        });
+    let workspace = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let mut choices = medusa_core::models::provider_models(&workspace)
+        .into_iter()
+        .map(|model| model.slug)
+        .collect::<Vec<_>>();
     let current = current.trim();
     if !current.is_empty() && !choices.iter().any(|model| model == current) {
         choices.insert(0, current.to_string());
@@ -691,13 +673,18 @@ pub(crate) fn model_choices(current: &str) -> Vec<String> {
     choices
 }
 
-/// Display label + optional description for a model slug, from the Codex
-/// backend cache. Unknown slugs (custom/env-set models) render as the slug.
-pub(crate) fn model_display(slug: &str) -> (String, Option<String>) {
-    medusa_core::models::codex_backend_models()
-        .and_then(|models| models.into_iter().find(|model| model.slug == slug))
-        .map(|model| (model.display_name, model.description))
-        .unwrap_or_else(|| (slug.to_string(), None))
+/// Display label + optional description for a provider/model reference.
+pub(crate) fn model_display(reference: &str) -> (String, Option<String>) {
+    let workspace = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    medusa_core::models::provider_model(reference, &workspace)
+        .map(|model| {
+            let provider = reference.split_once('/').map(|(provider, _)| provider);
+            let label = provider
+                .map(|provider| format!("{provider} / {}", model.display_name))
+                .unwrap_or(model.display_name);
+            (label, model.description)
+        })
+        .unwrap_or_else(|| (reference.to_string(), None))
 }
 
 pub(crate) fn model_index(current: &str) -> usize {
@@ -708,9 +695,8 @@ pub(crate) fn model_index(current: &str) -> usize {
 }
 
 pub(crate) fn model_default_reasoning(model: &str) -> Option<String> {
-    medusa_core::models::codex_backend_models()
-        .and_then(|models| models.into_iter().find(|candidate| candidate.slug == model))
-        .and_then(|model| model.default_reasoning)
+    let workspace = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    medusa_core::models::provider_model(model, &workspace).and_then(|model| model.default_reasoning)
 }
 
 /// Reasoning efforts selectable for `model`: the backend's per-model list when

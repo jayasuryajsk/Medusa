@@ -15,7 +15,7 @@ mod types;
 mod util;
 
 use app::App;
-use cli::{StartupCommand, parse_args, run_headless};
+use cli::{StartupCommand, parse_args, run_auth, run_headless};
 use terminal::{
     TerminalRestoreGuard, init_terminal, relaunch_current_executable, restore_terminal,
 };
@@ -26,6 +26,7 @@ fn main() -> Result<()> {
     let startup_session = match parse_args()? {
         StartupCommand::Tui(startup_session) => startup_session,
         StartupCommand::Headless(options) => return run_headless(options),
+        StartupCommand::Auth(command) => return run_auth(command),
         StartupCommand::Print(text) => {
             println!("{text}");
             return Ok(());

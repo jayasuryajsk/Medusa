@@ -435,12 +435,18 @@ impl App {
     /// recent (or streaming) turn. Esc/Enter closes (generic modal keys).
     pub(super) fn draw_cost_modal(&self, frame: &mut Frame<'_>, area: Rect) {
         let usage_line = |usage: TokenUsage| {
+            let hit_rate = usage
+                .cache_hit_percent()
+                .map(|percent| format!("{percent:.1}%"))
+                .unwrap_or_else(|| "n/a".to_string());
             Line::from(Span::styled(
                 format!(
-                    "  input {} · output {} · cached {}",
+                    "  input {} · output {} · cache hit {} · cached {} · uncached {}",
                     format_token_count(usage.input),
                     format_token_count(usage.output),
-                    format_token_count(usage.cached)
+                    hit_rate,
+                    format_token_count(usage.cached),
+                    format_token_count(usage.uncached_input()),
                 ),
                 value_style(),
             ))
@@ -720,7 +726,7 @@ impl App {
         let Some(attachment) = attachments.get(selected).cloned() else {
             return;
         };
-        let image_input_warning = image_input_warning(self.model.provider_name());
+        let image_input_warning = image_input_warning(self.model.model_capabilities().images);
         let header_height = if image_input_warning.is_some() { 3 } else { 2 };
         let sections = Layout::default()
             .direction(Direction::Vertical)

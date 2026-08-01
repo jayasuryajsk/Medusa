@@ -26,7 +26,7 @@ use super::{
 use crate::{
     agents::AgentRegistry,
     cancel::CancelToken,
-    model::{ConversationMessage, DirectCodexBackend, ModelStreamEvent},
+    model::{ConversationMessage, ModelGateway, ModelStreamEvent},
     tools::ToolRuntime,
 };
 
@@ -539,7 +539,7 @@ impl WorkflowRuntime {
         &self,
         script: &WorkflowScript,
         args: Option<Value>,
-        backend: DirectCodexBackend,
+        backend: ModelGateway,
         tools: ToolRuntime,
         mut emit: F,
     ) -> Result<WorkflowRunReport>
@@ -551,7 +551,7 @@ impl WorkflowRuntime {
         self.run_script_with_runner_and_cancel(script, args, runner, cancel, &mut emit)
     }
 
-    fn script_agent_runner(&self, backend: DirectCodexBackend, tools: ToolRuntime) -> AgentRunner {
+    fn script_agent_runner(&self, backend: ModelGateway, tools: ToolRuntime) -> AgentRunner {
         let workspace = self.workspace.clone();
         let memory_context = self.memory_context.clone();
         Arc::new(move |spec: &ScriptAgentSpec| {

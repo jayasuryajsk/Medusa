@@ -40,8 +40,8 @@ live plans, checkpoints, and permission controls.
 
 ## Requirements
 
-- A model backend. Codex OAuth is the default; OpenAI-compatible and DeepSeek
-  endpoints are also supported.
+- A model backend. Codex OAuth is the default; OpenAI Responses,
+  OpenAI-compatible services, and local endpoints are also supported.
 - Rust 1.90+ only when installing with Cargo or building from source.
 - `bubblewrap` for guarded or readonly execution on Linux.
 - Chrome, Node.js LTS, and npm only for optional browser control.
@@ -84,7 +84,7 @@ cargo install --locked --path crates/medusa-tui
 This builds an optimized binary and places `medusa` on your `PATH` (usually
 `~/.cargo/bin`).
 
-## Authentication
+## Models And Authentication
 
 By default Medusa authenticates with the **Codex OAuth token** — the same
 credentials the [Codex CLI](https://github.com/openai/codex) writes. If you
@@ -96,23 +96,72 @@ codex login
 ```
 
 Medusa reads the token from `~/.codex/auth.json` (override the directory with
-`CODEX_HOME`). Inside the TUI, `/auth` shows your current auth status.
+`CODEX_HOME`). Inside the TUI, `/auth` shows the active provider, protocol,
+endpoint, model, and credential status.
 
 ### Using another provider
 
-Set environment variables before launching:
+Models use `provider/model` IDs. Store an API key without putting it in shell
+history, then choose the model in `/model` or with `--model`:
 
 ```sh
-# OpenAI-compatible endpoint
-export MEDUSA_PROVIDER=openai-compatible
-export MEDUSA_OPENAI_API_KEY=sk-...
-export MEDUSA_MODEL=gpt-4o                # optional; defaults to gpt-5.5
-# export MEDUSA_OPENAI_BASE_URL=https://your-endpoint/v1   # optional
+medusa auth list
+medusa auth set openai
+medusa run --model openai/gpt-5.5 "inspect this repository"
 
-# DeepSeek
-export MEDUSA_PROVIDER=deepseek
-export DEEPSEEK_API_KEY=...
+medusa auth set deepseek
+medusa run --model deepseek/deepseek-v4-flash "fix the tests"
+
+# Local OpenAI-compatible servers need no credential
+medusa run --model ollama/qwen3-coder "review this diff"
 ```
+
+Keys are stored with private permissions in
+`~/.local/share/medusa/auth.json`. Environment variables such as
+`OPENAI_API_KEY`, `DEEPSEEK_API_KEY`, and `OPENROUTER_API_KEY` also work.
+Stored credentials take precedence. Use `medusa auth remove <provider>` to
+delete one.
+
+Built-in adapters cover Codex Responses, OpenAI Responses, and
+OpenAI-compatible Chat Completions. The registry includes `codex`, `openai`,
+`deepseek`, `openrouter`, `ollama`, and `lmstudio`. Add another compatible
+service in `.medusa/providers.json` (or globally in
+`~/.config/medusa/providers.json`):
+
+```json
+{
+  "providers": {
+    "acme": {
+      "name": "Acme AI",
+      "protocol": "openai-chat",
+      "thinking": "openai",
+      "baseUrl": "https://models.acme.example/v1",
+      "apiKeyEnv": ["ACME_API_KEY"],
+      "defaultModel": "coder",
+      "models": {
+        "coder": {
+          "name": "Acme Coder",
+          "reasoning": ["none", "medium", "high"],
+          "capabilities": {
+            "tools": true,
+            "reasoning": true,
+            "images": false,
+            "parallelTools": true,
+            "promptCache": true
+          }
+        }
+      }
+    }
+  }
+}
+```
+
+Then run `medusa auth set acme` and select `acme/coder`. Provider files may
+override built-ins, add request headers, declare models, and set capabilities;
+secrets stay in the credential store or environment rather than project JSON.
+For Chat Completions providers, `thinking` may be `openai`, `openrouter`,
+`deepseek`, or `none`; this keeps the reasoning picker aligned with the actual
+request format.
 
 ## Usage
 
@@ -144,7 +193,7 @@ In the composer:
 |---|---|
 | `/help` | List all commands |
 | `/plan` | Toggle plan mode (explore & propose before editing) |
-| `/model` | Choose the model and execution mode (model list populated live from the Codex backend) |
+| `/model` | Choose a provider/model and its supported reasoning mode |
 | `/reasoning` | Set thinking effort (`low`…`max`) or Ultra proactive orchestration when supported |
 | `/permissions` | Change permission mode (open / guarded / readonly) |
 | `/theme` | Cycle color themes (`medusa`, `opencode`, `tokyonight`, `catppuccin`, …) |
@@ -153,7 +202,7 @@ In the composer:
 | `/rewind` | Restore files to the state before a previous turn |
 | `/edit` | Backtrack: edit a previous message and resend from there |
 | `/review` | Seed the composer with a code-review prompt for pending changes |
-| `/compact` · `/context` · `/cost` | Compact history now · show context usage · show token usage |
+| `/compact` · `/context` · `/cost` | Compact history now · show context usage · show token and prompt-cache hit usage |
 | `/tools` · `/skills` · `/agents` | Show available tools / skills / named agents |
 | `/mcp [restart <server>]` | List MCP servers and their tools, or restart one |
 | `/sessions` · `/resume` · `/fork` · `/tree` | Manage and branch conversation sessions |
@@ -182,7 +231,7 @@ echo "list the public API of this module" | medusa run
 medusa run --json --permission readonly "audit error handling"
 ```
 
-Options: `--model <name>`, `--permission <open|guarded|readonly>`, `--json`,
+Options: `--model <provider/model>`, `--permission <open|guarded|readonly>`, `--json`,
 `--no-stream`.
 
 ## Configuration

@@ -51,7 +51,7 @@ pub(crate) fn execute_workflow_run_with_hooks<F>(
     call: &ToolCall,
     policy: HarnessPolicy,
     tool_policy: ToolLoopPolicy,
-    backend: &crate::model::types::DirectCodexBackend,
+    backend: &crate::model::types::ModelGateway,
     on_event: &mut F,
 ) -> ToolExecution
 where
@@ -100,7 +100,7 @@ fn execute_workflow_run<F>(
     tools: &ToolRuntime,
     call: &ToolCall,
     tool_policy: ToolLoopPolicy,
-    backend: &crate::model::types::DirectCodexBackend,
+    backend: &crate::model::types::ModelGateway,
     on_event: &mut F,
 ) -> ToolExecution
 where

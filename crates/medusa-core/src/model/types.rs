@@ -1,148 +1,25 @@
 use std::path::PathBuf;
 
+use crate::credentials::CredentialStore;
 use crate::harness::HarnessPolicy;
+use crate::model::provider::{ModelReference, ProviderRegistry};
 use crate::orchestrator::TurnOrchestrator;
 
-const CODEX_BACKEND_URL: &str = "https://chatgpt.com/backend-api/codex";
-const DEEPSEEK_BASE_URL: &str = "https://api.deepseek.com";
-const DEFAULT_MODEL: &str = "gpt-5.5";
-const DEFAULT_DEEPSEEK_MODEL: &str = "deepseek-v4-flash";
-
 #[derive(Debug, Clone)]
-pub struct DirectCodexBackend {
+pub struct ModelGateway {
     pub(crate) workspace: PathBuf,
-    pub(crate) provider: ModelProvider,
-    pub(crate) provider_locked: bool,
-    pub(crate) model: String,
+    pub(crate) registry: ProviderRegistry,
+    pub(crate) selection: ModelReference,
+    pub(crate) model_reference: String,
+    pub(crate) provider_hint: Option<String>,
     pub(crate) reasoning_effort: String,
-    pub(crate) chat_base_url: String,
-    pub(crate) chat_api_key: Option<String>,
+    pub(crate) credentials: CredentialStore,
     pub(crate) client: reqwest::blocking::Client,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ModelProvider {
-    Codex,
-    DeepSeek,
-    OpenAiCompatible,
-}
-
-impl ModelProvider {
-    pub(crate) fn from_name(name: &str) -> Option<Self> {
-        match name.trim().to_ascii_lowercase().replace('_', "-").as_str() {
-            "codex" | "openai-codex" => Some(Self::Codex),
-            "deepseek" => Some(Self::DeepSeek),
-            "openai" | "openai-compatible" | "chat-completions" | "compatible" => {
-                Some(Self::OpenAiCompatible)
-            }
-            _ => None,
-        }
-    }
-
-    pub(crate) fn infer_from_model(model: &str) -> Option<Self> {
-        let normalized = model.trim().to_ascii_lowercase();
-        if normalized.starts_with("deepseek") {
-            Some(Self::DeepSeek)
-        } else if normalized.starts_with("gpt-") {
-            Some(Self::Codex)
-        } else {
-            None
-        }
-    }
-
-    pub(crate) fn default_model(self) -> &'static str {
-        match self {
-            Self::Codex => DEFAULT_MODEL,
-            Self::DeepSeek => DEFAULT_DEEPSEEK_MODEL,
-            Self::OpenAiCompatible => DEFAULT_MODEL,
-        }
-    }
-
-    pub(crate) fn label(self) -> &'static str {
-        match self {
-            Self::Codex => "codex",
-            Self::DeepSeek => "deepseek",
-            Self::OpenAiCompatible => "openai-compatible",
-        }
-    }
-
-    pub(crate) fn base_url(self) -> String {
-        match self {
-            Self::Codex => CODEX_BACKEND_URL.to_string(),
-            Self::DeepSeek => std::env::var("MEDUSA_DEEPSEEK_BASE_URL")
-                .or_else(|_| std::env::var("DEEPSEEK_BASE_URL"))
-                .unwrap_or_else(|_| DEEPSEEK_BASE_URL.to_string()),
-            Self::OpenAiCompatible => std::env::var("MEDUSA_OPENAI_BASE_URL")
-                .or_else(|_| std::env::var("OPENAI_BASE_URL"))
-                .unwrap_or_else(|_| "https://api.openai.com/v1".to_string()),
-        }
-    }
-
-    pub(crate) fn api_key(self) -> Option<String> {
-        match self {
-            Self::Codex => None,
-            Self::DeepSeek => {
-                api_key_from_env_or_launchctl(&["MEDUSA_DEEPSEEK_API_KEY", "DEEPSEEK_API_KEY"])
-            }
-            Self::OpenAiCompatible => api_key_from_env_or_launchctl(&[
-                "MEDUSA_OPENAI_API_KEY",
-                "MEDUSA_API_KEY",
-                "OPENAI_API_KEY",
-            ]),
-        }
-    }
-
-    pub(crate) fn auth_hint(self) -> &'static str {
-        match self {
-            Self::Codex => "Codex OAuth",
-            Self::DeepSeek => "env var `DEEPSEEK_API_KEY` or `MEDUSA_DEEPSEEK_API_KEY`",
-            Self::OpenAiCompatible => {
-                "env var `MEDUSA_OPENAI_API_KEY`, `MEDUSA_API_KEY`, or `OPENAI_API_KEY`"
-            }
-        }
-    }
-}
-
-pub(crate) fn api_key_from_env_or_launchctl(keys: &[&str]) -> Option<String> {
-    for key in keys {
-        if let Ok(value) = std::env::var(key)
-            && !value.trim().is_empty()
-        {
-            return Some(value);
-        }
-    }
-
-    for key in keys {
-        if let Some(value) = launchctl_getenv(key) {
-            return Some(value);
-        }
-    }
-
-    None
-}
-
-fn launchctl_getenv(key: &str) -> Option<String> {
-    #[cfg(target_os = "macos")]
-    {
-        let output = std::process::Command::new("launchctl")
-            .arg("getenv")
-            .arg(key)
-            .output()
-            .ok()?;
-        if !output.status.success() {
-            return None;
-        }
-        let value = String::from_utf8(output.stdout).ok()?;
-        let value = value.trim().to_string();
-        (!value.is_empty()).then_some(value)
-    }
-
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = key;
-        None
-    }
-}
+/// Compatibility name retained for downstream users while the codebase moves
+/// to provider-neutral terminology.
+pub type DirectCodexBackend = ModelGateway;
 
 pub(crate) fn is_mutation_tool(name: &str) -> bool {
     matches!(name, "file_edit" | "file_patch")
@@ -167,6 +44,14 @@ pub struct TokenUsage {
 impl TokenUsage {
     pub fn total(&self) -> u64 {
         self.input + self.output
+    }
+
+    pub fn uncached_input(&self) -> u64 {
+        self.input.saturating_sub(self.cached)
+    }
+
+    pub fn cache_hit_percent(&self) -> Option<f64> {
+        (self.input > 0).then(|| self.cached.min(self.input) as f64 * 100.0 / self.input as f64)
     }
 
     pub fn add(&mut self, other: TokenUsage) {
@@ -298,6 +183,9 @@ pub(crate) struct ToolExecution {
 pub(crate) struct TurnOutcome {
     pub(crate) event_count: usize,
     pub(crate) tool_calls: Vec<ToolCall>,
+    /// Provider-native reasoning blocks that must round-trip unchanged across
+    /// a tool continuation (notably OpenRouter reasoning_details).
+    pub(crate) reasoning_details: Option<Vec<serde_json::Value>>,
     /// Usage for this single request, when the backend reported one.
     pub(crate) usage: Option<TokenUsage>,
 }

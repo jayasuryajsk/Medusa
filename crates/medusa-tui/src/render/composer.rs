@@ -155,11 +155,11 @@ pub(crate) fn image_preview_lines(attachment: &ImageAttachment, width: u16) -> V
     image_placeholder_lines(attachment, width, COMPOSER_IMAGE_PREVIEW_HEIGHT)
 }
 
-pub(crate) fn image_input_warning(provider: &str) -> Option<&'static str> {
-    if provider == "codex" {
+pub(crate) fn image_input_warning(images_supported: bool) -> Option<&'static str> {
+    if images_supported {
         None
     } else {
-        Some("current backend sends a placeholder instead of image pixels")
+        Some("selected model does not accept image input")
     }
 }
 

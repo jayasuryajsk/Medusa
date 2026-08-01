@@ -570,6 +570,23 @@ fn startup_parser_returns_headless_help_without_exiting() {
 }
 
 #[test]
+fn startup_parser_accepts_provider_auth_commands() {
+    assert_eq!(
+        parse_startup_command(&["auth".to_string(), "list".to_string()]).unwrap(),
+        StartupCommand::Auth(AuthCommand::List)
+    );
+    assert_eq!(
+        parse_startup_command(&[
+            "auth".to_string(),
+            "set".to_string(),
+            "openai-compatible".to_string(),
+        ])
+        .unwrap(),
+        StartupCommand::Auth(AuthCommand::Set("openai".to_string()))
+    );
+}
+
+#[test]
 fn startup_parser_accepts_headless_run_options() {
     let args = vec![
         "run".to_string(),

@@ -170,7 +170,7 @@ pub(crate) const SLASH_COMMANDS: &[SlashCommand] = &[
         name: "/auth",
         args: "",
         category: "system",
-        description: "Check Codex/ChatGPT auth status",
+        description: "Check the active provider and auth status",
     },
     SlashCommand {
         name: "/jobs",

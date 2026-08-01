@@ -4,13 +4,7 @@ use crate::harness::HarnessPolicy;
 use crate::model::types::*;
 use serde_json::{Value, json};
 
-pub(crate) fn medusa_instructions(
-    workspace: &Path,
-    state: &ToolLoopState,
-    policy: HarnessPolicy,
-    extra_context: Option<&str>,
-    mcp_tools_active: bool,
-) -> String {
+pub(crate) fn medusa_instructions(workspace: &Path, mcp_tools_active: bool) -> String {
     let mut instructions = format!(
         "You are Medusa, a terminal-native autonomous coding agent. \
 You help the user inspect, edit, test, debug, and evolve the current workspace through Medusa's tool loop. \
@@ -37,31 +31,10 @@ Summarize what changed, what passed/failed, and next steps. \
 For normal chat, answer naturally and concisely. \
 \
 Harness contract: {} \
-Harness law: explore in parallel; act serialized. Use parallel exploration for context gathering and verification, but keep edits/patches/mutating commands in a single coherent lane. \
-Turn mode: {}. \
-Orchestration route: {}. \
-{} \
-{} \
-{}",
+Harness law: explore in parallel; act serialized. Use parallel exploration for context gathering and verification, but keep edits/patches/mutating commands in a single coherent lane.",
         workspace.display(),
-        crate::harness::core_harness_contract(),
-        policy.mode_label(),
-        policy.route_label(),
-        policy.instructions(),
-        policy.route_instructions(),
-        policy.completion_contract()
+        crate::harness::core_harness_contract()
     );
-
-    if state.patch_requires_context {
-        instructions.push_str(
-            " A previous edit/patch failed, so mutation tools are temporarily withheld until you inspect the current file/context with file_read, file_search, fs_list, or terminal_exec. Do not retry blind edits.",
-        );
-    }
-
-    if let Some(evidence) = state.orchestrator.context() {
-        instructions.push_str("\n\n");
-        instructions.push_str(&evidence);
-    }
 
     if mcp_tools_active {
         instructions.push_str(
@@ -69,12 +42,48 @@ Orchestration route: {}. \
         );
     }
 
+    instructions
+}
+
+/// Per-turn state deliberately kept out of the stable instruction prefix.
+/// The caller appends this as an input item and keeps old snapshots in place,
+/// so later tool-loop requests extend an identical prefix instead of
+/// rewriting the system prompt on every observation.
+pub(crate) fn medusa_runtime_context(
+    state: &ToolLoopState,
+    policy: HarnessPolicy,
+    extra_context: Option<&str>,
+) -> String {
+    let mutation_gate = if state.patch_requires_context {
+        "Mutation gate: recovery required. A previous edit or patch failed; inspect the current file/context before attempting another mutation."
+    } else if state.native_mutation_allowed() {
+        "Mutation gate: open when the active permission policy allows mutation."
+    } else {
+        "Mutation gate: withheld by the current orchestration route. Gather the required workspace evidence or complete the required workflow before mutating files."
+    };
+
+    let mut context = format!(
+        "Medusa turn context (runtime state; newer runtime-state messages supersede older ones).\n\
+Turn mode: {}.\n\
+Orchestration route: {}.\n\
+{}\n\
+{}\n\
+{}\n\
+{}",
+        policy.mode_label(),
+        policy.route_label(),
+        policy.instructions(),
+        policy.route_instructions(),
+        policy.completion_contract(),
+        mutation_gate,
+    );
+
     if let Some(extra_context) = extra_context {
-        instructions.push_str("\n\n");
-        instructions.push_str(extra_context);
+        context.push_str("\n\n");
+        context.push_str(extra_context);
     }
 
-    instructions
+    context
 }
 
 pub(crate) fn medusa_tools(
@@ -621,5 +630,33 @@ pub(crate) fn deepseek_reasoning_effort(effort: &str) -> &'static str {
     {
         "xhigh" | "max" | "ultra" => "max",
         _ => "high",
+    }
+}
+
+pub(crate) fn apply_chat_reasoning(
+    body: &mut Value,
+    dialect: crate::model::provider::ThinkingDialect,
+    effort: &str,
+) {
+    if effort.trim().eq_ignore_ascii_case("none") {
+        return;
+    }
+
+    match dialect {
+        crate::model::provider::ThinkingDialect::None => {}
+        crate::model::provider::ThinkingDialect::Openai => {
+            body["reasoning_effort"] = json!(codex_reasoning_effort(effort));
+        }
+        crate::model::provider::ThinkingDialect::Openrouter => {
+            body["reasoning"] = json!({
+                "effort": codex_reasoning_effort(effort),
+            });
+        }
+        crate::model::provider::ThinkingDialect::Deepseek => {
+            body["thinking"] = json!({
+                "type": "enabled",
+            });
+            body["reasoning_effort"] = json!(deepseek_reasoning_effort(effort));
+        }
     }
 }

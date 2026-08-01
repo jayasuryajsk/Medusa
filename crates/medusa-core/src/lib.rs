@@ -3,6 +3,7 @@ pub mod auth;
 pub mod cancel;
 pub mod checkpoint;
 pub mod context;
+pub mod credentials;
 pub mod harness;
 pub mod hooks;
 pub mod mcp;

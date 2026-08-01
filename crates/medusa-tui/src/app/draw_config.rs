@@ -251,8 +251,6 @@ impl App {
                     accent().add_modifier(Modifier::BOLD),
                 ),
                 Span::styled("  ", muted()),
-                Span::styled(self.model.provider_name(), muted()),
-                Span::styled("/", muted()),
                 Span::styled(self.model.model_name().to_string(), prompt_style()),
                 Span::styled(" · ", muted()),
                 Span::styled(self.model.reasoning_effort().to_string(), prompt_style()),
@@ -260,8 +258,8 @@ impl App {
             Line::from(vec![
                 Span::styled("choose effort or Ultra orchestration", muted()),
                 Span::styled("  ·  ", muted()),
-                Span::styled("/model <id>", prompt_style()),
-                Span::styled(" accepts any model id", muted()),
+                Span::styled("/model <provider/model>", prompt_style()),
+                Span::styled(" accepts configured models", muted()),
             ]),
         ])
         .style(Style::default().bg(surface()).fg(text()));

@@ -5,7 +5,8 @@ use std::sync::atomic::Ordering;
 use ratatui::style::Color;
 
 use crate::cli::{
-    HELP_TEXT, HeadlessOptions, RUN_HELP_TEXT, StartupCommand, VERSION_TEXT, parse_startup_command,
+    AuthCommand, HELP_TEXT, HeadlessOptions, RUN_HELP_TEXT, StartupCommand, VERSION_TEXT,
+    parse_startup_command,
 };
 use crate::markdown::markdown_content_lines;
 
@@ -90,7 +91,7 @@ fn app_in_workspace() -> (App, PathBuf) {
     let workspace = temp_workspace();
     let mut app = app();
     app.tools = ToolRuntime::new(&workspace).unwrap();
-    app.model = DirectCodexBackend::new(&workspace).unwrap();
+    app.model = ModelGateway::new(&workspace).unwrap();
     app.cwd_display = abbreviate_home(&workspace.to_string_lossy());
     (app, workspace)
 }

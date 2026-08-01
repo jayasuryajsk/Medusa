@@ -16,10 +16,17 @@ pub(crate) fn execute_tool_call(
         };
     }
 
-    if call.name == "file_patch" && state.patch_requires_context {
+    if crate::model::types::is_mutation_tool(&call.name) && state.patch_requires_context {
         return ToolExecution {
             failed: true,
-            output: "file.patch recovery active: the previous patch failed. Use file_read, file_search, fs_list, or terminal_exec first to inspect the target file/context, then submit a fresh unified diff. Blind malformed patch retries are paused until context is refreshed.".to_string(),
+            output: "mutation recovery active: the previous edit or patch failed. Use file_read, file_search, fs_list, or terminal_exec first to inspect the target file/context, then submit a fresh edit. Blind mutation retries are paused until context is refreshed.".to_string(),
+        };
+    }
+
+    if crate::model::types::is_mutation_tool(&call.name) && !state.native_mutation_allowed() {
+        return ToolExecution {
+            failed: true,
+            output: "error: file mutation is withheld by the current orchestration route. Gather workspace evidence with file_read, file_search, file_glob, fs_list, explore_batch, or a read-only terminal command before editing; workflow-routed turns must complete their workflow first.".to_string(),
         };
     }
 

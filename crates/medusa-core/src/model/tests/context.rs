@@ -33,33 +33,85 @@ fn mutation_tools_gated_by_policy_not_turn_mode() {
 }
 
 #[test]
-fn medusa_instructions_include_explicit_skill_context() {
-    let instructions = schema::medusa_instructions(
-        Path::new("/workspace"),
+fn runtime_context_includes_explicit_skill_context() {
+    let context = schema::medusa_runtime_context(
         &types::ToolLoopState::default(),
         HarnessPolicy::for_user_prompt("use $review"),
         Some("Active Medusa skills.\n<skill name=\"review\">lead with findings</skill>"),
-        false,
     );
 
-    assert!(instructions.contains("Active Medusa skills"));
-    assert!(instructions.contains("lead with findings"));
+    assert!(context.contains("Active Medusa skills"));
+    assert!(context.contains("lead with findings"));
 }
 
 #[test]
 fn medusa_instructions_mention_mcp_only_when_mcp_tools_are_active() {
-    let base = |mcp_active| {
-        schema::medusa_instructions(
-            Path::new("/workspace"),
-            &types::ToolLoopState::default(),
-            HarnessPolicy::for_user_prompt("hello"),
-            None,
-            mcp_active,
-        )
-    };
+    let base = |mcp_active| schema::medusa_instructions(Path::new("/workspace"), mcp_active);
 
     assert!(base(true).contains("mcp_<server>_<tool>"));
     assert!(!base(false).contains("mcp_<server>_<tool>"));
+}
+
+#[test]
+fn stable_instructions_exclude_turn_specific_state() {
+    let instructions = schema::medusa_instructions(Path::new("/workspace"), false);
+
+    assert!(!instructions.contains("Turn mode:"));
+    assert!(!instructions.contains("Orchestration route:"));
+    assert!(!instructions.contains("Mutation gate:"));
+}
+
+#[test]
+fn dynamic_tool_schemas_are_sorted_deterministically() {
+    let mut tools = vec![
+        json!({"type":"function", "name":"mcp_zeta_read"}),
+        json!({"type":"function", "name":"mcp_alpha_read"}),
+    ];
+
+    super::super::sort_tool_schemas(&mut tools);
+
+    assert_eq!(super::super::tool_schema_name(&tools[0]), "mcp_alpha_read");
+    assert_eq!(super::super::tool_schema_name(&tools[1]), "mcp_zeta_read");
+}
+
+#[test]
+fn runtime_context_reports_orchestration_mutation_gate() {
+    let policy = HarnessPolicy::for_user_prompt("fix the failing tests");
+    let mut state = types::ToolLoopState::for_policy(policy);
+    assert!(!state.native_mutation_allowed());
+
+    let withheld = schema::medusa_runtime_context(&state, policy, None);
+    assert!(withheld.contains("Mutation gate: withheld"));
+
+    state
+        .orchestrator
+        .record_execution("file_read", "read src/lib.rs", "contents", false, &[]);
+    let open = schema::medusa_runtime_context(&state, policy, None);
+    assert!(open.contains("Mutation gate: open"));
+}
+
+#[test]
+fn executor_enforces_mutation_gate_with_stable_schema() {
+    let workspace = temp_workspace();
+    let tools = ToolRuntime::new(&workspace).unwrap();
+    let policy = HarnessPolicy::for_user_prompt("fix the failing tests");
+    let state = types::ToolLoopState::for_policy(policy);
+    let call = types::ToolCall {
+        name: "file_edit".to_string(),
+        call_id: "call_edit".to_string(),
+        arguments: r#"{"path":"src/lib.rs","old_string":"old","new_string":"new"}"#.to_string(),
+        reasoning_content: None,
+    };
+
+    let execution = exec::execute_tool_call(
+        &tools,
+        &call,
+        &state,
+        types::ToolLoopPolicy::mutation_allowed(),
+    );
+
+    assert!(execution.failed);
+    assert!(execution.output.contains("withheld"));
 }
 
 #[test]

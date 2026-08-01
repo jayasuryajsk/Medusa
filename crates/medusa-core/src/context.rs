@@ -3,10 +3,12 @@ use std::sync::{Arc, Mutex};
 use color_eyre::eyre::{Result, WrapErr, bail};
 use serde_json::{Value, json};
 
-use crate::model::{ConversationMessage, DirectCodexBackend};
+use crate::model::{ConversationMessage, ModelGateway};
 
 const DEFAULT_CONTEXT_MAX_TOKENS: usize = 60_000;
 const PROTECTED_RECENT_TOOL_OUTPUTS: usize = 4;
+const COMPACTION_HIGH_WATER_PERCENT: usize = 70;
+const COMPACTION_LOW_WATER_PERCENT: usize = 50;
 const SUMMARY_MAX_CHARS: usize = 6_000;
 const SUMMARY_SOURCE_MESSAGE_MAX_CHARS: usize = 2_000;
 const SUMMARY_SOURCE_MAX_CHARS: usize = 32_000;
@@ -39,13 +41,7 @@ pub(crate) fn value_tokens(value: &Value) -> usize {
 /// readouts so the visible budget accounts for instructions the transcript
 /// never shows.
 pub fn baseline_instructions_tokens(workspace: &std::path::Path) -> usize {
-    let instructions = crate::model::schema::medusa_instructions(
-        workspace,
-        &crate::model::types::ToolLoopState::default(),
-        crate::harness::HarnessPolicy::for_user_prompt(""),
-        None,
-        false,
-    );
+    let instructions = crate::model::schema::medusa_instructions(workspace, false);
     estimate_tokens(&instructions)
 }
 
@@ -163,7 +159,7 @@ impl ContextEngine {
     pub fn prepare(
         &self,
         messages: &[ConversationMessage],
-        backend: &DirectCodexBackend,
+        backend: &ModelGateway,
         cancel: &crate::cancel::CancelToken,
     ) -> Vec<ConversationMessage> {
         self.prepare_with_summarizer(messages, |prompt| {
@@ -192,22 +188,37 @@ impl ContextEngine {
         }
 
         let prefix_tokens: usize = prefix.iter().map(message_tokens).sum();
-        // Reserve room for the system prompt plus tool traffic during the turn.
-        let recent_budget = self
-            .max_tokens
-            .saturating_sub(prefix_tokens)
-            .saturating_mul(7)
-            / 10;
-        let body_tokens: usize = body.iter().map(message_tokens).sum();
+        let available = self.max_tokens.saturating_sub(prefix_tokens);
+        // Trigger at 70%, then compact down toward 50%. The gap leaves room
+        // for several future turns, so the summary prefix remains unchanged
+        // instead of being rewritten after every small addition.
+        let high_water = available.saturating_mul(COMPACTION_HIGH_WATER_PERCENT) / 100;
+        let low_water = available.saturating_mul(COMPACTION_LOW_WATER_PERCENT) / 100;
         let base_covers = state.as_ref().map(|summary| summary.covers).unwrap_or(0);
+        let active_tokens = state
+            .as_ref()
+            .map(|summary| message_tokens(&summary_message(summary)))
+            .unwrap_or(0)
+            + body[base_covers..]
+                .iter()
+                .map(message_tokens)
+                .sum::<usize>();
 
-        if body_tokens <= recent_budget && base_covers == 0 {
+        if active_tokens <= high_water {
+            if let Some(summary) = state.as_ref() {
+                let mut result = prefix.to_vec();
+                result.push(summary_message(summary));
+                result.extend_from_slice(&body[summary.covers..]);
+                return result;
+            }
             return messages.to_vec();
         }
 
-        // Find the cut: keep the longest suffix that fits the recent budget,
+        // Find the cut: keep the longest suffix that fits the low-water target,
         // never resurrecting messages an existing summary already covers, and
         // always keeping at least the last two messages verbatim.
+        let summary_reserve = (SUMMARY_MAX_CHARS.div_ceil(4) + 4).min(low_water);
+        let recent_budget = low_water.saturating_sub(summary_reserve);
         let mut used = 0usize;
         let mut cut = body.len();
         for (index, message) in body.iter().enumerate().rev() {
@@ -262,7 +273,7 @@ impl ContextEngine {
     pub fn compact_now(
         &self,
         messages: &[ConversationMessage],
-        backend: &DirectCodexBackend,
+        backend: &ModelGateway,
         cancel: &crate::cancel::CancelToken,
     ) -> Result<ManualCompaction> {
         self.compact_now_with_summarizer(messages, |prompt| {
@@ -518,6 +529,28 @@ mod tests {
         let second = engine.summary().unwrap();
         assert!(second.covers > first_covers);
         assert!(prepared[1].content.contains("extended summary"));
+    }
+
+    #[test]
+    fn automatic_compaction_leaves_headroom_before_refreshing_summary() {
+        let engine = ContextEngine::with_max_tokens(1_000);
+        let mut messages = vec![message("system", "permissions")];
+        for index in 0..8 {
+            messages.push(message("user", &format!("q{index} {}", long_text(200))));
+        }
+
+        let first = engine.prepare_with_summarizer(&messages, |_| Ok("stable summary".to_string()));
+        let first_summary = engine.summary().expect("summary created");
+        assert!(first[1].content.contains("stable summary"));
+
+        messages.push(message("assistant", "one small follow-up"));
+        let second = engine.prepare_with_summarizer(&messages, |_| {
+            panic!("low-water compaction should leave room for a small follow-up")
+        });
+
+        assert_eq!(engine.summary(), Some(first_summary));
+        assert!(second[1].content.contains("stable summary"));
+        assert_eq!(second.last().unwrap().content, "one small follow-up");
     }
 
     #[test]

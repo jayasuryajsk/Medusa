@@ -5,8 +5,13 @@ use std::{
 };
 
 use color_eyre::eyre::{Result, WrapErr, bail};
+use medusa_core::auth::load_codex_oauth_credentials;
+use medusa_core::credentials::CredentialStore;
 use medusa_core::mcp::McpRegistry;
-use medusa_core::model::{ConversationMessage, DirectCodexBackend, ModelStreamEvent};
+use medusa_core::model::{
+    ConversationMessage, ModelGateway, ModelStreamEvent,
+    provider::{ProviderAuth, ProviderRegistry, canonical_provider_id},
+};
 use medusa_core::permissions::PermissionMode;
 use medusa_core::session::SessionOpenMode;
 use medusa_core::tools::ToolRuntime;
@@ -21,7 +26,15 @@ use crate::util::{abbreviate_home, clean_model_error, compact_one_line, permissi
 pub(crate) enum StartupCommand {
     Tui(SessionOpenMode),
     Headless(HeadlessOptions),
+    Auth(AuthCommand),
     Print(&'static str),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum AuthCommand {
+    List,
+    Set(String),
+    Remove(String),
 }
 
 pub(crate) const HELP_TEXT: &str = "Usage: medusa [continue [session]]
@@ -31,9 +44,12 @@ Commands:
   continue            Resume the last Medusa TUI session in this workspace
   continue <session>  Resume a specific session from .medusa/sessions
   run                 Run one non-interactive headless agent turn
+  auth list           Show configured provider credentials
+  auth set <provider> Securely store a provider API key
+  auth remove <provider>
 
 Run options:
-  --model <name>                 Override the model for this run
+  --model <provider/model>       Override the model for this run
   --permission <open|guarded|readonly>
   --json                         Print a machine-readable JSON result
   --no-stream                    Print only the final answer
@@ -43,7 +59,7 @@ If <task> is omitted, medusa run reads the task from stdin.";
 pub(crate) const RUN_HELP_TEXT: &str = "Usage: medusa run [options] [--] <task>
 
 Options:
-  --model <name>                 Override the model for this run
+  --model <provider/model>       Override the model for this run
   --permission <open|guarded|readonly>
   --json                         Print a machine-readable JSON result
   --no-stream                    Print only the final answer
@@ -88,6 +104,7 @@ pub(crate) fn parse_startup_command(args: &[String]) -> Result<StartupCommand> {
             SessionOpenMode::ContinueNamed(session.to_string()),
         )),
         [command, rest @ ..] if command == "run" => parse_headless_options(rest),
+        [command, rest @ ..] if command == "auth" => parse_auth_command(rest),
         [command] if command == "--help" || command == "-h" => Ok(StartupCommand::Print(HELP_TEXT)),
         [command] if command == "--version" || command == "-V" => {
             Ok(StartupCommand::Print(VERSION_TEXT))
@@ -97,6 +114,81 @@ pub(crate) fn parse_startup_command(args: &[String]) -> Result<StartupCommand> {
             "too many arguments (usage: medusa [continue [session]] | medusa run [options] [--] <task>)"
         ),
     }
+}
+
+fn parse_auth_command(args: &[String]) -> Result<StartupCommand> {
+    match args {
+        [] => Ok(StartupCommand::Auth(AuthCommand::List)),
+        [action] if action == "list" => Ok(StartupCommand::Auth(AuthCommand::List)),
+        [action, provider] if action == "set" => Ok(StartupCommand::Auth(AuthCommand::Set(
+            canonical_provider_id(provider),
+        ))),
+        [action, provider] if action == "remove" || action == "delete" => Ok(StartupCommand::Auth(
+            AuthCommand::Remove(canonical_provider_id(provider)),
+        )),
+        [action] if action == "--help" || action == "-h" => Ok(StartupCommand::Print(
+            "Usage: medusa auth [list | set <provider> | remove <provider>]",
+        )),
+        _ => bail!("usage: medusa auth [list | set <provider> | remove <provider>]"),
+    }
+}
+
+pub(crate) fn run_auth(command: AuthCommand) -> Result<()> {
+    let cwd = env::current_dir().unwrap_or_else(|_| Path::new(".").to_path_buf());
+    let registry = ProviderRegistry::load(&cwd)?;
+    let store = CredentialStore::load();
+    match command {
+        AuthCommand::List => {
+            for provider in registry.providers() {
+                let status = match provider.auth {
+                    ProviderAuth::CodexOauth => {
+                        if load_codex_oauth_credentials().is_ok() {
+                            "ready"
+                        } else {
+                            "missing"
+                        }
+                    }
+                    ProviderAuth::Bearer => {
+                        if store.api_key(provider).is_some() {
+                            "ready"
+                        } else {
+                            "missing"
+                        }
+                    }
+                    ProviderAuth::None => "not required",
+                };
+                println!("{:<12} {:<18} {status}", provider.id, provider.display_name);
+            }
+        }
+        AuthCommand::Set(provider_id) => {
+            let provider = registry.provider(&provider_id).ok_or_else(|| {
+                color_eyre::eyre::eyre!(
+                    "unknown provider `{provider_id}`; add it to .medusa/providers.json first"
+                )
+            })?;
+            if provider.auth != ProviderAuth::Bearer {
+                bail!(
+                    "{} does not use a stored API key ({})",
+                    provider.display_name,
+                    provider.auth_hint()
+                );
+            }
+            let key = rpassword::prompt_password(format!("{} API key: ", provider.display_name))?;
+            if key.trim().is_empty() {
+                bail!("API key cannot be empty");
+            }
+            store.store_api_key(&provider.id, &key)?;
+            println!("Stored {} credentials.", provider.display_name);
+        }
+        AuthCommand::Remove(provider_id) => {
+            if store.remove(&provider_id)? {
+                println!("Removed credentials for {provider_id}.");
+            } else {
+                println!("No stored credentials for {provider_id}.");
+            }
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn parse_headless_options(args: &[String]) -> Result<StartupCommand> {
@@ -199,7 +291,7 @@ pub(crate) fn run_headless(options: HeadlessOptions) -> Result<()> {
         .unwrap_or_else(|| settings.permission_mode());
     let tools = tools.with_permission_mode(permission_mode);
     let mut backend =
-        DirectCodexBackend::new(tools.workspace().to_path_buf()).wrap_err("HTTP client builds")?;
+        ModelGateway::new(tools.workspace().to_path_buf()).wrap_err("HTTP client builds")?;
 
     let model_override = options.model.clone().or_else(|| {
         if env::var_os("MEDUSA_MODEL").is_none() {
@@ -209,7 +301,9 @@ pub(crate) fn run_headless(options: HeadlessOptions) -> Result<()> {
         }
     });
     if let Some(model) = model_override {
-        backend.set_model_name(model);
+        backend
+            .try_set_model_name(model)
+            .wrap_err("invalid model selection")?;
     }
 
     let task = read_headless_task(&options)?;

@@ -75,6 +75,7 @@ impl App {
             self.last_turn_runtime = Some(tools.clone());
         }
         let history = self.conversation_history();
+        let session_state = self.session_state_context_text();
         let context_engine = self.context_engine.clone();
         let plan_mode = self.plan_mode;
         let (sender, receiver) = mpsc::channel();
@@ -84,7 +85,8 @@ impl App {
             // Compaction may call the model to summarize old history, so it
             // runs here on the worker thread, never on the UI thread. It
             // shares the turn's cancel token so Esc interrupts it too.
-            let prompt = context_engine.prepare(&history, &backend, &cancel);
+            let mut prompt = context_engine.prepare(&history, &backend, &cancel);
+            insert_runtime_session_state(&mut prompt, session_state);
             let result = if permission_mode == PermissionMode::Readonly || plan_mode {
                 backend.chat_stream_messages_read_only(&prompt, tools, |event| {
                     sender.send(event).map_err(|error| {

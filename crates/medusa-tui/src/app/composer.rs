@@ -611,7 +611,11 @@ impl App {
             return;
         };
 
-        self.model.set_model_name(model.clone());
+        if let Err(error) = self.model.try_set_model_name(model.clone()) {
+            self.toast(format!("Model unavailable: {error}"), ToastKind::Error);
+            self.status_line = "model unchanged".to_string();
+            return;
+        }
         self.model.set_reasoning_effort(effort.clone());
         self.model_selection = model_index(&model);
         self.reasoning_selection = reasoning_index(&model, &effort);

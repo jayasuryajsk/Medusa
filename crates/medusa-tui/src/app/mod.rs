@@ -33,7 +33,6 @@ pub(super) use ratatui::{
 };
 
 pub(super) use medusa_core::agents::AgentRegistry;
-pub(super) use medusa_core::auth::probe_codex_auth;
 pub(super) use medusa_core::cancel::{CancelToken, error_is_cancellation};
 pub(super) use medusa_core::checkpoint::{
     CheckpointEntry, CheckpointMeta, CheckpointRecorder, CheckpointStore, CheckpointSummary,
@@ -42,7 +41,7 @@ pub(super) use medusa_core::checkpoint::{
 pub(super) use medusa_core::context::{ContextEngine, ManualCompaction};
 pub(super) use medusa_core::mcp::{McpRegistry, McpServerStateLabel, McpServerStatus};
 pub(super) use medusa_core::model::{
-    ConversationMessage, DirectCodexBackend, ModelStreamEvent, TokenUsage,
+    ConversationMessage, ModelGateway, ModelStreamEvent, TokenUsage,
 };
 pub(super) use medusa_core::permissions::PermissionMode;
 pub(super) use medusa_core::persistence::atomic_write_private;
@@ -100,7 +99,7 @@ pub(crate) struct App {
     /// Snapshot rendered by the /agents modal, reloaded from .medusa/agents
     /// each time the command runs so file edits show up without a restart.
     agent_registry: AgentRegistry,
-    model: DirectCodexBackend,
+    model: ModelGateway,
     context_engine: ContextEngine,
     plan_mode: bool,
     model_enabled: bool,

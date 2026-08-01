@@ -9,13 +9,6 @@ pub(crate) const IMAGE_PREVIEW_MAX_ZOOM: u16 = 300;
 pub(crate) const IMAGE_PREVIEW_ZOOM_STEP: u16 = 25;
 pub(crate) const CHAT_BOTTOM_PADDING_ROWS: usize = 1;
 pub(crate) const MIN_TOOL_PULSE_VISIBLE: Duration = Duration::from_millis(650);
-pub(crate) const DEFAULT_MODEL_CHOICES: &[&str] = &[
-    "gpt-5.5",
-    "gpt-5.3-codex",
-    "gpt-5.3",
-    "gpt-5.1-codex",
-    "deepseek-v4-flash",
-];
 pub(crate) const SESSION_STATE_MAX_INTENTS: usize = 8;
 pub(crate) const SESSION_STATE_MAX_OUTCOMES: usize = 8;
 pub(crate) const SESSION_STATE_MAX_SYSTEM_NOTES: usize = 6;

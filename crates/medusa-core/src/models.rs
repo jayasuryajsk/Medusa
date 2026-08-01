@@ -1,4 +1,4 @@
-//! Model catalog sourced from Codex's own backend model list.
+//! Provider-neutral model catalog.
 //!
 //! The Codex CLI fetches the account's available models from its backend and
 //! caches them in `$CODEX_HOME/models_cache.json` (refreshed periodically).
@@ -9,7 +9,7 @@
 //! provider, a fresh install, or a machine without the Codex CLI), callers
 //! fall back to their built-in defaults.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
@@ -19,7 +19,7 @@ use crate::auth::codex_home;
 /// picker needs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelInfo {
-    /// The wire slug sent to the backend, e.g. `gpt-5.6-sol`.
+    /// Canonical picker ID, e.g. `codex/gpt-5.6-sol`.
     pub slug: String,
     /// Human label, e.g. `GPT-5.6-Sol`. Falls back to the slug.
     pub display_name: String,
@@ -34,7 +34,8 @@ pub struct ModelInfo {
 /// A selectable reasoning effort for a model, with the backend's description.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReasoningLevel {
-    /// Wire value sent as `reasoning.effort`, e.g. `medium`, `xhigh`.
+    /// User-facing effort or orchestration preset. The active protocol adapter
+    /// translates it to the provider's wire value.
     pub effort: String,
     /// One-line description from the backend, when provided.
     pub description: Option<String>,
@@ -44,11 +45,46 @@ pub struct ReasoningLevel {
 /// (non-Codex providers, missing cache). `none` disables reasoning.
 pub const DEFAULT_REASONING_EFFORTS: &[&str] = &["none", "low", "medium", "high", "xhigh"];
 
+/// Merge built-in provider models, the Codex account catalog, global provider
+/// configuration, and workspace provider configuration into one picker list.
+pub fn provider_models(workspace: &Path) -> Vec<ModelInfo> {
+    crate::model::provider::ProviderRegistry::load(workspace)
+        .unwrap_or_else(|_| crate::model::provider::ProviderRegistry::builtins())
+        .model_catalog()
+}
+
+pub fn provider_model(reference: &str, workspace: &Path) -> Option<ModelInfo> {
+    let normalized = if reference.contains('/') {
+        reference.to_string()
+    } else {
+        format!("codex/{reference}")
+    };
+    provider_models(workspace)
+        .into_iter()
+        .find(|model| model.slug == normalized)
+}
+
+pub fn model_capabilities(
+    reference: &str,
+    workspace: &Path,
+) -> crate::model::provider::ModelCapabilities {
+    crate::model::provider::ProviderRegistry::load(workspace)
+        .unwrap_or_else(|_| crate::model::provider::ProviderRegistry::builtins())
+        .capabilities_for(reference)
+        .unwrap_or_default()
+}
+
 /// The reasoning efforts selectable for a model slug: the backend's per-model
 /// list when known, else the standard defaults. Always non-empty.
-pub fn reasoning_efforts_for(slug: &str) -> Vec<ReasoningLevel> {
-    codex_backend_models()
-        .and_then(|models| models.into_iter().find(|model| model.slug == slug))
+pub fn reasoning_efforts_for(reference: &str) -> Vec<ReasoningLevel> {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    if !model_capabilities(reference, &cwd).reasoning {
+        return vec![ReasoningLevel {
+            effort: "none".to_string(),
+            description: Some("This model does not expose configurable reasoning.".to_string()),
+        }];
+    }
+    provider_model(reference, &cwd)
         .map(|model| model.reasoning_levels)
         .filter(|levels| !levels.is_empty())
         .unwrap_or_else(|| {

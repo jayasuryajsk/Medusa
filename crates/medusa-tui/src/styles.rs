@@ -446,14 +446,15 @@ pub(crate) fn reasoning_detail_lines(
     lines
 }
 
-pub(crate) fn model_backend_hint(model: &str) -> &'static str {
-    let normalized = model.trim().to_ascii_lowercase();
-    if normalized.starts_with("deepseek") {
-        "deepseek · requires DEEPSEEK_API_KEY"
-    } else if normalized.starts_with("gpt-") {
-        "codex · uses Codex OAuth"
-    } else {
-        "inferred from MEDUSA_PROVIDER"
+pub(crate) fn model_backend_hint(model: &str) -> String {
+    let provider = model.split_once('/').map(|(provider, _)| provider);
+    match provider {
+        Some("codex") => "Codex provider · uses Codex OAuth".to_string(),
+        Some("deepseek") => "DeepSeek provider · API key required".to_string(),
+        Some("openai") => "OpenAI provider · API key required".to_string(),
+        Some("ollama" | "lmstudio") => "Local provider · no credentials required".to_string(),
+        Some(provider) => format!("{provider} provider · see /auth for status"),
+        None => "legacy model id · resolved through the active provider".to_string(),
     }
 }
 

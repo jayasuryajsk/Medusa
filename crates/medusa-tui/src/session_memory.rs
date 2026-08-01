@@ -65,6 +65,25 @@ pub(crate) fn transcript_conversation_message(
     }
 }
 
+/// Insert regenerated session state immediately before the newest user turn.
+/// Call this only after persistent context compaction: the state is transient
+/// and must not participate in the compactor's message-index accounting.
+pub(crate) fn insert_runtime_session_state(
+    messages: &mut Vec<ConversationMessage>,
+    content: String,
+) {
+    let state = ConversationMessage {
+        role: "system".to_string(),
+        content,
+        attachments: Vec::new(),
+    };
+    let insert_at = messages
+        .iter()
+        .rposition(|message| message.role == "user")
+        .unwrap_or(messages.len());
+    messages.insert(insert_at, state);
+}
+
 pub(crate) fn session_state_context_text(
     transcript: &[TranscriptItem],
     recent_message_count: usize,

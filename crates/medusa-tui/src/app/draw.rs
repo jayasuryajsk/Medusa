@@ -381,16 +381,20 @@ impl App {
     /// estimate as the footer gauge and the core context engine.
     pub(super) fn build_context_report(&self) -> ContextReport {
         let chars = transcript_char_usage(&self.transcript);
-        // The header system messages conversation_history() prepends before
-        // the transcript-derived messages (permission context, rolling
-        // session state, optional plan directive).
-        let header_len = 2 + usize::from(self.plan_mode);
-        let system_tokens = self
+        // Stable leading system messages are compacted with the transcript;
+        // regenerated rolling state is inserted afterward at request time.
+        let header_len = 1 + usize::from(self.plan_mode);
+        let mut system_tokens: usize = self
             .conversation_history()
             .iter()
             .take(header_len)
             .map(medusa_core::context::message_tokens)
             .sum();
+        system_tokens += medusa_core::context::message_tokens(&ConversationMessage {
+            role: "system".to_string(),
+            content: self.session_state_context_text(),
+            attachments: Vec::new(),
+        });
         let summary = self.context_engine.summary();
 
         ContextReport {
@@ -546,7 +550,7 @@ impl App {
         let mut spans = vec![
             Span::styled(" Message ", muted().add_modifier(Modifier::BOLD)),
             Span::styled(
-                format!(" {} ", self.model.model_name()),
+                format!(" {} ", truncate(self.model.model_name(), 40)),
                 accent().add_modifier(Modifier::BOLD),
             ),
         ];

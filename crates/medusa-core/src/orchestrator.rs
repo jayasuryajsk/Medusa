@@ -4,7 +4,6 @@ use std::hash::{Hash, Hasher};
 use crate::harness::HarnessPolicy;
 
 const MAX_EVIDENCE_ENTRIES: usize = 16;
-const MAX_CHANGED_FILES: usize = 32;
 const DEFAULT_NO_PROGRESS_REPETITIONS: usize = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -23,8 +22,6 @@ pub(crate) struct TurnOrchestrator {
     verification: VerificationState,
     verification_retry_sent: bool,
     observations: Vec<String>,
-    changed_files: Vec<String>,
-    changed_file_overflow: usize,
 }
 
 impl TurnOrchestrator {
@@ -37,8 +34,6 @@ impl TurnOrchestrator {
             verification: VerificationState::Unknown,
             verification_retry_sent: false,
             observations: Vec::new(),
-            changed_files: Vec::new(),
-            changed_file_overflow: 0,
         }
     }
 
@@ -71,16 +66,6 @@ impl TurnOrchestrator {
 
         if !changed_files.is_empty() {
             self.verification = VerificationState::Unknown;
-            for path in changed_files {
-                if self.changed_files.contains(path) {
-                    continue;
-                }
-                if self.changed_files.len() < MAX_CHANGED_FILES {
-                    self.changed_files.push(path.clone());
-                } else {
-                    self.changed_file_overflow += 1;
-                }
-            }
         }
 
         if let Some(verification) = verification_state(output) {
@@ -110,37 +95,6 @@ the user's authorization, explicitly report the blocker and unfinished criterion
         }
 
         None
-    }
-
-    pub(crate) fn context(&self) -> Option<String> {
-        if self.observations.is_empty()
-            && self.changed_files.is_empty()
-            && self.verification == VerificationState::Unknown
-        {
-            return None;
-        }
-
-        let mut lines = vec!["Medusa evidence ledger for this turn:".to_string()];
-        if !self.observations.is_empty() {
-            lines.push(format!("- observed: {}", self.observations.join(" | ")));
-        }
-        if !self.changed_files.is_empty() {
-            let overflow = if self.changed_file_overflow == 0 {
-                String::new()
-            } else {
-                format!(" (+{} more)", self.changed_file_overflow)
-            };
-            lines.push(format!(
-                "- changed: {}{overflow}",
-                self.changed_files.join(", ")
-            ));
-        }
-        match self.verification {
-            VerificationState::Unknown => {}
-            VerificationState::Passed => lines.push("- post-edit verification: passed".to_string()),
-            VerificationState::Failed => lines.push("- post-edit verification: failed".to_string()),
-        }
-        Some(lines.join("\n"))
     }
 
     fn push_observation(&mut self, entry: String) {
@@ -378,12 +332,6 @@ mod tests {
 
         orchestrator.record_execution("file_read", "read src/lib.rs", "contents", false, &[]);
         assert!(orchestrator.native_mutation_allowed());
-        assert!(
-            orchestrator
-                .context()
-                .expect("evidence context")
-                .contains("src/lib.rs")
-        );
     }
 
     #[test]
