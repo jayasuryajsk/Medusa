@@ -822,7 +822,10 @@ impl ModelGateway {
         let mut headers = HeaderMap::new();
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
         headers.insert(ACCEPT, HeaderValue::from_static("text/event-stream"));
-        headers.insert(USER_AGENT, HeaderValue::from_static("medusa-tui/0.2.0"));
+        headers.insert(
+            USER_AGENT,
+            HeaderValue::from_static(concat!("medusa-tui/", env!("CARGO_PKG_VERSION"))),
+        );
 
         match provider.auth {
             provider::ProviderAuth::CodexOauth => {

@@ -5,6 +5,28 @@ semantic versioning while the public interfaces stabilize.
 
 ## Unreleased
 
+## 0.3.0 - 2026-08-01
+
+### Added
+
+- A provider-neutral model gateway with configurable providers, models,
+  credentials, endpoints, and reasoning levels.
+- Native DeepSeek Responses API support, including streaming responses,
+  reasoning content, and tool-call round trips.
+- Adaptive workflow orchestration with convergence guards for parallel agents.
+
+### Changed
+
+- Split the core engine, tool runtime, and terminal UI into focused modules to
+  make the codebase easier to maintain and extend.
+- Preserve terminal theme colors while running in full-screen mode.
+- Use the crate version automatically in model-provider HTTP user agents.
+- Streamlined the README around installation and the terminal experience.
+
+### Fixed
+
+- Theme colors now remain visible when Medusa is launched in a fresh terminal.
+
 ## 0.2.0 - 2026-07-31
 
 ### Added

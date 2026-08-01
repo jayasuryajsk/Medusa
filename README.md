@@ -55,7 +55,7 @@ Install the latest tagged release directly:
 ```sh
 cargo install --locked \
   --git https://github.com/jayasuryajsk/Medusa.git \
-  --tag v0.2.0 \
+  --tag v0.3.0 \
   medusa-tui
 ```
 
