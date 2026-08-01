@@ -444,11 +444,29 @@ fn provider_registry_upgrades_legacy_model_ids() {
 
 #[test]
 fn deepseek_reasoning_effort_maps_codex_names_to_deepseek_values() {
+    use crate::model::provider::ThinkingDialect;
+
     assert_eq!(schema::deepseek_reasoning_effort("xhigh"), "max");
     assert_eq!(schema::deepseek_reasoning_effort("max"), "max");
     assert_eq!(schema::deepseek_reasoning_effort("ultra"), "max");
     assert_eq!(schema::deepseek_reasoning_effort("medium"), "high");
-    assert_eq!(schema::deepseek_reasoning_effort("low"), "high");
+    assert_eq!(schema::deepseek_reasoning_effort("low"), "low");
+    assert_eq!(
+        schema::responses_reasoning_effort(ThinkingDialect::Deepseek, "xhigh"),
+        "max"
+    );
+    assert_eq!(
+        schema::responses_reasoning_effort(ThinkingDialect::Deepseek, "none"),
+        "none"
+    );
+    assert_eq!(
+        schema::responses_reasoning_effort(ThinkingDialect::Deepseek, "low"),
+        "low"
+    );
+    assert_eq!(
+        schema::responses_reasoning_effort(ThinkingDialect::None, "xhigh"),
+        "xhigh"
+    );
 }
 
 #[test]

@@ -128,6 +128,10 @@ OpenAI-compatible Chat Completions. The registry includes `codex`, `openai`,
 service in `.medusa/providers.json` (or globally in
 `~/.config/medusa/providers.json`):
 
+The built-in `deepseek/deepseek-v4-flash` adapter uses DeepSeek's native
+Responses API. Custom DeepSeek-compatible Chat Completions providers remain
+supported through `protocol: "openai-chat"` and `thinking: "deepseek"`.
+
 ```json
 {
   "providers": {

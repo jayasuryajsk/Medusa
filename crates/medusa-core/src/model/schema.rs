@@ -629,7 +629,22 @@ pub(crate) fn deepseek_reasoning_effort(effort: &str) -> &'static str {
         .as_str()
     {
         "xhigh" | "max" | "ultra" => "max",
+        "minimal" | "low" => "low",
         _ => "high",
+    }
+}
+
+pub(crate) fn responses_reasoning_effort(
+    dialect: crate::model::provider::ThinkingDialect,
+    effort: &str,
+) -> &str {
+    if effort.trim().eq_ignore_ascii_case("none") {
+        return effort;
+    }
+
+    match dialect {
+        crate::model::provider::ThinkingDialect::Deepseek => deepseek_reasoning_effort(effort),
+        _ => codex_reasoning_effort(effort),
     }
 }
 

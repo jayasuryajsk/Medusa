@@ -949,7 +949,8 @@ impl ModelGateway {
             body["parallel_tool_calls"] = json!(capabilities.parallel_tools);
         }
 
-        let wire_effort = schema::codex_reasoning_effort(&self.reasoning_effort);
+        let wire_effort =
+            schema::responses_reasoning_effort(provider.thinking, &self.reasoning_effort);
         if capabilities.reasoning && !wire_effort.eq_ignore_ascii_case("none") {
             body["reasoning"] = json!({
                 "effort": wire_effort,

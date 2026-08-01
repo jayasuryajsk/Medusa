@@ -682,20 +682,19 @@ fn openai_provider() -> ProviderDefinition {
 fn deepseek_provider() -> ProviderDefinition {
     let capabilities = ModelCapabilities::coding_default();
     let mut models = BTreeMap::new();
-    models.insert(
-        "deepseek-v4-flash".to_string(),
-        configured_model(
-            "deepseek-v4-flash",
-            "DeepSeek V4 Flash",
-            "DeepSeek OpenAI-compatible chat model",
-            &["none", "high", "max"],
-            capabilities,
-        ),
+    let mut flash = configured_model(
+        "deepseek-v4-flash",
+        "DeepSeek V4 Flash",
+        "DeepSeek native Responses API model",
+        &["none", "low", "high", "max"],
+        capabilities,
     );
+    flash.default_reasoning = Some("high".to_string());
+    models.insert("deepseek-v4-flash".to_string(), flash);
     ProviderDefinition {
         id: "deepseek".to_string(),
         display_name: "DeepSeek".to_string(),
-        protocol: ProviderProtocol::OpenAiChat,
+        protocol: ProviderProtocol::OpenAiResponses,
         auth: ProviderAuth::Bearer,
         base_url: env::var("MEDUSA_DEEPSEEK_BASE_URL")
             .or_else(|_| env::var("DEEPSEEK_BASE_URL"))
@@ -813,6 +812,36 @@ mod tests {
                 .unwrap()
                 .as_string(),
             "ollama/my-model"
+        );
+    }
+
+    #[test]
+    fn deepseek_builtin_uses_native_responses_api() {
+        let registry = ProviderRegistry::builtins();
+        let provider = registry.provider("deepseek").unwrap();
+
+        assert_eq!(provider.protocol, ProviderProtocol::OpenAiResponses);
+        assert_eq!(
+            provider.endpoint("responses"),
+            "https://api.deepseek.com/responses"
+        );
+        assert_eq!(
+            provider.models["deepseek-v4-flash"].description.as_deref(),
+            Some("DeepSeek native Responses API model")
+        );
+        assert_eq!(
+            provider.models["deepseek-v4-flash"]
+                .default_reasoning
+                .as_deref(),
+            Some("high")
+        );
+        assert_eq!(
+            provider.models["deepseek-v4-flash"]
+                .reasoning_levels
+                .iter()
+                .map(|level| level.effort.as_str())
+                .collect::<Vec<_>>(),
+            vec!["none", "low", "high", "max"]
         );
     }
 
