@@ -5,6 +5,28 @@ semantic versioning while the public interfaces stabilize.
 
 ## Unreleased
 
+## 0.3.1 - 2026-08-03
+
+### Added
+
+- A persistent queued-turn shelf above the composer while an agent is working.
+- Subdued reasoning rows before model answers for providers that expose
+  reasoning content.
+- Model-specific context windows, including Codex catalog metadata and the
+  DeepSeek V4 Flash context budget.
+
+### Changed
+
+- Context usage now measures the effective prompt after compaction instead of
+  the unmodified transcript.
+- Model switches immediately update the context gauge and `/context` report.
+
+### Fixed
+
+- Automatic and manual compaction now show progress, before/after token counts,
+  completion feedback, and the resulting lower context usage.
+- Queued prompts no longer disappear from view after submission.
+
 ## 0.3.0 - 2026-08-01
 
 ### Added
