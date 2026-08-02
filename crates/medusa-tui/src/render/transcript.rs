@@ -543,13 +543,35 @@ pub(crate) fn append_activity_lines(
     selected_tool: Option<usize>,
     context: RenderContext,
 ) {
+    let reasoning = transcript[start..end]
+        .iter()
+        .filter_map(|item| match item {
+            TranscriptItem::Reasoning(trace) => Some(trace.content.as_str()),
+            _ => None,
+        })
+        .collect::<String>();
+    if !reasoning.trim().is_empty() {
+        for (index, text_line) in reasoning.trim().lines().enumerate() {
+            let prefix = if index == 0 {
+                "  thinking  "
+            } else {
+                "            "
+            };
+            lines.push(Line::from(vec![
+                Span::styled(prefix, muted().add_modifier(Modifier::ITALIC)),
+                Span::styled(
+                    text_line.to_string(),
+                    muted().add_modifier(Modifier::ITALIC),
+                ),
+            ]));
+        }
+    }
+
     let has_tools = transcript[start..end]
         .iter()
         .any(|item| matches!(item, TranscriptItem::Tool(_)));
 
-    if !has_tools {
-        return;
+    if has_tools {
+        append_tool_group_lines(lines, transcript, start, end, selected_tool, context);
     }
-
-    append_tool_group_lines(lines, transcript, start, end, selected_tool, context);
 }

@@ -108,6 +108,9 @@ impl App {
                 decision.recv().unwrap_or(ApprovalDecision::Deny)
             });
 
+        let context_engine = ContextEngine::with_max_tokens(
+            medusa_core::context::context_max_tokens_for_model(model.context_window()),
+        );
         let mut app = Self {
             input: String::new(),
             input_cursor: 0,
@@ -130,7 +133,7 @@ impl App {
             mcp,
             mcp_statuses: Vec::new(),
             agent_registry: AgentRegistry::default(),
-            context_engine: ContextEngine::new(),
+            context_engine,
             plan_mode: false,
             last_escape_at: None,
             model,
@@ -187,6 +190,8 @@ impl App {
             last_turn_requests: 0,
             context_report: None,
             compact_events: None,
+            compaction_active: false,
+            last_compaction: None,
             active_checkpoint: None,
             #[cfg(test)]
             last_turn_runtime: None,

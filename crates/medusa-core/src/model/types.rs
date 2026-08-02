@@ -65,6 +65,14 @@ impl TokenUsage {
 pub enum ModelStreamEvent {
     Delta(String),
     ReasoningDelta(String),
+    CompactionStarted {
+        before_tokens: usize,
+    },
+    CompactionFinished {
+        before_tokens: usize,
+        after_tokens: usize,
+        folded_messages: usize,
+    },
     ToolStart {
         call_id: String,
         name: String,

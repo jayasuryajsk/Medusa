@@ -261,6 +261,7 @@ impl App {
             self.touch_transcript();
             self.selected_tool = None;
             self.context_engine.reset();
+            self.last_compaction = None;
             self.toast("Session cleared", ToastKind::Warning);
             self.status_line = "cleared".to_string();
             return true;
@@ -515,6 +516,10 @@ impl App {
             return;
         }
         let model = self.model.model_name().to_string();
+        self.context_engine
+            .set_max_tokens(medusa_core::context::context_max_tokens_for_model(
+                self.model.context_window(),
+            ));
         let effort = preferred_reasoning_for_model(&model, self.model.reasoning_effort());
         self.model.set_reasoning_effort(effort.clone());
         self.model_selection = model_index(&model);

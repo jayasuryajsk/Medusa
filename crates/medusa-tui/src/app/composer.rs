@@ -617,6 +617,10 @@ impl App {
             return;
         }
         self.model.set_reasoning_effort(effort.clone());
+        self.context_engine
+            .set_max_tokens(medusa_core::context::context_max_tokens_for_model(
+                self.model.context_window(),
+            ));
         self.model_selection = model_index(&model);
         self.reasoning_selection = reasoning_index(&model, &effort);
         self.active_modal = None;

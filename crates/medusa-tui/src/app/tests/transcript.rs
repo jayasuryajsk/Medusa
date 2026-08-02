@@ -363,7 +363,7 @@ fn visible_chat_lines_distinguishes_roles() {
 }
 
 #[test]
-fn reasoning_does_not_render_as_ghost_text() {
+fn reasoning_renders_as_ghost_text_before_the_answer() {
     let transcript = vec![
         TranscriptItem::Message(ChatMessage::user("read code")),
         TranscriptItem::Message(ChatMessage::assistant("The render loop is in main.rs.")),
@@ -380,12 +380,26 @@ fn reasoning_does_not_render_as_ghost_text() {
         text.iter()
             .any(|line| line.contains("The render loop is in main.rs."))
     );
-    assert!(
-        !text
-            .iter()
-            .any(|line| line.contains("Hidden model thinking"))
-    );
-    assert!(!text.iter().any(|line| line.contains("thinking")));
+    let reasoning_index = text
+        .iter()
+        .position(|line| line.contains("Hidden model thinking"))
+        .expect("reasoning ghost row");
+    let answer_index = text
+        .iter()
+        .position(|line| line.contains("The render loop is in main.rs."))
+        .expect("assistant answer");
+    assert!(reasoning_index < answer_index);
+    assert!(text[reasoning_index].contains("thinking"));
+}
+
+#[test]
+fn queued_turn_reserves_a_visible_strip_above_the_composer() {
+    let mut app = app();
+    app.queued_turns
+        .push_back("follow up after this".to_string());
+
+    assert_eq!(app.queue_strip_height(40), 1);
+    assert_eq!(app.queue_strip_height(10), 0);
 }
 
 #[test]

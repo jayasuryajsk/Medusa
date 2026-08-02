@@ -454,6 +454,16 @@ fn model_command_switches_model_and_persists_setting() {
 }
 
 #[test]
+fn changing_model_updates_the_context_budget() {
+    let mut app = app();
+
+    app.set_model_name("deepseek/deepseek-v4-flash");
+
+    assert_eq!(app.context_engine.max_tokens(), 1_000_000);
+    assert_eq!(app.build_context_report().budget, 1_000_000);
+}
+
+#[test]
 fn selecting_model_from_palette_opens_model_picker() {
     let mut app = app();
 

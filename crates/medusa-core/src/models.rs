@@ -29,6 +29,8 @@ pub struct ModelInfo {
     pub default_reasoning: Option<String>,
     /// Reasoning efforts this model accepts, in the backend's order.
     pub reasoning_levels: Vec<ReasoningLevel>,
+    /// Effective context window advertised by the provider, in tokens.
+    pub context_window: Option<usize>,
 }
 
 /// A selectable reasoning effort for a model, with the backend's description.
@@ -125,6 +127,10 @@ struct CachedModel {
     priority: i64,
     #[serde(default)]
     supported_reasoning_levels: Vec<CachedReasoningLevel>,
+    #[serde(default)]
+    context_window: Option<usize>,
+    #[serde(default)]
+    effective_context_window_percent: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -194,6 +200,10 @@ fn parse_codex_models(raw: &str) -> Option<Vec<ModelInfo>> {
                             description: level.description.filter(|text| !text.trim().is_empty()),
                         })
                         .collect(),
+                    context_window: model.context_window.map(|window| {
+                        window.saturating_mul(model.effective_context_window_percent.unwrap_or(100))
+                            / 100
+                    }),
                 },
             )
         })
@@ -216,7 +226,7 @@ mod tests {
     const SAMPLE: &str = r#"{
         "fetched_at": "2026-07-11T04:40:46Z",
         "models": [
-            {"slug":"gpt-5.5","display_name":"GPT-5.5","description":"Frontier model.","default_reasoning_level":"medium","visibility":"list","supported_in_api":true,"priority":0,
+            {"slug":"gpt-5.5","display_name":"GPT-5.5","description":"Frontier model.","default_reasoning_level":"medium","visibility":"list","supported_in_api":true,"priority":0,"context_window":272000,"effective_context_window_percent":95,
              "supported_reasoning_levels":[{"effort":"low","description":"Fast"},{"effort":"medium"},{"effort":"high"},{"effort":"xhigh"}]},
             {"slug":"gpt-5.6-sol","display_name":"GPT-5.6-Sol","description":"Latest.","default_reasoning_level":"medium","visibility":"list","supported_in_api":true,"priority":1},
             {"slug":"gpt-5.3-codex-spark","display_name":"Spark","visibility":"list","supported_in_api":false,"priority":26},
@@ -233,6 +243,7 @@ mod tests {
         assert_eq!(models[1].display_name, "GPT-5.6-Sol");
         assert_eq!(models[0].description.as_deref(), Some("Frontier model."));
         assert_eq!(models[0].default_reasoning.as_deref(), Some("medium"));
+        assert_eq!(models[0].context_window, Some(258_400));
     }
 
     #[test]

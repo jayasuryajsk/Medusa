@@ -85,7 +85,31 @@ impl App {
             // Compaction may call the model to summarize old history, so it
             // runs here on the worker thread, never on the UI thread. It
             // shares the turn's cancel token so Esc interrupts it too.
+            let before_tokens = context_engine.effective_tokens(&history);
+            let before_covers = context_engine
+                .summary()
+                .map(|summary| summary.covers)
+                .unwrap_or(0);
+            let will_compact = context_engine.will_compact(&history);
+            if will_compact {
+                let _ = sender.send(ModelStreamEvent::CompactionStarted { before_tokens });
+            }
             let mut prompt = context_engine.prepare(&history, &backend, &cancel);
+            if will_compact {
+                let after_tokens = prompt
+                    .iter()
+                    .map(medusa_core::context::message_tokens)
+                    .sum();
+                let after_covers = context_engine
+                    .summary()
+                    .map(|summary| summary.covers)
+                    .unwrap_or(before_covers);
+                let _ = sender.send(ModelStreamEvent::CompactionFinished {
+                    before_tokens,
+                    after_tokens,
+                    folded_messages: after_covers.saturating_sub(before_covers),
+                });
+            }
             insert_runtime_session_state(&mut prompt, session_state);
             let result = if permission_mode == PermissionMode::Readonly || plan_mode {
                 backend.chat_stream_messages_read_only(&prompt, tools, |event| {
@@ -289,6 +313,7 @@ impl App {
         let backend = self.model.clone();
         let (sender, receiver) = mpsc::channel();
         self.compact_events = Some(receiver);
+        self.compaction_active = true;
         self.status_line = "compacting context…".to_string();
 
         thread::spawn(move || {
@@ -310,8 +335,10 @@ impl App {
             Err(TryRecvError::Disconnected) => Err("compaction worker exited".to_string()),
         };
         self.compact_events = None;
+        self.compaction_active = false;
         match outcome {
             Ok(compaction) => {
+                self.last_compaction = Some((compaction, Instant::now()));
                 self.status_line = "context compacted".to_string();
                 self.toast(
                     format!(
@@ -379,6 +406,8 @@ impl App {
 
     pub(super) fn has_active_animation(&self) -> bool {
         self.is_working()
+            || self.compact_events.is_some()
+            || self.compaction_active
             || self.has_active_workflows()
             || self.has_running_tool_rows()
             || self.has_running_workflow_rows()
@@ -593,9 +622,46 @@ impl App {
                 }
                 Ok(ModelStreamEvent::ReasoningDelta(delta)) => {
                     changed = true;
-                    let _ = delta;
                     self.flush_stream_delta(&mut delta_buffer);
+                    self.append_reasoning_delta(&delta);
+                    self.status_line = self.scoped_status("thinking");
                     self.stick_chat_to_bottom_if_needed();
+                }
+                Ok(ModelStreamEvent::CompactionStarted { before_tokens }) => {
+                    changed = true;
+                    self.compaction_active = true;
+                    self.status_line = format!(
+                        "compacting context · {}",
+                        format_token_count(before_tokens as u64)
+                    );
+                }
+                Ok(ModelStreamEvent::CompactionFinished {
+                    before_tokens,
+                    after_tokens,
+                    folded_messages,
+                }) => {
+                    changed = true;
+                    self.compaction_active = false;
+                    let compaction = ManualCompaction {
+                        before_tokens,
+                        after_tokens,
+                        folded_messages,
+                    };
+                    self.last_compaction = Some((compaction, Instant::now()));
+                    self.status_line = format!(
+                        "context compacted · {} → {}",
+                        format_token_count(before_tokens as u64),
+                        format_token_count(after_tokens as u64)
+                    );
+                    self.toast(
+                        format!(
+                            "Context compacted: {} → {} ({} messages folded)",
+                            format_token_count(before_tokens as u64),
+                            format_token_count(after_tokens as u64),
+                            folded_messages
+                        ),
+                        ToastKind::Success,
+                    );
                 }
                 Ok(ModelStreamEvent::ToolStart {
                     call_id,
@@ -783,9 +849,12 @@ impl App {
 
         if keep_receiver {
             self.model_events = Some(receiver);
-        } else if turn_finished {
-            self.finish_turn_checkpoint();
-            self.start_next_queued_turn();
+        } else {
+            self.compaction_active = false;
+            if turn_finished {
+                self.finish_turn_checkpoint();
+                self.start_next_queued_turn();
+            }
         }
 
         changed

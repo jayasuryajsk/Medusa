@@ -577,6 +577,8 @@ impl WorkflowRuntime {
                         }
                     }
                     ModelStreamEvent::ReasoningDelta(_)
+                    | ModelStreamEvent::CompactionStarted { .. }
+                    | ModelStreamEvent::CompactionFinished { .. }
                     | ModelStreamEvent::Workflow(_)
                     | ModelStreamEvent::Usage(_)
                     | ModelStreamEvent::Done { .. }

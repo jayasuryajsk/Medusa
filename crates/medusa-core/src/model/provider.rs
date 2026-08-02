@@ -131,6 +131,7 @@ pub struct ProviderModel {
     pub default_reasoning: Option<String>,
     pub reasoning_levels: Vec<ReasoningLevel>,
     pub capabilities: ModelCapabilities,
+    pub context_window: Option<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -294,6 +295,7 @@ impl ProviderRegistry {
                         } else {
                             Vec::new()
                         },
+                        context_window: None,
                     });
                 }
             }
@@ -306,6 +308,7 @@ impl ProviderRegistry {
                         description: model.description.clone(),
                         default_reasoning: model.default_reasoning.clone(),
                         reasoning_levels: model.reasoning_levels.clone(),
+                        context_window: model.context_window,
                     });
                 }
             }
@@ -458,6 +461,11 @@ impl ProviderRegistry {
                         .capabilities
                         .or_else(|| existing_model.as_ref().map(|entry| entry.capabilities))
                         .unwrap_or(provider.capabilities),
+                    context_window: model.context_window.or_else(|| {
+                        existing_model
+                            .as_ref()
+                            .and_then(|entry| entry.context_window)
+                    }),
                 },
             );
         }
@@ -496,6 +504,7 @@ struct ProviderModelConfig {
     default_reasoning: Option<String>,
     reasoning: Option<Vec<String>>,
     capabilities: Option<ModelCapabilities>,
+    context_window: Option<usize>,
 }
 
 fn provider_config_paths(workspace: &Path) -> Vec<PathBuf> {
@@ -590,6 +599,7 @@ fn configured_model(
             reasoning.iter().map(|value| (*value).to_string()).collect(),
         ),
         capabilities,
+        context_window: None,
     }
 }
 
@@ -610,6 +620,7 @@ fn codex_provider() -> ProviderDefinition {
                     default_reasoning: model.default_reasoning,
                     reasoning_levels: model.reasoning_levels,
                     capabilities,
+                    context_window: model.context_window,
                 },
             );
         }
@@ -690,6 +701,7 @@ fn deepseek_provider() -> ProviderDefinition {
         capabilities,
     );
     flash.default_reasoning = Some("high".to_string());
+    flash.context_window = Some(1_000_000);
     models.insert("deepseek-v4-flash".to_string(), flash);
     ProviderDefinition {
         id: "deepseek".to_string(),
@@ -842,6 +854,10 @@ mod tests {
                 .map(|level| level.effort.as_str())
                 .collect::<Vec<_>>(),
             vec!["none", "low", "high", "max"]
+        );
+        assert_eq!(
+            provider.models["deepseek-v4-flash"].context_window,
+            Some(1_000_000)
         );
     }
 

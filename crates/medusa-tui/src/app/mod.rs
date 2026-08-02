@@ -171,6 +171,12 @@ pub(crate) struct App {
     context_report: Option<ContextReport>,
     /// Result channel for a background /compact run; None while idle.
     compact_events: Option<Receiver<Result<ManualCompaction, String>>>,
+    /// Automatic compaction runs inside the active model worker and reports
+    /// its lifecycle through ModelStreamEvent.
+    compaction_active: bool,
+    /// Most recent successful manual or automatic compaction, retained long
+    /// enough for the footer and context modal to explain the changed gauge.
+    last_compaction: Option<(ManualCompaction, Instant)>,
     /// Recorder for the turn currently streaming; finished on turn end.
     active_checkpoint: Option<CheckpointRecorder>,
     /// Test-only capture of the exact `ToolRuntime` handed to the last model

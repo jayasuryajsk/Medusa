@@ -46,6 +46,13 @@ pub fn baseline_instructions_tokens(workspace: &std::path::Path) -> usize {
 }
 
 pub fn context_max_tokens() -> usize {
+    context_max_tokens_for_model(None)
+}
+
+/// Resolve the usable context budget for the selected model. Explicit user
+/// overrides win; otherwise use the provider's advertised window and finally
+/// Medusa's conservative fallback for unknown/custom models.
+pub fn context_max_tokens_for_model(model_window: Option<usize>) -> usize {
     if let Some(tokens) = std::env::var("MEDUSA_CONTEXT_MAX_TOKENS")
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
@@ -63,7 +70,9 @@ pub fn context_max_tokens() -> usize {
         return chars / 4;
     }
 
-    DEFAULT_CONTEXT_MAX_TOKENS
+    model_window
+        .unwrap_or(DEFAULT_CONTEXT_MAX_TOKENS)
+        .max(1_000)
 }
 
 /// Mid-turn context relief: when the growing tool-loop input exceeds the token
@@ -138,12 +147,71 @@ impl ContextEngine {
         }
     }
 
-    #[cfg(test)]
-    fn with_max_tokens(max_tokens: usize) -> Self {
+    pub fn with_max_tokens(max_tokens: usize) -> Self {
         Self {
             max_tokens,
             state: Arc::new(Mutex::new(None)),
         }
+    }
+
+    pub fn max_tokens(&self) -> usize {
+        self.max_tokens
+    }
+
+    pub fn set_max_tokens(&mut self, max_tokens: usize) {
+        self.max_tokens = max_tokens.max(1_000);
+    }
+
+    /// Estimated size of the prompt that would be sent now, including the
+    /// existing summary in place of the older messages it covers.
+    pub fn effective_tokens(&self, messages: &[ConversationMessage]) -> usize {
+        self.effective_messages(messages)
+            .iter()
+            .map(message_tokens)
+            .sum()
+    }
+
+    pub fn will_compact(&self, messages: &[ConversationMessage]) -> bool {
+        let system_prefix_len = messages
+            .iter()
+            .take_while(|message| message.role == "system")
+            .count();
+        let (prefix, body) = messages.split_at(system_prefix_len);
+        let state = self.state.lock().expect("context engine lock");
+        let summary = state
+            .as_ref()
+            .filter(|summary| summary.covers <= body.len());
+        let prefix_tokens: usize = prefix.iter().map(message_tokens).sum();
+        let available = self.max_tokens.saturating_sub(prefix_tokens);
+        let high_water = available.saturating_mul(COMPACTION_HIGH_WATER_PERCENT) / 100;
+        let base_covers = summary.map(|summary| summary.covers).unwrap_or(0);
+        let active_tokens = summary
+            .map(|summary| message_tokens(&summary_message(summary)))
+            .unwrap_or(0)
+            + body[base_covers..]
+                .iter()
+                .map(message_tokens)
+                .sum::<usize>();
+        active_tokens > high_water && body.len().saturating_sub(base_covers) > 2
+    }
+
+    fn effective_messages(&self, messages: &[ConversationMessage]) -> Vec<ConversationMessage> {
+        let system_prefix_len = messages
+            .iter()
+            .take_while(|message| message.role == "system")
+            .count();
+        let (prefix, body) = messages.split_at(system_prefix_len);
+        let state = self.state.lock().expect("context engine lock");
+        let Some(summary) = state
+            .as_ref()
+            .filter(|summary| summary.covers <= body.len())
+        else {
+            return messages.to_vec();
+        };
+        let mut result = prefix.to_vec();
+        result.push(summary_message(summary));
+        result.extend_from_slice(&body[summary.covers..]);
+        result
     }
 
     /// Forget the accumulated summary (call when history is cleared or a
@@ -474,6 +542,29 @@ mod tests {
 
         assert_eq!(prepared, messages);
         assert!(engine.summary().is_none());
+    }
+
+    #[test]
+    fn effective_usage_drops_after_compaction() {
+        let engine = ContextEngine::with_max_tokens(1_000);
+        let mut messages = vec![message("system", "permissions")];
+        for index in 0..8 {
+            messages.push(message("user", &format!("q{index} {}", long_text(200))));
+            messages.push(message(
+                "assistant",
+                &format!("a{index} {}", long_text(200)),
+            ));
+        }
+        let before = engine.effective_tokens(&messages);
+        assert!(engine.will_compact(&messages));
+
+        let prepared =
+            engine.prepare_with_summarizer(&messages, |_| Ok("dense summary".to_string()));
+        let after = engine.effective_tokens(&messages);
+
+        assert!(after < before);
+        assert_eq!(after, prepared.iter().map(message_tokens).sum::<usize>());
+        assert!(!engine.will_compact(&messages));
     }
 
     #[test]

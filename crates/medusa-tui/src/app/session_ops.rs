@@ -43,6 +43,7 @@ impl App {
                 let name = session.current_id();
                 self.transcript = transcript;
                 self.context_engine.reset();
+                self.last_compaction = None;
                 self.touch_transcript();
                 self.selected_tool = None;
                 self.streaming_message = None;
@@ -338,6 +339,7 @@ impl App {
                 self.selected_tool = None;
                 self.streaming_message = None;
                 self.context_engine.reset();
+                self.last_compaction = None;
                 self.scroll_chat_to_bottom();
                 self.input = old_prompt;
                 self.input_cursor = self.input_len();

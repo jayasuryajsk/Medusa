@@ -1,6 +1,22 @@
 use super::*;
 
 impl App {
+    pub(super) fn append_reasoning_delta(&mut self, delta: &str) {
+        if delta.is_empty() {
+            return;
+        }
+        match self.transcript.last_mut() {
+            Some(TranscriptItem::Reasoning(trace)) => trace.content.push_str(delta),
+            _ => self
+                .transcript
+                .push(TranscriptItem::Reasoning(ReasoningTrace {
+                    content: delta.to_string(),
+                    expanded: false,
+                })),
+        }
+        self.touch_transcript();
+    }
+
     pub(super) fn flush_stream_delta(&mut self, delta_buffer: &mut String) {
         if delta_buffer.is_empty() {
             return;

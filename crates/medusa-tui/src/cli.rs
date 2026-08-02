@@ -446,6 +446,18 @@ pub(crate) fn handle_headless_event(
                 eprintln!("reasoning: {}", compact_one_line(&delta, 160));
             }
         }
+        ModelStreamEvent::CompactionStarted { before_tokens } => {
+            eprintln!("compacting context ({before_tokens} estimated tokens)...");
+        }
+        ModelStreamEvent::CompactionFinished {
+            before_tokens,
+            after_tokens,
+            folded_messages,
+        } => {
+            eprintln!(
+                "context compacted: {before_tokens} -> {after_tokens} estimated tokens ({folded_messages} messages folded)"
+            );
+        }
         ModelStreamEvent::ToolStart { name, summary, .. } => {
             if !options.json {
                 eprintln!("tool start: {name} · {}", compact_one_line(&summary, 180));

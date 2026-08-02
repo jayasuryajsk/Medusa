@@ -762,7 +762,10 @@ fn interleaved_reasoning_and_tools_render_as_one_batch() {
         text.iter()
             .any(|line| line.contains("terminal $ rg TODO, $ sed -n '1,80p' README.md"))
     );
-    assert!(!text.iter().any(|line| line.contains("thinking")));
+    assert!(
+        text.iter()
+            .any(|line| line.contains("thinking") && line.contains("Reading matching files"))
+    );
 }
 
 #[test]

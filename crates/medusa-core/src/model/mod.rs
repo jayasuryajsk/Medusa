@@ -180,6 +180,13 @@ impl ModelGateway {
             .unwrap_or_default()
     }
 
+    pub fn context_window(&self) -> Option<usize> {
+        self.provider_definition()
+            .ok()
+            .and_then(|provider| provider.models.get(self.wire_model_name()))
+            .and_then(|model| model.context_window)
+    }
+
     pub fn available_models(&self) -> Vec<crate::models::ModelInfo> {
         self.registry.model_catalog()
     }

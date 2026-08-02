@@ -14,12 +14,14 @@ impl App {
         });
         let input_height = self.input_height(area.height);
         let plan_height = self.plan_strip_height(area.height);
+        let queue_height = self.queue_strip_height(area.height);
         let sections = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Length(2),
                 Constraint::Min(5),
                 Constraint::Length(plan_height),
+                Constraint::Length(queue_height),
                 Constraint::Length(input_height),
                 Constraint::Length(1),
             ])
@@ -28,8 +30,9 @@ impl App {
         self.draw_header(frame, sections[0]);
         self.draw_workspace(frame, sections[1]);
         self.draw_plan_strip(frame, sections[2]);
-        self.draw_input(frame, sections[3]);
-        self.draw_status(frame, sections[4]);
+        self.draw_queue_strip(frame, sections[3]);
+        self.draw_input(frame, sections[4]);
+        self.draw_status(frame, sections[5]);
         if self.active_modal.is_none() {
             self.draw_slash_suggestions(frame, shell_area);
             self.draw_mention_suggestions(frame, shell_area);
@@ -136,7 +139,9 @@ impl App {
     }
 
     pub(super) fn header_state(&self) -> (&'static str, Style) {
-        if self.is_working() {
+        if self.compaction_active || self.compact_events.is_some() {
+            ("compacting", prompt_style())
+        } else if self.is_working() {
             ("working", tool_label_style())
         } else if self.has_active_workflows() {
             ("workflow", prompt_style())
@@ -339,6 +344,46 @@ impl App {
         );
     }
 
+    pub(super) fn queue_strip_height(&self, terminal_height: u16) -> u16 {
+        if self.queued_turns.is_empty() || terminal_height < 12 {
+            0
+        } else {
+            1
+        }
+    }
+
+    pub(super) fn draw_queue_strip(&self, frame: &mut Frame<'_>, area: Rect) {
+        if area.height == 0 {
+            return;
+        }
+        let Some(next) = self.queued_turns.front() else {
+            return;
+        };
+        let more = self.queued_turns.len().saturating_sub(1);
+        let suffix = if more == 0 {
+            String::new()
+        } else {
+            format!("  +{more} more")
+        };
+        let available = area.width.saturating_sub(18) as usize;
+        let line = Line::from(vec![
+            Span::styled(
+                format!(" queued {} ", self.queued_turns.len()),
+                Style::default()
+                    .fg(palette().selected_fg)
+                    .bg(accent_color())
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("  › ", prompt_style()),
+            Span::styled(truncate(next, available), value_style()),
+            Span::styled(suffix, muted()),
+        ]);
+        frame.render_widget(
+            Paragraph::new(line).style(Style::default().bg(app_bg()).fg(text())),
+            area,
+        );
+    }
+
     pub(super) fn input_height(&self, terminal_height: u16) -> u16 {
         let attachment_lines = if self.pending_attachments.is_empty() {
             0
@@ -372,45 +417,49 @@ impl App {
         self.draw_footer_telemetry(frame, chunks[3]);
     }
 
-    pub(super) fn context_usage_chars(&self) -> usize {
-        transcript_char_usage(&self.transcript).total()
-    }
-
     /// Snapshot for the /context modal: estimated tokens per category, the
     /// budget, and the compaction state. Uses the same ~4 chars/token
     /// estimate as the footer gauge and the core context engine.
     pub(super) fn build_context_report(&self) -> ContextReport {
-        let chars = transcript_char_usage(&self.transcript);
         // Stable leading system messages are compacted with the transcript;
         // regenerated rolling state is inserted afterward at request time.
         let header_len = 1 + usize::from(self.plan_mode);
-        let mut system_tokens: usize = self
-            .conversation_history()
+        let history = self.conversation_history();
+        let history_system_tokens: usize = history
             .iter()
             .take(header_len)
             .map(medusa_core::context::message_tokens)
             .sum();
-        system_tokens += medusa_core::context::message_tokens(&ConversationMessage {
+        let runtime_state_tokens = medusa_core::context::message_tokens(&ConversationMessage {
             role: "system".to_string(),
             content: self.session_state_context_text(),
             attachments: Vec::new(),
         });
+        let system_tokens = history_system_tokens + runtime_state_tokens;
         let summary = self.context_engine.summary();
+        let summary_tokens = summary
+            .as_ref()
+            .map(|summary| medusa_core::context::estimate_tokens(&summary.text) + 24)
+            .unwrap_or(0);
+        let effective_history_tokens = self.context_engine.effective_tokens(&history);
+        let message_tokens = effective_history_tokens
+            .saturating_sub(history_system_tokens)
+            .saturating_sub(summary_tokens);
 
         ContextReport {
             instructions_tokens: medusa_core::context::baseline_instructions_tokens(
                 self.tools.workspace(),
             ),
             system_tokens,
-            message_tokens: chars.messages.div_ceil(4),
-            tool_tokens: chars.tool_outputs.div_ceil(4),
-            reasoning_tokens: chars.reasoning.div_ceil(4),
-            plan_tokens: chars.plans.div_ceil(4),
-            budget: medusa_core::context::context_max_tokens(),
+            message_tokens,
+            // Tool, reasoning, and plan rows are presentation state. Their
+            // durable facts are represented by the rolling session state.
+            tool_tokens: 0,
+            reasoning_tokens: 0,
+            plan_tokens: 0,
+            budget: self.context_engine.max_tokens(),
             summary_covers: summary.as_ref().map(|summary| summary.covers),
-            summary_tokens: summary
-                .map(|summary| medusa_core::context::estimate_tokens(&summary.text))
-                .unwrap_or(0),
+            summary_tokens,
         }
     }
 
@@ -418,9 +467,9 @@ impl App {
         if area.width < 4 {
             return;
         }
-        // ~4 chars per token, matching medusa_core::context::estimate_tokens.
-        let used = self.context_usage_chars().div_ceil(4);
-        let max = medusa_core::context::context_max_tokens().max(1);
+        let report = self.build_context_report();
+        let used = report.total_tokens();
+        let max = report.budget.max(1);
         let ratio = (used as f64 / max as f64).clamp(0.0, 1.0);
         let color = if ratio < 0.5 {
             palette().success
@@ -429,18 +478,24 @@ impl App {
         } else {
             palette().error
         };
+        let recent_compaction = self
+            .last_compaction
+            .as_ref()
+            .is_some_and(|(_, at)| at.elapsed() < Duration::from_secs(12));
+        let label = if self.compaction_active || self.compact_events.is_some() {
+            "compact".to_string()
+        } else if recent_compaction {
+            format!("✓ {:>3.0}%", ratio * 100.0)
+        } else if area.width >= 8 {
+            format!("{:>3.0}%", ratio * 100.0)
+        } else {
+            String::new()
+        };
         let gauge = LineGauge::default()
             .filled_style(Style::default().fg(color).bg(surface()))
             .unfilled_style(Style::default().fg(palette().separator).bg(surface()))
             .ratio(ratio)
-            .label(Span::styled(
-                if area.width >= 8 {
-                    format!("{:>3.0}%", ratio * 100.0)
-                } else {
-                    String::new()
-                },
-                muted(),
-            ))
+            .label(Span::styled(label, muted()))
             .style(Style::default().bg(surface()));
         frame.render_widget(gauge, area);
     }

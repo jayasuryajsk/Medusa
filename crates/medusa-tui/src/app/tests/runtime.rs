@@ -540,19 +540,13 @@ fn context_report_categories_sum_to_total_estimate() {
     ];
     app.push_tool_start("file_read".to_string(), "src/main.rs".to_string());
 
-    let chars = transcript_char_usage(&app.transcript);
-    assert_eq!(chars.total(), app.context_usage_chars());
-    assert!(chars.messages > 0);
-    assert!(chars.tool_outputs > 0);
-    assert!(chars.reasoning > 0);
-    assert!(chars.plans > 0);
-
     let report = app.build_context_report();
-    // Transcript categories reuse the same ~4 chars/token estimate.
-    assert_eq!(report.message_tokens, chars.messages.div_ceil(4));
-    assert_eq!(report.tool_tokens, chars.tool_outputs.div_ceil(4));
-    assert_eq!(report.reasoning_tokens, chars.reasoning.div_ceil(4));
-    assert_eq!(report.plan_tokens, chars.plans.div_ceil(4));
+    assert!(report.message_tokens > 0);
+    // Presentation-only rows are not replayed verbatim to the backend. Their
+    // durable state is represented in the generated system-state message.
+    assert_eq!(report.tool_tokens, 0);
+    assert_eq!(report.reasoning_tokens, 0);
+    assert_eq!(report.plan_tokens, 0);
     // The report's total is exactly the sum of its categories.
     assert_eq!(
         report.total_tokens(),
@@ -562,6 +556,7 @@ fn context_report_categories_sum_to_total_estimate() {
             + report.tool_tokens
             + report.reasoning_tokens
             + report.plan_tokens
+            + report.summary_tokens
     );
     assert!(
         report.instructions_tokens > 0,
@@ -618,6 +613,8 @@ fn compact_result_lands_as_success_toast_with_before_and_after() {
     assert!(app.drain_compact_events());
 
     assert!(app.compact_events.is_none());
+    assert!(!app.compaction_active);
+    assert!(app.last_compaction.is_some());
     let toast = app.toast.clone().expect("compact toast");
     assert_eq!(toast.kind, ToastKind::Success);
     assert!(toast.message.contains("12.00k tok"), "{}", toast.message);
@@ -645,6 +642,38 @@ fn compact_failure_lands_as_error_toast() {
         toast.message.contains("backend offline"),
         "{}",
         toast.message
+    );
+}
+
+#[test]
+fn automatic_compaction_events_explain_the_context_drop() {
+    let (mut app, sender, _token) = working_app();
+    sender
+        .send(ModelStreamEvent::CompactionStarted {
+            before_tokens: 90_000,
+        })
+        .unwrap();
+    sender
+        .send(ModelStreamEvent::CompactionFinished {
+            before_tokens: 90_000,
+            after_tokens: 42_000,
+            folded_messages: 18,
+        })
+        .unwrap();
+
+    assert!(app.drain_model_events());
+
+    assert!(!app.compaction_active);
+    let (result, _) = app.last_compaction.expect("compaction result");
+    assert_eq!(result.before_tokens, 90_000);
+    assert_eq!(result.after_tokens, 42_000);
+    assert!(app.status_line.contains("context compacted"));
+    assert!(
+        app.toast
+            .as_ref()
+            .unwrap()
+            .message
+            .contains("18 messages folded")
     );
 }
 
