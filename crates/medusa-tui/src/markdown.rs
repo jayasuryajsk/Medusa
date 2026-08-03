@@ -11,6 +11,7 @@ use crate::styles::{
     code_block_style, code_border_style, heading_style, inline_code_style, link_style,
     list_marker_style, message_style, muted, quote_border_style, quote_style, separator_style,
 };
+use crate::terminal::{horizontal_rule, ui_border_set};
 use crate::types::ChatRole;
 
 pub(crate) fn code_syntaxes() -> &'static syntect::parsing::SyntaxSet {
@@ -125,7 +126,10 @@ pub(crate) fn markdown_content_lines_uncached(content: &str, role: ChatRole) -> 
         }
 
         if in_code_block {
-            let mut spans = vec![Span::styled("  │ ", code_border_style())];
+            let mut spans = vec![Span::styled(
+                format!("  {} ", ui_border_set().vertical_left),
+                code_border_style(),
+            )];
             match highlighter.as_mut() {
                 Some(highlighter) => spans.extend(highlighter.spans(line)),
                 None => spans.push(Span::styled(line.to_string(), code_block_style())),
@@ -142,7 +146,7 @@ pub(crate) fn markdown_content_lines_uncached(content: &str, role: ChatRole) -> 
         if is_horizontal_rule(trimmed) {
             lines.push(Line::from(vec![
                 Span::styled("  ", muted()),
-                Span::styled("─".repeat(48), separator_style()),
+                Span::styled(horizontal_rule(48), separator_style()),
             ]));
             continue;
         }
@@ -157,7 +161,10 @@ pub(crate) fn markdown_content_lines_uncached(content: &str, role: ChatRole) -> 
 
         if let Some(quote) = trimmed.strip_prefix("> ") {
             let mut spans = vec![
-                Span::styled("  ┃ ", quote_border_style()),
+                Span::styled(
+                    format!("  {} ", ui_border_set().vertical_left),
+                    quote_border_style(),
+                ),
                 Span::styled("", quote_style()),
             ];
             spans.extend(inline_markdown_spans(quote, quote_style()));

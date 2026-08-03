@@ -202,13 +202,14 @@ pub(crate) fn image_placeholder_lines(
     let width = width.max(10) as usize;
     let height = height.max(3) as usize;
     let inner_width = width.saturating_sub(2);
-    let border = "─".repeat(inner_width);
+    let glyphs = crate::terminal::ui_border_set();
+    let border = glyphs.horizontal_top.repeat(inner_width);
     let dimensions = format!("{}×{}", attachment.width, attachment.height);
     let size = human_bytes(attachment.size_bytes);
     let name = truncate(&attachment.name, inner_width);
     let mut lines = vec![
         Line::from(Span::styled(
-            format!("╭{border}╮"),
+            format!("{}{border}{}", glyphs.top_left, glyphs.top_right),
             attachment_preview_border_style(),
         )),
         attachment_preview_body_line("image", width, attachment_preview_title_style()),
@@ -225,7 +226,7 @@ pub(crate) fn image_placeholder_lines(
         muted(),
     ));
     lines.push(Line::from(Span::styled(
-        format!("╰{border}╯"),
+        format!("{}{border}{}", glyphs.bottom_left, glyphs.bottom_right),
         attachment_preview_border_style(),
     )));
     lines
@@ -240,9 +241,15 @@ pub(crate) fn attachment_preview_body_line(
     let fitted = truncate(text, inner_width);
     let padding = inner_width.saturating_sub(fitted.chars().count());
     Line::from(vec![
-        Span::styled("│", attachment_preview_border_style()),
+        Span::styled(
+            crate::terminal::ui_border_set().vertical_left,
+            attachment_preview_border_style(),
+        ),
         Span::styled(fitted, style),
         Span::raw(" ".repeat(padding)),
-        Span::styled("│", attachment_preview_border_style()),
+        Span::styled(
+            crate::terminal::ui_border_set().vertical_right,
+            attachment_preview_border_style(),
+        ),
     ])
 }

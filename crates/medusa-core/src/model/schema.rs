@@ -9,9 +9,9 @@ pub(crate) fn medusa_instructions(workspace: &Path, mcp_tools_active: bool) -> S
         "You are Medusa, a terminal-native autonomous coding agent. \
 You help the user inspect, edit, test, debug, and evolve the current workspace through Medusa's tool loop. \
 Current workspace: {}. \
-Use fs_list to discover the workspace tree, file_search to find text with regular expressions, file_glob to find files by name pattern, and file_read to read exact files or line ranges. \
+Use fs_list to discover the workspace tree, file_search to find exact text with regular expressions, semantic_search to locate code by intent when names are unknown, file_glob to find files by name pattern, and file_read to read exact files or line ranges. \
 For nontrivial code tasks, prefer explore_batch first: fan out read-only list/search/read/safe terminal probes in parallel, then synthesize the evidence before editing. \
-Independent read-only calls (file_read, file_search, file_glob, fs_list) issued together in one turn execute concurrently — emit them as one batch of tool calls instead of one per turn when they do not depend on each other. \
+Independent read-only calls (file_read, file_search, semantic_search, file_glob, fs_list) issued together in one turn execute concurrently — emit them as one batch of tool calls instead of one per turn when they do not depend on each other. \
 Use terminal_exec for tests, builds, formatters, git, project scripts, and uncommon shell work. \
 In guarded/ask/readonly modes terminal_exec commands run inside the platform sandbox (Seatbelt on macOS, bubblewrap on Linux; writes confined to the workspace and temp directories, network denied); if a command fails in a way plausibly caused by the sandbox, you may retry with {{\"sandbox\": false}} and explain why — every unsandboxed run requires user approval. \
 Use web_search to look up library documentation, unfamiliar error messages, and current facts, and web_fetch to read a specific page; prefer official documentation and primary sources. \
@@ -147,6 +147,30 @@ pub(crate) fn medusa_tools(
                     "include": {
                         "type": "string",
                         "description": "Optional glob filter for which files to search, such as *.rs or src/**/*.ts."
+                    }
+                },
+                "required": ["query"],
+                "additionalProperties": false
+            }
+        }),
+        json!({
+            "type": "function",
+            "name": "semantic_search",
+            "description": "Find workspace code by meaning or intent using Medusa's local incremental semantic index. Use when you know what code does but not its exact names. Results identify files and line ranges; follow with file_read before editing.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Natural-language description of the behavior, concept, or implementation to locate."
+                    },
+                    "path": {
+                        "type": "string",
+                        "description": "Optional workspace-relative file or directory scope."
+                    },
+                    "max_results": {
+                        "type": "integer",
+                        "description": "Optional maximum number of distinct matching files (default 8, maximum 24)."
                     }
                 },
                 "required": ["query"],

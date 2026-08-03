@@ -357,6 +357,7 @@ where
     let mut event_count = 0;
     let mut tool_calls = Vec::new();
     let mut usage = None;
+    let mut reasoning_seen = false;
 
     while let Some(line) = next_line()? {
         let Some(payload) = line.strip_prefix("data: ") else {
@@ -402,8 +403,10 @@ where
                     }
                 }
 
-                for text in extract_reasoning_text(&event) {
-                    on_event(ModelStreamEvent::ReasoningDelta(text))?;
+                if !reasoning_seen {
+                    for text in extract_reasoning_text(&event) {
+                        on_event(ModelStreamEvent::ReasoningDelta(text))?;
+                    }
                 }
 
                 if !emitted_text && let Some(text) = extract_completed_output_text(&event) {
@@ -415,16 +418,25 @@ where
                 bail!("{}", backend_failure_message(&event));
             }
             Some(event_type) if event_type.contains("reasoning") => {
-                let mut emitted_reasoning = false;
+                // Responses streams commonly send delta, done, and completed
+                // forms of the same reasoning text. Once deltas have arrived,
+                // later snapshots must not replay the whole trace.
+                if reasoning_seen && !event_type.ends_with(".delta") {
+                    continue;
+                }
+                let mut emitted_this_event = false;
                 for text in extract_reasoning_text(&event) {
-                    emitted_reasoning = true;
+                    emitted_this_event = true;
+                    reasoning_seen = true;
                     on_event(ModelStreamEvent::ReasoningDelta(text))?;
                 }
 
-                if !emitted_reasoning {
+                if !emitted_this_event {
                     if let Some(delta) = event.get("delta").and_then(Value::as_str) {
+                        reasoning_seen = true;
                         on_event(ModelStreamEvent::ReasoningDelta(delta.to_string()))?;
                     } else if let Some(text) = event.get("text").and_then(Value::as_str) {
+                        reasoning_seen = true;
                         on_event(ModelStreamEvent::ReasoningDelta(text.to_string()))?;
                     }
                 }

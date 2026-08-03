@@ -314,3 +314,12 @@ fn bell_preference_round_trips_through_settings() {
     let settings = load_app_settings(&workspace).unwrap();
     assert_eq!(settings.bell, Some(false));
 }
+
+#[test]
+fn reasoning_visibility_round_trips_through_settings() {
+    let workspace = temp_workspace();
+    assert!(!load_app_settings(&workspace).unwrap().show_reasoning());
+
+    save_reasoning_visibility(&workspace, true).unwrap();
+    assert!(load_app_settings(&workspace).unwrap().show_reasoning());
+}

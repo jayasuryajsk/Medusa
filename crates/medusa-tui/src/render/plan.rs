@@ -153,15 +153,15 @@ pub(crate) fn append_decision_rows(
         } else {
             ("? ", prompt_style())
         };
+        let branch = if crate::terminal::ascii_ui() {
+            if index == last { "  `- " } else { "  +- " }
+        } else if index == last {
+            "  └─ "
+        } else {
+            "  ├─ "
+        };
         rows.push(TranscriptRow::text(Line::from(vec![
-            Span::styled(
-                if index == last {
-                    "  └─ "
-                } else {
-                    "  ├─ "
-                },
-                muted(),
-            ),
+            Span::styled(branch, muted()),
             Span::styled(marker, marker_style),
             Span::styled(
                 truncate(&question.prompt, 120),
@@ -172,7 +172,13 @@ pub(crate) fn append_decision_rows(
                 },
             ),
         ])));
-        let continuation = if index == last { "     " } else { "  │  " };
+        let continuation = if index == last {
+            "     "
+        } else if crate::terminal::ascii_ui() {
+            "  |  "
+        } else {
+            "  │  "
+        };
         if question.kind == DecisionQuestionKind::Choice && !decision.answered {
             for (option_index, option) in question.options.iter().take(4).enumerate() {
                 let recommended = question.recommended.as_deref() == Some(option.as_str());

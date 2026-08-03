@@ -176,6 +176,7 @@ pub(crate) struct RenderContext {
     pub(crate) animation_tick: u64,
     /// Index of the keyboard-selected question in the pending decision.
     pub(crate) decision_selection: usize,
+    pub(crate) show_reasoning: bool,
 }
 
 impl RenderContext {
@@ -336,6 +337,7 @@ pub(crate) struct TranscriptRowsCache {
     pub(crate) selected_tool: Option<usize>,
     pub(crate) animation_tick: Option<u64>,
     pub(crate) decision_selection: usize,
+    pub(crate) show_reasoning: bool,
     /// Shared so cache hits are an Arc bump, not a deep clone of every row.
     pub(crate) rows: Arc<Vec<TranscriptRow>>,
 }

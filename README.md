@@ -24,6 +24,8 @@ live plans, checkpoints, and permission controls.
 - **Parallel heads, single writer:** independent reads and specialist agents
   run concurrently; mutation is serialized and read-only heads cannot write
   through the terminal.
+- **Local semantic code search:** find implementations by intent with an
+  incremental repository index and a globally cached Nomic embedding model.
 - **Evidence and convergence:** observations, changed files, and verification
   state follow the turn. Repeated no-progress cycles stop without imposing an
   arbitrary tool-call limit.
@@ -45,6 +47,8 @@ live plans, checkpoints, and permission controls.
 - Rust 1.90+ only when installing with Cargo or building from source.
 - `bubblewrap` for guarded or readonly execution on Linux.
 - Chrome, Node.js LTS, and npm only for optional browser control.
+- `llama-server` only for optional local semantic search (`brew install
+  llama.cpp` on macOS). Medusa downloads the 140 MB Nomic Q8 model once.
 
 ## Install
 
@@ -55,7 +59,7 @@ Install the latest tagged release directly:
 ```sh
 cargo install --locked \
   --git https://github.com/jayasuryajsk/Medusa.git \
-  --tag v0.3.1 \
+  --tag v0.3.2 \
   medusa-tui
 ```
 
@@ -237,6 +241,15 @@ medusa run --json --permission readonly "audit error handling"
 
 Options: `--model <provider/model>`, `--permission <open|guarded|readonly>`, `--json`,
 `--no-stream`.
+
+### Local semantic search
+
+When the model needs to find code by intent rather than an exact identifier,
+Medusa can call `semantic.search`. The first call downloads Nomic Embed Text
+v1.5 Q8 once to `~/.local/share/medusa/models/`, starts a local Metal/CUDA/CPU
+`llama-server`, and builds `.medusa/semantic/index.bin`. Later searches update
+only changed files. The model cache is global; source embeddings remain local
+to each repository and are never sent to an API.
 
 ## Configuration
 

@@ -131,7 +131,7 @@ impl App {
         }
 
         let rule = Paragraph::new(Line::from(Span::styled(
-            "─".repeat(sections[1].width as usize),
+            horizontal_rule(sections[1].width as usize),
             separator_style(),
         )))
         .style(Style::default().bg(surface()));
@@ -208,6 +208,7 @@ impl App {
             RenderContext {
                 animation_tick: self.animation_tick,
                 decision_selection: self.decision_selection,
+                show_reasoning: self.show_reasoning,
             },
         )
     }
@@ -225,6 +226,7 @@ impl App {
             && cache.selected_tool == self.selected_tool
             && cache.animation_tick == animation_tick
             && cache.decision_selection == self.decision_selection
+            && cache.show_reasoning == self.show_reasoning
         {
             return Arc::clone(&cache.rows);
         }
@@ -237,6 +239,7 @@ impl App {
             selected_tool: self.selected_tool,
             animation_tick,
             decision_selection: self.decision_selection,
+            show_reasoning: self.show_reasoning,
             rows: Arc::clone(&rows),
         });
         rows
@@ -292,7 +295,7 @@ impl App {
             .block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .border_type(BorderType::Rounded)
+                    .border_set(ui_border_set())
                     .title(self.input_title_content())
                     .border_style(border_style)
                     .style(Style::default().bg(surface()).fg(text()))

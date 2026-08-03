@@ -26,6 +26,8 @@ pub(crate) struct AppSettings {
     pub(crate) bell: Option<bool>,
     #[serde(default)]
     pub(crate) reasoning_effort: Option<String>,
+    #[serde(default)]
+    pub(crate) show_reasoning: Option<bool>,
 }
 
 impl AppSettings {
@@ -54,6 +56,10 @@ impl AppSettings {
             .as_deref()
             .and_then(PermissionMode::from_name)
             .unwrap_or(PermissionMode::Guarded)
+    }
+
+    pub(crate) fn show_reasoning(&self) -> bool {
+        self.show_reasoning.unwrap_or(false)
     }
 }
 
@@ -115,6 +121,12 @@ pub(crate) fn save_permission_mode_preference(
 pub(crate) fn save_bell_preference(workspace: &Path, enabled: bool) -> Result<()> {
     let mut settings = load_app_settings(workspace).unwrap_or_default();
     settings.bell = Some(enabled);
+    save_app_settings(workspace, &settings)
+}
+
+pub(crate) fn save_reasoning_visibility(workspace: &Path, visible: bool) -> Result<()> {
+    let mut settings = load_app_settings(workspace).unwrap_or_default();
+    settings.show_reasoning = Some(visible);
     save_app_settings(workspace, &settings)
 }
 
@@ -196,7 +208,6 @@ pub(crate) struct ThemePalette {
     pub(crate) tool: Color,
     pub(crate) quote: Color,
     pub(crate) code_fg: Color,
-    pub(crate) code_bg: Color,
     pub(crate) inline_code_fg: Color,
     pub(crate) inline_code_bg: Color,
 }
@@ -243,7 +254,6 @@ pub(crate) fn material_dark_palette(
         tool,
         quote: MATERIAL_BLUE_GREY_100,
         code_fg: MATERIAL_BLUE_GREY_50,
-        code_bg: MATERIAL_BLUE_GREY_900,
         inline_code_fg,
         inline_code_bg: Color::Rgb(18, 31, 35),
     }
@@ -383,7 +393,6 @@ impl ThemeKind {
                 tool: Color::Rgb(126, 176, 255),
                 quote: Color::Rgb(168, 176, 188),
                 code_fg: Color::Rgb(190, 205, 220),
-                code_bg: Color::Rgb(16, 18, 22),
                 inline_code_fg: Color::Rgb(147, 210, 178),
                 inline_code_bg: Color::Rgb(20, 26, 24),
             },
@@ -403,7 +412,6 @@ impl ThemeKind {
                 tool: Color::Rgb(147, 197, 253),
                 quote: Color::Rgb(176, 184, 196),
                 code_fg: Color::Rgb(205, 213, 224),
-                code_bg: Color::Rgb(17, 21, 28),
                 inline_code_fg: Color::Rgb(191, 219, 254),
                 inline_code_bg: Color::Rgb(23, 31, 44),
             },
@@ -423,7 +431,6 @@ impl ThemeKind {
                 tool: Color::Rgb(125, 207, 255),
                 quote: Color::Rgb(154, 165, 206),
                 code_fg: Color::Rgb(192, 202, 245),
-                code_bg: Color::Rgb(22, 22, 30),
                 inline_code_fg: Color::Rgb(187, 154, 247),
                 inline_code_bg: Color::Rgb(38, 35, 58),
             },
@@ -443,7 +450,6 @@ impl ThemeKind {
                 tool: Color::Rgb(137, 180, 250),
                 quote: Color::Rgb(180, 190, 254),
                 code_fg: Color::Rgb(203, 214, 244),
-                code_bg: Color::Rgb(24, 24, 37),
                 inline_code_fg: Color::Rgb(148, 226, 213),
                 inline_code_bg: Color::Rgb(30, 30, 46),
             },
@@ -463,7 +469,6 @@ impl ThemeKind {
                 tool: Color::Rgb(139, 233, 253),
                 quote: Color::Rgb(241, 250, 140),
                 code_fg: Color::Rgb(248, 248, 242),
-                code_bg: Color::Rgb(33, 34, 44),
                 inline_code_fg: Color::Rgb(255, 121, 198),
                 inline_code_bg: Color::Rgb(48, 42, 65),
             },
@@ -483,7 +488,6 @@ impl ThemeKind {
                 tool: Color::Rgb(129, 161, 193),
                 quote: Color::Rgb(180, 142, 173),
                 code_fg: Color::Rgb(229, 233, 240),
-                code_bg: Color::Rgb(36, 42, 54),
                 inline_code_fg: Color::Rgb(143, 188, 187),
                 inline_code_bg: Color::Rgb(48, 56, 70),
             },
@@ -503,7 +507,6 @@ impl ThemeKind {
                 tool: Color::Rgb(131, 165, 152),
                 quote: Color::Rgb(211, 134, 155),
                 code_fg: Color::Rgb(235, 219, 178),
-                code_bg: Color::Rgb(29, 32, 33),
                 inline_code_fg: Color::Rgb(250, 189, 47),
                 inline_code_bg: Color::Rgb(50, 48, 47),
             },
@@ -523,7 +526,6 @@ impl ThemeKind {
                 tool: Color::Rgb(38, 139, 210),
                 quote: Color::Rgb(108, 113, 196),
                 code_fg: Color::Rgb(147, 161, 161),
-                code_bg: Color::Rgb(0, 35, 44),
                 inline_code_fg: Color::Rgb(203, 75, 22),
                 inline_code_bg: Color::Rgb(7, 54, 66),
             },
@@ -573,7 +575,6 @@ impl ThemeKind {
                 tool: Color::Rgb(156, 207, 216),
                 quote: Color::Rgb(184, 179, 209),
                 code_fg: Color::Rgb(224, 222, 244),
-                code_bg: Color::Rgb(31, 29, 46),
                 inline_code_fg: Color::Rgb(196, 167, 231),
                 inline_code_bg: Color::Rgb(38, 35, 58),
             },
@@ -593,7 +594,6 @@ impl ThemeKind {
                 tool: Color::Rgb(92, 207, 230),
                 quote: Color::Rgb(166, 172, 205),
                 code_fg: Color::Rgb(203, 204, 198),
-                code_bg: Color::Rgb(36, 41, 54),
                 inline_code_fg: Color::Rgb(149, 230, 203),
                 inline_code_bg: Color::Rgb(42, 48, 62),
             },
@@ -613,7 +613,6 @@ impl ThemeKind {
                 tool: Color::Rgb(127, 187, 179),
                 quote: Color::Rgb(157, 169, 160),
                 code_fg: Color::Rgb(211, 198, 170),
-                code_bg: Color::Rgb(39, 46, 51),
                 inline_code_fg: Color::Rgb(131, 192, 146),
                 inline_code_bg: Color::Rgb(47, 56, 62),
             },
@@ -633,7 +632,6 @@ impl ThemeKind {
                 tool: Color::Rgb(172, 172, 172),
                 quote: Color::Rgb(160, 160, 160),
                 code_fg: Color::Rgb(209, 209, 209),
-                code_bg: Color::Rgb(20, 20, 20),
                 inline_code_fg: Color::Rgb(255, 199, 153),
                 inline_code_bg: Color::Rgb(30, 30, 30),
             },

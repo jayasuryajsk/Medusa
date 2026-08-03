@@ -70,6 +70,7 @@ commands until the current harness route permits mutation: {error}"
     match call.name.as_str() {
         "file_read" => execute_file_read(tools, &args),
         "file_search" => execute_file_search(tools, &args),
+        "semantic_search" => execute_semantic_search(tools, &args),
         "file_glob" => execute_file_glob(tools, &args),
         "fs_list" => execute_fs_list(tools, &args),
         "explore_batch" => execute_explore_batch(tools, &args),
@@ -179,6 +180,30 @@ fn execute_file_search(tools: &ToolRuntime, args: &Value) -> ToolExecution {
         Ok(result) => ToolExecution {
             failed: false,
             output: format_file_search_result(&result),
+        },
+        Err(error) => ToolExecution {
+            failed: true,
+            output: format!("error: {error}"),
+        },
+    }
+}
+
+fn execute_semantic_search(tools: &ToolRuntime, args: &Value) -> ToolExecution {
+    let Some(query) = args.get("query").and_then(Value::as_str) else {
+        return ToolExecution {
+            failed: true,
+            output: "error: semantic_search.query is required".to_string(),
+        };
+    };
+    let request = SemanticSearchRequest {
+        query: query.to_string(),
+        path: optional_path(args, "path"),
+        max_results: optional_usize(args, "max_results"),
+    };
+    match tools.semantic_search(request) {
+        Ok(result) => ToolExecution {
+            failed: false,
+            output: format_semantic_search_result(&result),
         },
         Err(error) => ToolExecution {
             failed: true,
@@ -720,6 +745,25 @@ fn format_file_search_result(result: &crate::tools::FileSearchResult) -> String 
     );
     for hit in &result.matches {
         output.push_str(&format!("{}:{}: {}\n", hit.path, hit.line, hit.text));
+    }
+    output
+}
+
+fn format_semantic_search_result(result: &crate::tools::SemanticSearchResult) -> String {
+    let mut output = format!(
+        "query: {}\nmodel: {}\nindex: {} files, {} chunks ({} updated)\nmatches: {}\n",
+        result.query,
+        result.model,
+        result.indexed_files,
+        result.indexed_chunks,
+        result.updated_files,
+        result.matches.len()
+    );
+    for hit in &result.matches {
+        output.push_str(&format!(
+            "{}:{}-{} score {:.3}: {}\n",
+            hit.path, hit.start_line, hit.end_line, hit.score, hit.preview
+        ));
     }
     output
 }

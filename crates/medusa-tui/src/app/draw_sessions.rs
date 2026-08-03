@@ -83,7 +83,13 @@ impl App {
             .map(SessionStore::tree_entries)
             .unwrap_or_default();
         let rows = entries.into_iter().take(14).map(|entry| {
-            let branch = if entry.depth == 0 { "●" } else { "└" };
+            let branch = if entry.depth == 0 {
+                "●"
+            } else if crate::terminal::ascii_ui() {
+                "`"
+            } else {
+                "└"
+            };
             let indent = "  ".repeat(entry.depth);
             let name = format!("{indent}{branch} {}", entry.name);
             Row::new(vec![

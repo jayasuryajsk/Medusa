@@ -6,7 +6,9 @@ impl App {
             return;
         }
         match self.transcript.last_mut() {
-            Some(TranscriptItem::Reasoning(trace)) => trace.content.push_str(delta),
+            Some(TranscriptItem::Reasoning(trace)) => {
+                append_stream_fragment(&mut trace.content, delta)
+            }
             _ => self
                 .transcript
                 .push(TranscriptItem::Reasoning(ReasoningTrace {
@@ -235,5 +237,46 @@ impl App {
         }
 
         false
+    }
+}
+
+pub(crate) fn append_stream_fragment(current: &mut String, fragment: &str) {
+    if fragment.is_empty() || current.ends_with(fragment) {
+        return;
+    }
+    if current.is_empty() {
+        current.push_str(fragment);
+        return;
+    }
+    if fragment.starts_with(current.as_str()) {
+        *current = fragment.to_string();
+        return;
+    }
+
+    let max_overlap = current.len().min(fragment.len());
+    let overlap = (1..=max_overlap).rev().find(|&size| {
+        current.is_char_boundary(current.len() - size)
+            && fragment.is_char_boundary(size)
+            && current[current.len() - size..] == fragment[..size]
+    });
+    current.push_str(&fragment[overlap.unwrap_or(0)..]);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::append_stream_fragment;
+
+    #[test]
+    fn reasoning_fragments_do_not_repeat_snapshots_or_overlaps() {
+        let mut text = "Inspecting the workspace".to_string();
+
+        append_stream_fragment(&mut text, "Inspecting the workspace");
+        append_stream_fragment(&mut text, "the workspace and reading files");
+        append_stream_fragment(
+            &mut text,
+            "Inspecting the workspace and reading files carefully",
+        );
+
+        assert_eq!(text, "Inspecting the workspace and reading files carefully");
     }
 }

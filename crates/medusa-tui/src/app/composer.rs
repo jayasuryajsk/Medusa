@@ -452,6 +452,7 @@ impl App {
         match items.get(self.settings_selection).map(|item| item.key) {
             Some("model") => self.open_models_modal(),
             Some("reasoning") => self.open_reasoning_modal(),
+            Some("thinking") => self.toggle_reasoning_visibility(),
             Some("theme") => self.open_themes_modal(),
             Some("permissions") => self.open_permissions_modal(),
             Some("bell") => self.toggle_bell_setting(),
@@ -477,6 +478,26 @@ impl App {
             Err(error) => {
                 self.status_line = format!("bell preference not saved: {error}");
                 self.toast("Bell preference not saved", ToastKind::Warning);
+            }
+        }
+    }
+
+    pub(super) fn toggle_reasoning_visibility(&mut self) {
+        self.show_reasoning = !self.show_reasoning;
+        self.touch_transcript();
+        let label = if self.show_reasoning {
+            "Thinking shown"
+        } else {
+            "Thinking hidden"
+        };
+        match save_reasoning_visibility(self.tools.workspace(), self.show_reasoning) {
+            Ok(()) => {
+                self.status_line = label.to_ascii_lowercase();
+                self.toast(label, ToastKind::Info);
+            }
+            Err(error) => {
+                self.status_line = format!("thinking preference not saved: {error}");
+                self.toast("Thinking preference not saved", ToastKind::Warning);
             }
         }
     }

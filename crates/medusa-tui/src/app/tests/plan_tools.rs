@@ -250,7 +250,15 @@ fn visible_tool_activity_lines_show_running_state() {
         group_expanded: false,
     })];
 
-    let lines = visible_transcript_lines(&transcript, None, None);
+    let lines = transcript_lines_from_rows(&visible_transcript_rows(
+        &transcript,
+        None,
+        None,
+        RenderContext {
+            show_reasoning: true,
+            ..Default::default()
+        },
+    ));
     let text = lines.iter().map(line_text).collect::<Vec<_>>();
 
     assert!(text[0].contains("patch apply patch"));
@@ -755,7 +763,15 @@ fn interleaved_reasoning_and_tools_render_as_one_batch() {
         }),
     ];
 
-    let lines = visible_transcript_lines(&transcript, None, None);
+    let lines = transcript_lines_from_rows(&visible_transcript_rows(
+        &transcript,
+        None,
+        None,
+        RenderContext {
+            show_reasoning: true,
+            ..Default::default()
+        },
+    ));
     let text = lines.iter().map(line_text).collect::<Vec<_>>();
 
     assert!(
@@ -764,8 +780,9 @@ fn interleaved_reasoning_and_tools_render_as_one_batch() {
     );
     assert!(
         text.iter()
-            .any(|line| line.contains("thinking") && line.contains("Reading matching files"))
+            .any(|line| line.contains("Reading matching files"))
     );
+    assert!(text.iter().all(|line| !line.contains("thinking")));
 }
 
 #[test]

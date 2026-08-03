@@ -387,6 +387,7 @@ pub(crate) fn tool_display_name(name: &str) -> &str {
     match name {
         "file.read" => "read",
         "file.search" => "search",
+        "semantic.search" => "semantic",
         "fs.list" => "list",
         "terminal.exec" => "terminal",
         "file.edit" => "edit",

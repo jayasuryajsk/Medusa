@@ -101,7 +101,7 @@ impl App {
         };
         let block = Block::default()
             .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
+            .border_set(ui_border_set())
             .border_style(Style::default().fg(palette().prompt))
             .style(Style::default().bg(surface()).fg(text()))
             .title(title);
@@ -159,7 +159,7 @@ impl App {
             .collect::<Vec<_>>();
         let block = Block::default()
             .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
+            .border_set(ui_border_set())
             .border_style(Style::default().fg(accent_color()))
             .style(Style::default().bg(surface()).fg(text()))
             .title(" Command Palette ");
@@ -206,7 +206,12 @@ impl App {
         );
         let divider = Paragraph::new(
             (0..divider_area.height)
-                .map(|_| Line::from(Span::styled("│", separator_style())))
+                .map(|_| {
+                    Line::from(Span::styled(
+                        ui_border_set().vertical_left,
+                        separator_style(),
+                    ))
+                })
                 .collect::<Vec<_>>(),
         )
         .style(Style::default().bg(surface()));
@@ -260,7 +265,7 @@ impl App {
 
         let block = Block::default()
             .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
+            .border_set(ui_border_set())
             .border_style(Style::default().fg(accent_color()))
             .style(Style::default().bg(surface()).fg(text()))
             .title(" Files ");
@@ -699,7 +704,7 @@ impl App {
         };
         let block = Block::default()
             .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
+            .border_set(ui_border_set())
             .title(title)
             .border_style(Style::default().fg(accent_color()))
             .style(Style::default().bg(surface()).fg(text()));

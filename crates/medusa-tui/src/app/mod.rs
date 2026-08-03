@@ -27,8 +27,8 @@ pub(super) use ratatui::{
     style::{Modifier, Style},
     text::{Line, Span},
     widgets::{
-        Block, BorderType, Borders, Cell, Clear, LineGauge, List, ListItem, ListState, Padding,
-        Paragraph, Row, Scrollbar, ScrollbarOrientation, ScrollbarState, Table, Wrap,
+        Block, Borders, Cell, Clear, LineGauge, List, ListItem, ListState, Padding, Paragraph, Row,
+        Scrollbar, ScrollbarOrientation, ScrollbarState, Table, Wrap,
     },
 };
 
@@ -61,9 +61,9 @@ pub(super) use crate::render::*;
 pub(super) use crate::session_memory::*;
 pub(super) use crate::slash::*;
 pub(super) use crate::styles::*;
-pub(super) use crate::terminal::Tui;
 #[cfg(test)]
 pub(super) use crate::terminal::maybe_rebuild_before_reload;
+pub(super) use crate::terminal::{Tui, horizontal_rule, ui_border_set};
 pub(super) use crate::types::*;
 pub(super) use crate::util::*;
 
@@ -147,6 +147,8 @@ pub(crate) struct App {
     mention_dismissed: bool,
     /// Workspace bell preference (MEDUSA_BELL can override at ring time).
     bell_setting: bool,
+    /// Whether provider reasoning traces are rendered in the transcript.
+    show_reasoning: bool,
     settings_selection: usize,
     model_selection: usize,
     reasoning_selection: usize,

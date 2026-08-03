@@ -47,7 +47,7 @@ impl SubagentToolPolicy {
     fn instructions(self) -> &'static str {
         match self {
             Self::ReadOnly => {
-                "Use fs_list, file_search, and file_read for inspection. Do not edit files or apply patches."
+                "Use fs_list, file_search, semantic_search, and file_read for inspection. Do not edit files or apply patches."
             }
             Self::ShellRead => {
                 "Prefer file tools for inspection. You may use terminal_exec for safe read-only commands such as rg, sed, git status, cargo test, or format/check commands. Do not edit files."

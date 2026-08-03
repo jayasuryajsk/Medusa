@@ -172,6 +172,7 @@ impl App {
             mention_files: None,
             mention_dismissed: false,
             bell_setting: app_settings.bell.unwrap_or(true),
+            show_reasoning: app_settings.show_reasoning(),
             settings_selection: 0,
             model_selection: 0,
             reasoning_selection: 0,

@@ -354,7 +354,15 @@ fn visible_chat_lines_distinguishes_roles() {
         TranscriptItem::Message(ChatMessage::user("hello")),
         TranscriptItem::Message(ChatMessage::assistant("hi")),
     ];
-    let lines = visible_transcript_lines(&transcript, None, None);
+    let lines = transcript_lines_from_rows(&visible_transcript_rows(
+        &transcript,
+        None,
+        None,
+        RenderContext {
+            show_reasoning: true,
+            ..Default::default()
+        },
+    ));
 
     assert_eq!(lines.len(), 3 + CHAT_BOTTOM_PADDING_ROWS);
     let text = lines.iter().map(line_text).collect::<Vec<_>>();
@@ -368,12 +376,20 @@ fn reasoning_renders_as_ghost_text_before_the_answer() {
         TranscriptItem::Message(ChatMessage::user("read code")),
         TranscriptItem::Message(ChatMessage::assistant("The render loop is in main.rs.")),
         TranscriptItem::Reasoning(ReasoningTrace {
-            content: "Hidden model thinking.".to_string(),
+            content: "Inspecting the render loop.".to_string(),
             expanded: false,
         }),
     ];
 
-    let lines = visible_transcript_lines(&transcript, None, None);
+    let lines = transcript_lines_from_rows(&visible_transcript_rows(
+        &transcript,
+        None,
+        None,
+        RenderContext {
+            show_reasoning: true,
+            ..Default::default()
+        },
+    ));
     let text = lines.iter().map(line_text).collect::<Vec<_>>();
 
     assert!(
@@ -382,14 +398,30 @@ fn reasoning_renders_as_ghost_text_before_the_answer() {
     );
     let reasoning_index = text
         .iter()
-        .position(|line| line.contains("Hidden model thinking"))
+        .position(|line| line.contains("Inspecting the render loop"))
         .expect("reasoning ghost row");
     let answer_index = text
         .iter()
         .position(|line| line.contains("The render loop is in main.rs."))
         .expect("assistant answer");
     assert!(reasoning_index < answer_index);
-    assert!(text[reasoning_index].contains("thinking"));
+    assert!(!text[reasoning_index].trim_start().starts_with("thinking"));
+}
+
+#[test]
+fn reasoning_is_hidden_by_default() {
+    let transcript = vec![TranscriptItem::Reasoning(ReasoningTrace {
+        content: "Verbose provider trace".to_string(),
+        expanded: false,
+    })];
+
+    let lines = visible_transcript_lines(&transcript, None, None);
+    assert!(
+        lines
+            .iter()
+            .map(line_text)
+            .all(|line| !line.contains("Verbose provider trace"))
+    );
 }
 
 #[test]
@@ -447,6 +479,19 @@ fn rust_code_blocks_get_syntax_highlighting() {
         .filter_map(|span| span.style.fg)
         .collect::<std::collections::HashSet<_>>();
     assert!(distinct_colors.len() > 1, "expected multiple token colors");
+}
+
+#[test]
+fn fenced_code_uses_the_transcript_background() {
+    assert_eq!(code_block_style().bg, None);
+
+    let lines = markdown_content_lines("```text\nplain code\n```", ChatRole::Assistant);
+    let code = lines
+        .iter()
+        .flat_map(|line| line.spans.iter())
+        .find(|span| span.content.contains("plain code"))
+        .expect("fenced code span");
+    assert_eq!(code.style.bg, None);
 }
 
 #[test]

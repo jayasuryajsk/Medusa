@@ -113,6 +113,7 @@ fn is_observation_tool(name: &str) -> bool {
         name,
         "file_read"
             | "file_search"
+            | "semantic_search"
             | "file_glob"
             | "fs_list"
             | "explore_batch"

@@ -588,6 +588,7 @@ pub(crate) fn tools_text() -> String {
         "explore.batch  Run parallel read-only probes and return evidence",
         "file.read      Read files by path/range",
         "file.search    Search file contents by regex",
+        "semantic.search Find code by meaning (local index)",
         "file.glob      Find files by name pattern",
         "fs.list        List workspace paths",
         "file.edit      Replace exact old/new strings",

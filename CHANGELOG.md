@@ -5,6 +5,33 @@ semantic versioning while the public interfaces stabilize.
 
 ## Unreleased
 
+## 0.3.2 - 2026-08-04
+
+### Added
+
+- Local semantic code search powered by a globally cached Nomic Embed Text
+  model and persistent llama.cpp server.
+- Incremental, quantized repository indexes with hybrid semantic, lexical,
+  and path ranking.
+- A settings control for showing or hiding provider reasoning traces.
+
+### Changed
+
+- Semantic retrieval participates in Medusa's parallel read-only exploration
+  and returns distinct files with focused line ranges.
+- Apple Terminal uses ASCII borders automatically while modern terminals keep
+  rounded Unicode borders.
+- Code blocks use the transcript background instead of a separate grey panel.
+
+### Fixed
+
+- DeepSeek reasoning snapshots and overlapping deltas no longer produce
+  duplicated thinking text.
+- Reasoning traces are hidden by default and no longer display a redundant
+  `thinking` label.
+- Repository semantic indexes detect external file changes and refuse to
+  traverse symlinks outside the workspace.
+
 ## 0.3.1 - 2026-08-03
 
 ### Added

@@ -34,7 +34,7 @@ impl App {
         let selected = self.settings_selection.min(items.len().saturating_sub(1));
         frame.render_widget(
             modal_block(" Settings ")
-                .border_type(BorderType::Rounded)
+                .border_set(ui_border_set())
                 .padding(Padding::new(2, 2, 0, 0)),
             area,
         );
@@ -217,7 +217,7 @@ impl App {
     pub(super) fn draw_models_modal(&self, frame: &mut Frame<'_>, area: Rect) {
         frame.render_widget(
             modal_block(" Model & execution mode ")
-                .border_type(BorderType::Rounded)
+                .border_set(ui_border_set())
                 .padding(Padding::new(2, 2, 0, 0)),
             area,
         );
@@ -443,7 +443,7 @@ impl App {
     pub(super) fn draw_reasoning_modal(&self, frame: &mut Frame<'_>, area: Rect) {
         frame.render_widget(
             modal_block(" Reasoning & orchestration ")
-                .border_type(BorderType::Rounded)
+                .border_set(ui_border_set())
                 .padding(Padding::new(2, 2, 0, 0)),
             area,
         );
@@ -533,7 +533,7 @@ impl App {
     pub(super) fn draw_permissions_modal(&self, frame: &mut Frame<'_>, area: Rect) {
         frame.render_widget(
             modal_block(" Permissions ")
-                .border_type(BorderType::Rounded)
+                .border_set(ui_border_set())
                 .padding(Padding::new(2, 2, 0, 0)),
             area,
         );
@@ -614,7 +614,7 @@ impl App {
     pub(super) fn draw_themes_modal(&self, frame: &mut Frame<'_>, area: Rect) {
         frame.render_widget(
             modal_block(" Themes ")
-                .border_type(BorderType::Rounded)
+                .border_set(ui_border_set())
                 .padding(Padding::new(2, 2, 0, 0)),
             area,
         );
@@ -754,6 +754,18 @@ impl App {
                 value: self.model.reasoning_effort().to_string(),
                 description: "Thinking depth, or Ultra for proactive multi-agent orchestration.",
                 action: "enter opens reasoning picker",
+                editable: true,
+            },
+            SettingsItem {
+                key: "thinking",
+                value: if self.show_reasoning {
+                    "shown"
+                } else {
+                    "hidden"
+                }
+                .to_string(),
+                description: "Show provider reasoning as muted ghost text. This does not change reasoning effort or API usage.",
+                action: "enter toggles",
                 editable: true,
             },
             SettingsItem {

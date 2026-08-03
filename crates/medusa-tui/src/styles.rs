@@ -7,6 +7,7 @@ use ratatui::{
 };
 
 use crate::config::{ThemeKind, model_display, palette, reasoning_description};
+use crate::terminal::ui_border_set;
 use crate::types::{ChatRole, ToastKind, ToolRunState};
 
 pub(crate) fn app_bg() -> Color {
@@ -113,7 +114,7 @@ pub(crate) fn code_border_style() -> Style {
 }
 
 pub(crate) fn code_block_style() -> Style {
-    Style::default().fg(palette().code_fg).bg(palette().code_bg)
+    Style::default().fg(palette().code_fg)
 }
 
 pub(crate) fn inline_code_style() -> Style {
@@ -209,6 +210,7 @@ pub(crate) fn toast_label(kind: ToastKind) -> &'static str {
 pub(crate) fn modal_block(title: &'static str) -> Block<'static> {
     Block::default()
         .borders(Borders::ALL)
+        .border_set(ui_border_set())
         .title(title)
         .border_style(Style::default().fg(accent_color()))
         .style(Style::default().bg(surface()).fg(text()))

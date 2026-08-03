@@ -25,8 +25,8 @@ pub(crate) fn update_tool_loop_state(
         "file_edit" | "file_patch" => {
             state.patch_requires_context = false;
         }
-        "file_read" | "file_search" | "file_glob" | "fs_list" | "explore_batch"
-        | "terminal_exec" | "workflow_run" => {
+        "file_read" | "file_search" | "semantic_search" | "file_glob" | "fs_list"
+        | "explore_batch" | "terminal_exec" | "workflow_run" => {
             state.patch_requires_context = false;
         }
         _ => {}
@@ -50,6 +50,11 @@ pub(crate) fn summarize_tool_call(call: &ToolCall) -> String {
             .and_then(Value::as_str)
             .map(|query| format!("search {query:?}"))
             .unwrap_or_else(|| "search files".to_string()),
+        "semantic_search" => args
+            .get("query")
+            .and_then(Value::as_str)
+            .map(|query| format!("find code about {query:?}"))
+            .unwrap_or_else(|| "search code by meaning".to_string()),
         "file_glob" => args
             .get("pattern")
             .and_then(Value::as_str)

@@ -623,7 +623,9 @@ impl App {
                 Ok(ModelStreamEvent::ReasoningDelta(delta)) => {
                     changed = true;
                     self.flush_stream_delta(&mut delta_buffer);
-                    self.append_reasoning_delta(&delta);
+                    if self.show_reasoning {
+                        self.append_reasoning_delta(&delta);
+                    }
                     self.status_line = self.scoped_status("thinking");
                     self.stick_chat_to_bottom_if_needed();
                 }

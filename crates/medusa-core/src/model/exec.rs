@@ -9,8 +9,8 @@ use crate::tools::{
     DecisionQuestionRequest, DecisionRequest, DecisionResult, ExploreBatchRequest,
     ExploreBatchResult, ExploreProbe, ExploreProbeKind, FileEditRequest, FileGlobRequest,
     FilePatchRequest, FileReadRequest, FileSearchRequest, FsListRequest, PlanUpdateItem,
-    PlanUpdateRequest, PlanUpdateResult, QuestionRequest, TaskUpdateRequest, TerminalExecRequest,
-    ToolRuntime, validate_read_only_terminal_command,
+    PlanUpdateRequest, PlanUpdateResult, QuestionRequest, SemanticSearchRequest, TaskUpdateRequest,
+    TerminalExecRequest, ToolRuntime, validate_read_only_terminal_command,
 };
 
 /// Tools that neither mutate the workspace nor consult [`ToolLoopState`] —
@@ -20,6 +20,7 @@ pub(crate) fn tool_call_is_read_only(name: &str) -> bool {
         name,
         "file_read"
             | "file_search"
+            | "semantic_search"
             | "file_glob"
             | "fs_list"
             | "explore_batch"
@@ -113,6 +114,7 @@ pub(crate) fn display_tool_name(name: &str) -> &str {
     match name {
         "file_read" => "file.read",
         "file_search" => "file.search",
+        "semantic_search" => "semantic.search",
         "file_glob" => "file.glob",
         "fs_list" => "fs.list",
         "explore_batch" => "explore.batch",

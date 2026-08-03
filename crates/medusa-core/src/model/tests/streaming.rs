@@ -90,6 +90,33 @@ fn extracts_completed_reasoning_summaries() {
 }
 
 #[test]
+fn responses_stream_does_not_replay_completed_reasoning() {
+    let stream = concat!(
+        "data: {\"type\":\"response.reasoning_summary_text.delta\",\"delta\":\"Checking files\"}\n",
+        "data: {\"type\":\"response.reasoning_summary_text.done\",\"text\":\"Checking files\"}\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"output\":[{\"type\":\"reasoning\",\"summary\":[{\"type\":\"summary_text\",\"text\":\"Checking files\"}]}]}}\n",
+    );
+    let mut events = Vec::new();
+
+    wire::read_sse_response(
+        std::io::Cursor::new(stream.as_bytes().to_vec()),
+        &crate::cancel::CancelToken::new(),
+        &mut |event| {
+            events.push(event);
+            Ok(())
+        },
+    )
+    .unwrap();
+
+    assert_eq!(
+        events,
+        vec![types::ModelStreamEvent::ReasoningDelta(
+            "Checking files".to_string()
+        )]
+    );
+}
+
+#[test]
 fn extracts_completed_tool_calls() {
     let event = json!({
         "type": "response.completed",
@@ -137,6 +164,7 @@ fn medusa_tools_include_structured_file_tools() {
 
     assert!(names.contains(&"file_read"));
     assert!(names.contains(&"file_search"));
+    assert!(names.contains(&"semantic_search"));
     assert!(names.contains(&"fs_list"));
     assert!(names.contains(&"explore_batch"));
     assert!(names.contains(&"file_edit"));

@@ -23,11 +23,49 @@ use crossterm::{
         disable_raw_mode, enable_raw_mode, supports_keyboard_enhancement,
     },
 };
-use ratatui::{Terminal, backend::CrosstermBackend};
+use ratatui::{Terminal, backend::CrosstermBackend, symbols::border};
 
 pub(crate) type Tui = Terminal<CrosstermBackend<io::Stdout>>;
 
 static KEYBOARD_ENHANCED: AtomicBool = AtomicBool::new(false);
+
+const ASCII_BORDER: border::Set<'static> = border::Set {
+    top_left: "+",
+    top_right: "+",
+    bottom_left: "+",
+    bottom_right: "+",
+    vertical_left: "|",
+    vertical_right: "|",
+    horizontal_top: "-",
+    horizontal_bottom: "-",
+};
+
+fn ascii_ui_enabled(term_program: Option<&str>, override_value: Option<&str>) -> bool {
+    match override_value.map(|value| value.trim().to_ascii_lowercase()) {
+        Some(value) if matches!(value.as_str(), "1" | "true" | "on" | "always") => true,
+        Some(value) if matches!(value.as_str(), "0" | "false" | "off" | "never") => false,
+        _ => term_program.is_some_and(|value| value.eq_ignore_ascii_case("Apple_Terminal")),
+    }
+}
+
+pub(crate) fn ascii_ui() -> bool {
+    ascii_ui_enabled(
+        env::var("TERM_PROGRAM").ok().as_deref(),
+        env::var("MEDUSA_ASCII").ok().as_deref(),
+    )
+}
+
+pub(crate) fn ui_border_set() -> border::Set<'static> {
+    if ascii_ui() {
+        ASCII_BORDER
+    } else {
+        border::ROUNDED
+    }
+}
+
+pub(crate) fn horizontal_rule(width: usize) -> String {
+    ui_border_set().horizontal_top.repeat(width)
+}
 
 fn themed_color_output_enabled(override_value: Option<&str>) -> bool {
     !override_value.is_some_and(|value| {
@@ -219,7 +257,7 @@ pub(crate) fn relaunch_current_executable() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::themed_color_output_enabled;
+    use super::{ascii_ui_enabled, themed_color_output_enabled};
 
     #[test]
     fn themed_tui_enables_color_by_default() {
@@ -233,5 +271,13 @@ mod tests {
         for value in ["never", "off", "false", "0", " NEVER "] {
             assert!(!themed_color_output_enabled(Some(value)));
         }
+    }
+
+    #[test]
+    fn apple_terminal_uses_ascii_unless_overridden() {
+        assert!(ascii_ui_enabled(Some("Apple_Terminal"), None));
+        assert!(!ascii_ui_enabled(Some("Apple_Terminal"), Some("off")));
+        assert!(ascii_ui_enabled(Some("ghostty"), Some("on")));
+        assert!(!ascii_ui_enabled(Some("ghostty"), None));
     }
 }
