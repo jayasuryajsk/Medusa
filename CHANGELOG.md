@@ -5,6 +5,32 @@ semantic versioning while the public interfaces stabilize.
 
 ## Unreleased
 
+## 0.3.3 - 2026-08-09
+
+### Added
+
+- A keyboard-navigable inline approval pane with concise one-shot, remembered,
+  and deny actions plus expandable command and path details.
+- Animated manual and automatic context-compaction progress with cancellation,
+  before/after token estimates, and queued-prompt continuity.
+
+### Changed
+
+- Tool activity is condensed into one expandable batch per user turn, while
+  intermediate operational narration stays out of the visible transcript.
+- Removed the experimental local semantic index, embedding model download, and
+  `llama-server` dependency. Medusa continues to use parallel file search,
+  globbing, listing, and exact reads for repository discovery.
+
+### Fixed
+
+- Concurrent or abandoned compaction workers can no longer install a stale
+  summary into a newer session or index beyond their history snapshot.
+- Manual compaction no longer blocks the UI, races active workflows, or traps
+  users in an uninterruptible model request.
+- Queued approval requests reset selection and accidental-keypress protection
+  correctly as each request becomes active.
+
 ## 0.3.2 - 2026-08-04
 
 ### Added

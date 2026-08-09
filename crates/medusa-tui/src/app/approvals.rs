@@ -34,6 +34,9 @@ impl App {
                     } else if let Some(decision) = self.auto_approval_decision(&pending.request) {
                         let _ = pending.respond.send(decision);
                     } else {
+                        if self.approval_queue.is_empty() {
+                            self.reset_approval_ui();
+                        }
                         self.approval_queue.push_back(pending);
                     }
                 }
@@ -133,6 +136,9 @@ impl App {
         };
         // The next queued request must serve its own grace window.
         self.approval_shown_at = None;
+        self.approval_selection = 0;
+        self.approval_expanded = false;
+        self.approval_detail_scroll = 0;
 
         // Defense in depth: even if an always-allow decision reaches an
         // escalation (the card doesn't offer one), downgrade it to a
@@ -173,6 +179,14 @@ impl App {
             } else {
                 self.approval_queue.push_back(pending);
             }
+        }
+        if self.approval_queue.is_empty() {
+            self.reset_approval_ui();
+        } else {
+            // The next queued card is visible immediately, so its accidental
+            // keypress guard starts now rather than eating the user's first
+            // key whenever they eventually respond.
+            self.approval_shown_at = Some(Instant::now());
         }
     }
 

@@ -116,6 +116,12 @@ pub(crate) struct App {
     session_web_egress_allowed: bool,
     denied_this_turn: Vec<String>,
     approval_shown_at: Option<Instant>,
+    /// Highlighted action in the active approval pane.
+    approval_selection: usize,
+    /// Expanded approvals devote the transcript area to long command/path details.
+    approval_expanded: bool,
+    /// Vertical offset into long approval details while expanded.
+    approval_detail_scroll: u16,
     denied_edits_this_turn: Vec<String>,
     background_job_events: Receiver<BackgroundJobEvent>,
     background_jobs: BTreeMap<String, BackgroundJobView>,
@@ -173,9 +179,14 @@ pub(crate) struct App {
     context_report: Option<ContextReport>,
     /// Result channel for a background /compact run; None while idle.
     compact_events: Option<Receiver<Result<ManualCompaction, String>>>,
+    /// Shared cancellation flag for a manual `/compact` worker.
+    compact_cancel: Option<CancelToken>,
     /// Automatic compaction runs inside the active model worker and reports
     /// its lifecycle through ModelStreamEvent.
     compaction_active: bool,
+    /// Start time and input size for the live, indeterminate compaction UI.
+    compaction_started_at: Option<Instant>,
+    compaction_before_tokens: Option<usize>,
     /// Most recent successful manual or automatic compaction, retained long
     /// enough for the footer and context modal to explain the changed gauge.
     last_compaction: Option<(ManualCompaction, Instant)>,
@@ -203,6 +214,7 @@ pub(crate) struct App {
     review_diff_check: fn(&Path) -> bool,
 }
 
+mod approval_ui;
 mod approvals;
 mod attachments;
 mod commands;

@@ -164,7 +164,6 @@ fn medusa_tools_include_structured_file_tools() {
 
     assert!(names.contains(&"file_read"));
     assert!(names.contains(&"file_search"));
-    assert!(names.contains(&"semantic_search"));
     assert!(names.contains(&"fs_list"));
     assert!(names.contains(&"explore_batch"));
     assert!(names.contains(&"file_edit"));

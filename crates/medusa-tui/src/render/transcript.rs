@@ -33,33 +33,27 @@ pub(crate) fn visible_transcript_rows(
     while index < transcript.len() {
         match &transcript[index] {
             TranscriptItem::Message(message) if message.role == ChatRole::Assistant => {
-                let assistant = message.clone();
-                let assistant_index = index;
-                index += 1;
-
-                let activity_start = index;
-                while index < transcript.len()
-                    && matches!(
-                        transcript[index],
-                        TranscriptItem::Tool(_) | TranscriptItem::Reasoning(_)
-                    )
+                let (turn_start, turn_end) = activity_turn_range(transcript, index);
+                // Earlier assistant text in this user turn is operational
+                // narration. Keep it in history, but render only the latest
+                // answer candidate after the turn-level activity batch.
+                let has_activity = turn_has_activity(transcript, turn_start, turn_end);
+                if !has_activity
+                    || final_assistant_index(transcript, turn_start, turn_end) == Some(index)
                 {
-                    index += 1;
+                    if has_activity {
+                        append_turn_activity_rows(
+                            &mut rows,
+                            transcript,
+                            turn_start,
+                            turn_end,
+                            selected_tool,
+                            context,
+                        );
+                    }
+                    append_chat_message_rows(&mut rows, message, streaming_message == Some(index));
                 }
-
-                append_activity_rows(
-                    &mut rows,
-                    transcript,
-                    activity_start,
-                    index,
-                    selected_tool,
-                    context,
-                );
-                append_chat_message_rows(
-                    &mut rows,
-                    &assistant,
-                    streaming_message == Some(assistant_index),
-                );
+                index += 1;
             }
             TranscriptItem::Message(message) => {
                 let is_streaming = streaming_message == Some(index);
@@ -92,29 +86,115 @@ pub(crate) fn visible_transcript_rows(
                 index += 1;
             }
             TranscriptItem::Tool(_) | TranscriptItem::Reasoning(_) => {
-                let activity_start = index;
-                while index < transcript.len()
-                    && matches!(
-                        transcript[index],
-                        TranscriptItem::Tool(_) | TranscriptItem::Reasoning(_)
-                    )
+                let (turn_start, turn_end) = activity_turn_range(transcript, index);
+                if final_assistant_index(transcript, turn_start, turn_end).is_none()
+                    && first_activity_index(transcript, turn_start, turn_end) == Some(index)
                 {
-                    index += 1;
+                    append_turn_activity_rows(
+                        &mut rows,
+                        transcript,
+                        turn_start,
+                        turn_end,
+                        selected_tool,
+                        context,
+                    );
                 }
-                append_activity_rows(
-                    &mut rows,
-                    transcript,
-                    activity_start,
-                    index,
-                    selected_tool,
-                    context,
-                );
+                index += 1;
             }
         }
     }
 
     append_chat_bottom_padding(&mut rows);
     rows
+}
+
+pub(crate) fn activity_turn_range(transcript: &[TranscriptItem], index: usize) -> (usize, usize) {
+    let start = transcript[..index]
+        .iter()
+        .rposition(|item| {
+            matches!(item, TranscriptItem::Message(message) if message.role == ChatRole::User)
+        })
+        .map_or(0, |position| position + 1);
+    let end = transcript[index + 1..]
+        .iter()
+        .position(|item| {
+            matches!(item, TranscriptItem::Message(message) if message.role == ChatRole::User)
+        })
+        .map_or(transcript.len(), |offset| index + 1 + offset);
+    (start, end)
+}
+
+pub(crate) fn first_activity_index(
+    transcript: &[TranscriptItem],
+    start: usize,
+    end: usize,
+) -> Option<usize> {
+    transcript[start..end]
+        .iter()
+        .position(|item| matches!(item, TranscriptItem::Tool(_) | TranscriptItem::Reasoning(_)))
+        .map(|offset| start + offset)
+}
+
+pub(crate) fn turn_has_activity(transcript: &[TranscriptItem], start: usize, end: usize) -> bool {
+    transcript[start..end]
+        .iter()
+        .any(|item| matches!(item, TranscriptItem::Tool(_) | TranscriptItem::Reasoning(_)))
+}
+
+pub(crate) fn final_assistant_index(
+    transcript: &[TranscriptItem],
+    start: usize,
+    end: usize,
+) -> Option<usize> {
+    let candidate = transcript[start..end]
+        .iter()
+        .rposition(|item| {
+            matches!(item, TranscriptItem::Message(message) if message.role == ChatRole::Assistant)
+        })
+        .map(|offset| start + offset)?;
+    if transcript[candidate + 1..end]
+        .iter()
+        .any(|item| matches!(item, TranscriptItem::Tool(_)))
+    {
+        None
+    } else {
+        Some(candidate)
+    }
+}
+
+pub(crate) fn append_turn_activity_rows(
+    rows: &mut Vec<TranscriptRow>,
+    transcript: &[TranscriptItem],
+    start: usize,
+    end: usize,
+    selected_tool: Option<usize>,
+    context: RenderContext,
+) {
+    let mut lines = Vec::new();
+
+    if context.show_reasoning
+        && let Some(reasoning) = transcript[start..end]
+            .iter()
+            .rev()
+            .find_map(|item| match item {
+                TranscriptItem::Reasoning(trace) if !trace.content.trim().is_empty() => {
+                    Some(trace.content.trim())
+                }
+                _ => None,
+            })
+        && let Some(latest) = reasoning.lines().rev().find(|line| !line.trim().is_empty())
+    {
+        lines.push(Line::from(vec![
+            Span::styled("  ", muted()),
+            Span::styled(
+                truncate(latest.trim(), 180),
+                muted().add_modifier(Modifier::ITALIC),
+            ),
+        ]));
+    }
+
+    append_tool_batch_lines(&mut lines, transcript, start, end, selected_tool, context);
+    rows.extend(lines.into_iter().map(TranscriptRow::text));
 }
 
 pub(crate) fn append_chat_bottom_padding(rows: &mut Vec<TranscriptRow>) {
@@ -519,58 +599,5 @@ pub(crate) fn append_user_message_lines(
 
     if !attachments.is_empty() {
         lines.push(attachment_strip_line(attachments).style(user_message_background_style()));
-    }
-}
-
-pub(crate) fn append_activity_rows(
-    rows: &mut Vec<TranscriptRow>,
-    transcript: &[TranscriptItem],
-    start: usize,
-    end: usize,
-    selected_tool: Option<usize>,
-    context: RenderContext,
-) {
-    let mut lines = Vec::new();
-    append_activity_lines(&mut lines, transcript, start, end, selected_tool, context);
-    rows.extend(lines.into_iter().map(TranscriptRow::text));
-}
-
-pub(crate) fn append_activity_lines(
-    lines: &mut Vec<Line<'static>>,
-    transcript: &[TranscriptItem],
-    start: usize,
-    end: usize,
-    selected_tool: Option<usize>,
-    context: RenderContext,
-) {
-    let reasoning = if context.show_reasoning {
-        transcript[start..end]
-            .iter()
-            .filter_map(|item| match item {
-                TranscriptItem::Reasoning(trace) => Some(trace.content.as_str()),
-                _ => None,
-            })
-            .collect::<String>()
-    } else {
-        String::new()
-    };
-    if !reasoning.trim().is_empty() {
-        for text_line in reasoning.trim().lines() {
-            lines.push(Line::from(vec![
-                Span::styled("  ", muted()),
-                Span::styled(
-                    text_line.to_string(),
-                    muted().add_modifier(Modifier::ITALIC),
-                ),
-            ]));
-        }
-    }
-
-    let has_tools = transcript[start..end]
-        .iter()
-        .any(|item| matches!(item, TranscriptItem::Tool(_)));
-
-    if has_tools {
-        append_tool_group_lines(lines, transcript, start, end, selected_tool, context);
     }
 }

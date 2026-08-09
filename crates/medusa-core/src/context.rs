@@ -123,6 +123,15 @@ pub struct CompactionSummary {
     pub text: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct ContextState {
+    /// Changes whenever the transcript epoch changes. A summarizer that
+    /// started before a reset may finish later, but must never repopulate the
+    /// new session with a summary of the old one.
+    generation: u64,
+    summary: Option<CompactionSummary>,
+}
+
 /// Keeps conversation history inside the token budget. When history outgrows
 /// the budget, older messages are folded into an LLM-generated summary that is
 /// extended incrementally on later turns; recent messages pass through
@@ -130,7 +139,7 @@ pub struct CompactionSummary {
 #[derive(Debug, Clone)]
 pub struct ContextEngine {
     max_tokens: usize,
-    state: Arc<Mutex<Option<CompactionSummary>>>,
+    state: Arc<Mutex<ContextState>>,
 }
 
 impl Default for ContextEngine {
@@ -143,14 +152,14 @@ impl ContextEngine {
     pub fn new() -> Self {
         Self {
             max_tokens: context_max_tokens(),
-            state: Arc::new(Mutex::new(None)),
+            state: Arc::new(Mutex::new(ContextState::default())),
         }
     }
 
     pub fn with_max_tokens(max_tokens: usize) -> Self {
         Self {
             max_tokens,
-            state: Arc::new(Mutex::new(None)),
+            state: Arc::new(Mutex::new(ContextState::default())),
         }
     }
 
@@ -179,6 +188,7 @@ impl ContextEngine {
         let (prefix, body) = messages.split_at(system_prefix_len);
         let state = self.state.lock().expect("context engine lock");
         let summary = state
+            .summary
             .as_ref()
             .filter(|summary| summary.covers <= body.len());
         let prefix_tokens: usize = prefix.iter().map(message_tokens).sum();
@@ -203,6 +213,7 @@ impl ContextEngine {
         let (prefix, body) = messages.split_at(system_prefix_len);
         let state = self.state.lock().expect("context engine lock");
         let Some(summary) = state
+            .summary
             .as_ref()
             .filter(|summary| summary.covers <= body.len())
         else {
@@ -217,11 +228,17 @@ impl ContextEngine {
     /// Forget the accumulated summary (call when history is cleared or a
     /// different session is loaded).
     pub fn reset(&self) {
-        *self.state.lock().expect("context engine lock") = None;
+        let mut state = self.state.lock().expect("context engine lock");
+        state.generation = state.generation.wrapping_add(1);
+        state.summary = None;
     }
 
     pub fn summary(&self) -> Option<CompactionSummary> {
-        self.state.lock().expect("context engine lock").clone()
+        self.state
+            .lock()
+            .expect("context engine lock")
+            .summary
+            .clone()
     }
 
     pub fn prepare(
@@ -246,14 +263,22 @@ impl ContextEngine {
             .count();
         let (prefix, body) = messages.split_at(system_prefix_len);
 
-        let mut state = self.state.lock().expect("context engine lock");
-        // History shrank underneath us (cleared or switched session).
-        if state
-            .as_ref()
-            .is_some_and(|summary| summary.covers > body.len())
-        {
-            *state = None;
-        }
+        // Snapshot the summary before any model call. Holding this mutex while
+        // `summarize` waits on the network blocks TUI reads of context state
+        // and makes the entire interface appear frozen.
+        let state_snapshot = {
+            let mut state = self.state.lock().expect("context engine lock");
+            // History shrank underneath us (cleared or switched session).
+            if state
+                .summary
+                .as_ref()
+                .is_some_and(|summary| summary.covers > body.len())
+            {
+                state.generation = state.generation.wrapping_add(1);
+                state.summary = None;
+            }
+            state.clone()
+        };
 
         let prefix_tokens: usize = prefix.iter().map(message_tokens).sum();
         let available = self.max_tokens.saturating_sub(prefix_tokens);
@@ -262,8 +287,13 @@ impl ContextEngine {
         // instead of being rewritten after every small addition.
         let high_water = available.saturating_mul(COMPACTION_HIGH_WATER_PERCENT) / 100;
         let low_water = available.saturating_mul(COMPACTION_LOW_WATER_PERCENT) / 100;
-        let base_covers = state.as_ref().map(|summary| summary.covers).unwrap_or(0);
-        let active_tokens = state
+        let base_covers = state_snapshot
+            .summary
+            .as_ref()
+            .map(|summary| summary.covers)
+            .unwrap_or(0);
+        let active_tokens = state_snapshot
+            .summary
             .as_ref()
             .map(|summary| message_tokens(&summary_message(summary)))
             .unwrap_or(0)
@@ -273,7 +303,7 @@ impl ContextEngine {
                 .sum::<usize>();
 
         if active_tokens <= high_water {
-            if let Some(summary) = state.as_ref() {
+            if let Some(summary) = state_snapshot.summary.as_ref() {
                 let mut result = prefix.to_vec();
                 result.push(summary_message(summary));
                 result.extend_from_slice(&body[summary.covers..]);
@@ -303,18 +333,49 @@ impl ContextEngine {
             return messages.to_vec();
         }
 
-        if state
+        let summary = if state_snapshot
+            .summary
             .as_ref()
             .is_none_or(|summary| summary.covers < cut || summary.text.is_empty())
         {
-            let previous = state.as_ref().map(|summary| summary.text.clone());
+            let previous = state_snapshot
+                .summary
+                .as_ref()
+                .map(|summary| summary.text.clone());
             let prompt = summary_source(previous.as_deref(), &body[base_covers..cut]);
             match summarize(&prompt) {
                 Ok(text) if !text.trim().is_empty() => {
-                    *state = Some(CompactionSummary {
+                    let candidate = CompactionSummary {
                         covers: cut,
                         text: cap_chars(text.trim(), SUMMARY_MAX_CHARS),
-                    });
+                    };
+                    let mut state = self.state.lock().expect("context engine lock");
+                    if state.generation != state_snapshot.generation {
+                        // The app cleared or switched history while the model
+                        // was summarizing. Use the candidate only for this
+                        // already-running request; never leak it into the new
+                        // transcript epoch.
+                        candidate
+                    } else if let Some(current) = state.summary.as_ref().filter(|current| {
+                        current.covers >= candidate.covers && current.covers <= body.len()
+                    }) {
+                        // A concurrent prepare reached at least as far and is
+                        // valid for this snapshot. Reuse it.
+                        current.clone()
+                    } else {
+                        // A summary produced from a longer concurrent snapshot
+                        // may cover beyond this body. Preserve that newer
+                        // global state, but return our bounded candidate so the
+                        // slice below always remains valid.
+                        if state
+                            .summary
+                            .as_ref()
+                            .is_none_or(|current| current.covers <= candidate.covers)
+                        {
+                            state.summary = Some(candidate.clone());
+                        }
+                        candidate
+                    }
                 }
                 _ => {
                     // Summarization unavailable: degrade to a plain omission note.
@@ -324,11 +385,13 @@ impl ContextEngine {
                     return result;
                 }
             }
-        }
-
-        let summary = state.as_ref().expect("summary present after refresh");
+        } else {
+            state_snapshot
+                .summary
+                .expect("summary present without refresh")
+        };
         let mut result = prefix.to_vec();
-        result.push(summary_message(summary));
+        result.push(summary_message(&summary));
         result.extend_from_slice(&body[summary.covers..]);
         result
     }
@@ -360,14 +423,24 @@ impl ContextEngine {
             .count();
         let (prefix, body) = messages.split_at(system_prefix_len);
 
-        let mut state = self.state.lock().expect("context engine lock");
-        if state
+        // As above, never hold the context lock while the backend summarizes.
+        let state_snapshot = {
+            let mut state = self.state.lock().expect("context engine lock");
+            if state
+                .summary
+                .as_ref()
+                .is_some_and(|summary| summary.covers > body.len())
+            {
+                state.generation = state.generation.wrapping_add(1);
+                state.summary = None;
+            }
+            state.clone()
+        };
+        let base_covers = state_snapshot
+            .summary
             .as_ref()
-            .is_some_and(|summary| summary.covers > body.len())
-        {
-            *state = None;
-        }
-        let base_covers = state.as_ref().map(|summary| summary.covers).unwrap_or(0);
+            .map(|summary| summary.covers)
+            .unwrap_or(0);
 
         // Keep the last two messages verbatim, like prepare's floor.
         let cut = body.len().saturating_sub(2);
@@ -376,7 +449,10 @@ impl ContextEngine {
         }
 
         let before_tokens = messages.iter().map(message_tokens).sum::<usize>();
-        let previous = state.as_ref().map(|summary| summary.text.clone());
+        let previous = state_snapshot
+            .summary
+            .as_ref()
+            .map(|summary| summary.text.clone());
         let prompt = summary_source(previous.as_deref(), &body[base_covers..cut]);
         let text = summarize(&prompt).wrap_err("compaction summarizer failed")?;
         if text.trim().is_empty() {
@@ -394,7 +470,11 @@ impl ContextEngine {
             .chain(body[cut..].iter().map(message_tokens))
             .sum::<usize>();
         let folded_messages = cut - base_covers;
-        *state = Some(summary);
+        let mut state = self.state.lock().expect("context engine lock");
+        if *state != state_snapshot {
+            bail!("context changed while compaction was running; retry");
+        }
+        state.summary = Some(summary);
 
         Ok(ManualCompaction {
             before_tokens,
@@ -751,6 +831,116 @@ mod tests {
         assert!(
             engine.summary().is_none(),
             "failed compact must not persist state"
+        );
+    }
+
+    #[test]
+    fn manual_compact_does_not_lock_context_reads_during_summarization() {
+        use std::{sync::mpsc, thread, time::Duration};
+
+        let engine = ContextEngine::with_max_tokens(1_000_000);
+        let mut messages = vec![message("system", "permissions")];
+        for index in 0..6 {
+            messages.push(message("user", &format!("q{index} {}", long_text(100))));
+        }
+
+        let worker_engine = engine.clone();
+        let (summarizer_started_tx, summarizer_started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            worker_engine.compact_now_with_summarizer(&messages, |_| {
+                summarizer_started_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                Ok("- compact summary".to_string())
+            })
+        });
+
+        summarizer_started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("summarizer did not start");
+        let reader_engine = engine.clone();
+        let (read_tx, read_rx) = mpsc::channel();
+        thread::spawn(move || read_tx.send(reader_engine.summary()).unwrap());
+        let read = read_rx.recv_timeout(Duration::from_millis(200));
+        release_tx.send(()).unwrap();
+
+        assert_eq!(read.expect("context read blocked behind summarizer"), None);
+        worker.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn concurrent_prepare_never_uses_summary_beyond_its_history_snapshot() {
+        use std::{sync::mpsc, thread, time::Duration};
+
+        let engine = ContextEngine::with_max_tokens(1_000);
+        let mut short = vec![message("system", "permissions")];
+        for index in 0..8 {
+            short.push(message("user", &format!("q{index} {}", long_text(200))));
+        }
+        let short_body_len = short.len() - 1;
+        let mut long = short.clone();
+        for index in 8..16 {
+            long.push(message("user", &format!("q{index} {}", long_text(200))));
+        }
+
+        let worker_engine = engine.clone();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            worker_engine.prepare_with_summarizer(&short, |_| {
+                started_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                Ok("short summary".to_string())
+            })
+        });
+
+        started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("short summarizer did not start");
+        let long_prepared =
+            engine.prepare_with_summarizer(&long, |_| Ok("long summary".to_string()));
+        let long_summary = engine.summary().expect("long summary persisted");
+        assert!(long_summary.covers > short_body_len);
+        assert!(long_prepared[1].content.contains("long summary"));
+
+        release_tx.send(()).unwrap();
+        let short_prepared = worker.join().expect("short prepare panicked");
+
+        assert!(short_prepared[1].content.contains("short summary"));
+        assert_eq!(engine.summary(), Some(long_summary));
+    }
+
+    #[test]
+    fn reset_while_summarizing_does_not_repopulate_stale_context() {
+        use std::{sync::mpsc, thread, time::Duration};
+
+        let engine = ContextEngine::with_max_tokens(1_000);
+        let mut messages = vec![message("system", "permissions")];
+        for index in 0..8 {
+            messages.push(message("user", &format!("q{index} {}", long_text(200))));
+        }
+
+        let worker_engine = engine.clone();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            worker_engine.prepare_with_summarizer(&messages, |_| {
+                started_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                Ok("summary from abandoned history".to_string())
+            })
+        });
+
+        started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("summarizer did not start");
+        engine.reset();
+        release_tx.send(()).unwrap();
+        worker.join().expect("prepare panicked");
+
+        assert!(
+            engine.summary().is_none(),
+            "an old worker must not repopulate context after reset"
         );
     }
 

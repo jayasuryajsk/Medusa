@@ -200,19 +200,6 @@ Chat reasoning dialects are `openai` (`reasoning_effort`), `openrouter`
 Per-model capabilities override provider defaults and control tool schemas,
 parallel tool requests, image payloads, and reasoning choices.
 
-## Local Semantic Search
-
-`semantic.search` uses Nomic Embed Text v1.5 Q8 through a persistent local
-`llama-server`. Install llama.cpp (`brew install llama.cpp` on macOS); the
-embedding model downloads once into the global Medusa data directory. Each
-workspace keeps its incremental, quantized index at
-`.medusa/semantic/index.bin`. Medusa refreshes changed and deleted files before
-search and marks the index dirty after native edits or patches.
-
-The default model is pinned by revision. Override it with
-`MEDUSA_SEMANTIC_MODEL` only when the replacement uses the same embedding
-space, or delete the workspace index before switching models.
-
 ## Environment Variables
 
 | Variable | Purpose |
@@ -227,10 +214,6 @@ space, or delete the workspace index before switching models.
 | `MEDUSA_CONFIG_HOME` | Global configuration directory; default `~/.config/medusa` |
 | `MEDUSA_DATA_HOME` | Private state directory; default `~/.local/share/medusa` |
 | `MEDUSA_CONTEXT_MAX_TOKENS` | Context budget before compaction; default 60k |
-| `MEDUSA_LLAMA_SERVER` | Path to the `llama-server` executable |
-| `MEDUSA_SEMANTIC_MODEL` | Path to a local Nomic-compatible GGUF embedding model |
-| `MEDUSA_SEMANTIC_MODEL_URL` | Override the one-time model download URL |
-| `MEDUSA_SEMANTIC_BATCH_SIZE` | Embedding batch size; default 24 |
 | `MEDUSA_VERIFY` | Set to `off` to disable post-edit verification |
 | `MEDUSA_VERIFY_TIMEOUT_SECS` | Verification timeout; default 90 |
 | `MEDUSA_SANDBOX` | `on` or `off` |

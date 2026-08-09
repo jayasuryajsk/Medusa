@@ -15,7 +15,6 @@ pub mod persistence;
 mod proc;
 pub mod project;
 pub mod sandbox;
-pub mod semantic;
 pub mod session;
 pub mod skills;
 pub mod tools;

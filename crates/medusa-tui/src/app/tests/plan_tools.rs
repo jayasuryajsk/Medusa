@@ -179,16 +179,16 @@ fn answering_pending_decision_marks_it_answered() {
 fn decision_choice_can_be_selected_with_keyboard_and_submitted() {
     let mut app = app();
     app.apply_decision_request_output(
-        r#"{"title":"Semantic indexing","questions":[{"id":"embedding","prompt":"Which embedding approach?","kind":"choice","options":["local embeddings","remote API embeddings","hybrid"],"recommended":"local embeddings","required":true},{"id":"timing","prompt":"When should it run?","kind":"choice","options":["manual only","lazy on first search","background on startup"],"recommended":"lazy on first search","required":true}]}"#,
+        r#"{"title":"Test strategy","questions":[{"id":"scope","prompt":"Which test scope?","kind":"choice","options":["unit tests","integration tests","full suite"],"recommended":"unit tests","required":true},{"id":"timing","prompt":"When should tests run?","kind":"choice","options":["before changes","after changes","before and after"],"recommended":"after changes","required":true}]}"#,
     )
     .unwrap();
 
     app.handle_key(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE));
     assert_eq!(
         app.pending_decision()
-            .and_then(|decision| decision.answers.get("embedding"))
+            .and_then(|decision| decision.answers.get("scope"))
             .map(String::as_str),
-        Some("remote API embeddings")
+        Some("integration tests")
     );
 
     app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
@@ -201,14 +201,14 @@ fn decision_choice_can_be_selected_with_keyboard_and_submitted() {
     assert!(decision.answered);
     assert_eq!(
         decision.answers.get("timing").map(String::as_str),
-        Some("background on startup")
+        Some("before and after")
     );
     assert!(matches!(
         app.transcript.last(),
         Some(TranscriptItem::Message(ChatMessage { role: ChatRole::User, content, .. }))
-            if content.contains("Decision answer: Semantic indexing")
-                && content.contains("- embedding: remote API embeddings")
-                && content.contains("- timing: background on startup")
+            if content.contains("Decision answer: Test strategy")
+                && content.contains("- scope: integration tests")
+                && content.contains("- timing: before and after")
     ));
 }
 
@@ -261,7 +261,7 @@ fn visible_tool_activity_lines_show_running_state() {
     ));
     let text = lines.iter().map(line_text).collect::<Vec<_>>();
 
-    assert!(text[0].contains("patch apply patch"));
+    assert!(text[0].contains("tools · 1 call · patch ×1"));
     assert!(
         text[0].contains("⠁")
             || text[0].contains("⠃")
@@ -270,7 +270,8 @@ fn visible_tool_activity_lines_show_running_state() {
             || text[0].contains("⠷")
             || text[0].contains("⠿")
     );
-    assert!(text[1].contains("⎿ running…"));
+    assert!(text[0].contains("working"));
+    assert_eq!(text.iter().filter(|line| !line.is_empty()).count(), 1);
 }
 
 #[test]
@@ -461,22 +462,14 @@ fn consecutive_tool_rows_render_as_one_activity_block() {
     let lines = visible_transcript_lines(&transcript, None, None);
     let text = lines.iter().map(line_text).collect::<Vec<_>>();
 
-    assert!(
-        text.iter()
-            .any(|line| line.contains("terminal $ cargo test -p medusa-tui"))
-    );
-    assert!(text.iter().any(|line| line.contains("⎿ 24 passed")));
-    assert!(
-        text.iter()
-            .any(|line| line.contains("patch crates/medusa-tui/src/main.rs - update renderer"))
-    );
-    assert!(
-        text.iter()
-            .any(|line| line.contains("⎿ error: patch rejected"))
-    );
-    assert!(
-        text.iter()
-            .any(|line| line.contains("recovery: inspect context"))
+    assert!(text[0].contains("tools · 2 calls"));
+    assert!(text[0].contains("terminal ×1"));
+    assert!(text[0].contains("patch ×1"));
+    assert!(text[0].contains("1 failed"));
+    assert_eq!(
+        text.iter().filter(|line| !line.is_empty()).count(),
+        1,
+        "collapsed activity is one timeline row"
     );
 }
 
@@ -527,17 +520,10 @@ fn consecutive_same_tool_calls_coalesce_into_one_line() {
     let lines = visible_transcript_lines(&transcript, None, None);
     let text = lines.iter().map(line_text).collect::<Vec<_>>();
 
-    assert!(
-        text.iter()
-            .any(|line| { line.contains("read src/main.rs, src/tools.rs, src/wire.rs +1 more") })
-    );
-    assert!(text.iter().any(|line| line.contains("⎿ 4 calls")));
-    // The lone terminal call renders as a normal block.
-    assert!(
-        text.iter()
-            .any(|line| line.contains("terminal $ cargo check"))
-    );
-    assert!(!text.iter().any(|line| line.contains("read src/tools.rs\n")));
+    assert!(text[0].contains("tools · 5 calls"));
+    assert!(text[0].contains("read ×4"));
+    assert!(text[0].contains("terminal ×1"));
+    assert_eq!(text.iter().filter(|line| !line.is_empty()).count(), 1);
 }
 
 #[test]
@@ -579,7 +565,7 @@ fn out_of_order_tool_results_land_on_the_right_blocks_by_call_id() {
 }
 
 #[test]
-fn edit_tool_shows_diff_lines_and_never_coalesces() {
+fn edit_tools_collapse_into_turn_summary_until_expanded() {
     let mut first = finished_tool("file.edit", "edit src/a.rs", ToolRunState::Succeeded);
     first.detail =
         "edited src/a.rs (1 replacement)\n- fn old() {}\n+ fn new() {}\n  shared".to_string();
@@ -590,12 +576,9 @@ fn edit_tool_shows_diff_lines_and_never_coalesces() {
     let lines = visible_transcript_lines(&transcript, None, None);
     let text = lines.iter().map(line_text).collect::<Vec<_>>();
 
-    // Both edits stay as separate blocks with their diff bodies visible.
-    assert!(text.iter().any(|line| line.contains("edit src/a.rs")));
-    assert!(text.iter().any(|line| line.contains("edit src/b.rs")));
-    assert!(text.iter().any(|line| line.contains("- fn old() {}")));
-    assert!(text.iter().any(|line| line.contains("+ fn new() {}")));
-    assert!(!text.iter().any(|line| line.contains("2 calls")));
+    assert!(text[0].contains("tools · 2 calls · edit ×2"));
+    assert_eq!(text.iter().filter(|line| !line.is_empty()).count(), 1);
+    assert!(!text.iter().any(|line| line.contains("fn old")));
 }
 
 #[test]
@@ -619,26 +602,13 @@ fn running_call_joins_coalesced_run_as_live_tail() {
     let lines = visible_transcript_lines(&transcript, None, None);
     let text = lines.iter().map(line_text).collect::<Vec<_>>();
 
-    assert!(
-        text.iter()
-            .any(|line| line.contains("read src/main.rs, src/tools.rs, src/slow.rs")),
-        "running call renders inside the coalesced line, not below it"
-    );
-    assert!(
-        text.iter()
-            .any(|line| line.contains("⎿ 3 calls · running…"))
-    );
-    assert_eq!(
-        text.iter()
-            .filter(|line| line.contains("src/slow.rs"))
-            .count(),
-        1,
-        "the running call must not also render as its own block"
-    );
+    assert!(text[0].contains("tools · 3 calls · read ×3"));
+    assert!(text[0].contains("working"));
+    assert_eq!(text.iter().filter(|line| !line.is_empty()).count(), 1);
 }
 
 #[test]
-fn failed_and_running_calls_never_coalesce() {
+fn failed_and_running_calls_share_one_turn_summary() {
     let mut running = finished_tool("file.read", "read src/slow.rs", ToolRunState::Running);
     running.detail = String::new();
     let transcript = vec![
@@ -658,10 +628,10 @@ fn failed_and_running_calls_never_coalesce() {
     let lines = visible_transcript_lines(&transcript, None, None);
     let text = lines.iter().map(line_text).collect::<Vec<_>>();
 
-    assert!(!text.iter().any(|line| line.contains("calls")));
-    assert!(text.iter().any(|line| line.contains("read src/main.rs")));
-    assert!(text.iter().any(|line| line.contains("read src/missing.rs")));
-    assert!(text.iter().any(|line| line.contains("read src/slow.rs")));
+    assert!(text[0].contains("tools · 3 calls · read ×3"));
+    assert!(text[0].contains("1 failed"));
+    assert!(text[0].contains("working"));
+    assert_eq!(text.iter().filter(|line| !line.is_empty()).count(), 1);
 }
 
 #[test]
@@ -686,11 +656,8 @@ fn reasoning_between_same_tool_calls_does_not_break_coalescing() {
     let lines = visible_transcript_lines(&transcript, None, None);
     let text = lines.iter().map(line_text).collect::<Vec<_>>();
 
-    assert!(
-        text.iter()
-            .any(|line| line.contains("read src/main.rs, src/tools.rs"))
-    );
-    assert!(text.iter().any(|line| line.contains("⎿ 2 calls")));
+    assert!(text[0].contains("tools · 2 calls · read ×2"));
+    assert_eq!(text.iter().filter(|line| !line.is_empty()).count(), 1);
 }
 
 #[test]
@@ -776,7 +743,7 @@ fn interleaved_reasoning_and_tools_render_as_one_batch() {
 
     assert!(
         text.iter()
-            .any(|line| line.contains("terminal $ rg TODO, $ sed -n '1,80p' README.md"))
+            .any(|line| line.contains("tools · 2 calls · terminal ×2"))
     );
     assert!(
         text.iter()
@@ -802,8 +769,9 @@ fn selected_tool_row_still_stays_collapsed_until_opened() {
     let lines = visible_transcript_lines(&transcript, None, Some(0));
 
     let text = lines.iter().map(line_text).collect::<Vec<_>>();
-    assert!(text[0].contains("terminal $ cargo check"));
-    assert!(text[1].contains("⎿ done"));
+    assert!(text[0].contains("tools · 1 call · terminal ×1"));
+    assert!(text[0].contains("enter to expand"));
+    assert_eq!(text.iter().filter(|line| !line.is_empty()).count(), 1);
 }
 
 #[test]

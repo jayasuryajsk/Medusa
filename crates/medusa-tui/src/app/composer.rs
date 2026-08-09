@@ -41,6 +41,11 @@ impl App {
             }
             return;
         }
+        if self.is_compacting() {
+            self.last_escape_at = None;
+            self.request_cancel_compaction();
+            return;
+        }
         if self.has_active_workflows() {
             // A background workflow is running but no model turn is streaming
             // (`is_working()` is false). Esc cancels the workflow — never falls

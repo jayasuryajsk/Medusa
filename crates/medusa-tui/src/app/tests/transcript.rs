@@ -409,6 +409,73 @@ fn reasoning_renders_as_ghost_text_before_the_answer() {
 }
 
 #[test]
+fn long_agent_turn_renders_one_tool_batch_and_only_the_final_answer() {
+    let tool = |name: &str, summary: &str| {
+        TranscriptItem::Tool(ToolRun {
+            id: None,
+            started_at: Instant::now(),
+            pending_result: None,
+            name: name.to_string(),
+            summary: summary.to_string(),
+            state: ToolRunState::Succeeded,
+            detail: "done".to_string(),
+            expanded: false,
+            group_expanded: false,
+        })
+    };
+    let transcript = vec![
+        TranscriptItem::Message(ChatMessage::user("inspect the retry failure")),
+        TranscriptItem::Message(ChatMessage::assistant(
+            "Let me inspect the running processes.",
+        )),
+        tool("terminal.exec", "$ ps aux"),
+        TranscriptItem::Message(ChatMessage::assistant(
+            "Now let me read the relevant source.",
+        )),
+        tool("file.read", "read crates/medusa-core/src/model/retry.rs"),
+        TranscriptItem::Message(ChatMessage::assistant(
+            "The retry backoff configuration caused the failure.",
+        )),
+        TranscriptItem::Reasoning(ReasoningTrace {
+            content: "Checking the final diagnosis.".to_string(),
+            expanded: false,
+        }),
+    ];
+
+    let lines = transcript_lines_from_rows(&visible_transcript_rows(
+        &transcript,
+        None,
+        None,
+        RenderContext {
+            show_reasoning: true,
+            ..Default::default()
+        },
+    ));
+    let text = lines.iter().map(line_text).collect::<Vec<_>>();
+
+    assert_eq!(
+        text.iter()
+            .filter(|line| line.contains("tools · 2 calls"))
+            .count(),
+        1
+    );
+    assert!(text.iter().any(|line| line.contains("terminal ×1")));
+    assert!(text.iter().any(|line| line.contains("read ×1")));
+    assert!(
+        text.iter()
+            .any(|line| line.contains("The retry backoff configuration caused the failure"))
+    );
+    assert!(
+        text.iter()
+            .all(|line| !line.contains("Let me inspect the running processes"))
+    );
+    assert!(
+        text.iter()
+            .all(|line| !line.contains("Now let me read the relevant source"))
+    );
+}
+
+#[test]
 fn reasoning_is_hidden_by_default() {
     let transcript = vec![TranscriptItem::Reasoning(ReasoningTrace {
         content: "Verbose provider trace".to_string(),
@@ -492,6 +559,17 @@ fn fenced_code_uses_the_transcript_background() {
         .find(|span| span.content.contains("plain code"))
         .expect("fenced code span");
     assert_eq!(code.style.bg, None);
+}
+
+#[test]
+fn inline_code_uses_foreground_color_without_a_background_fill() {
+    let spans = inline_markdown_spans("open `semantic.rs`", value_style());
+    let code = spans
+        .iter()
+        .find(|span| span.content == "semantic.rs")
+        .expect("inline code span");
+    assert_eq!(code.style.bg, None);
+    assert_eq!(code.style.fg, Some(palette().inline_code_fg));
 }
 
 #[test]

@@ -95,6 +95,10 @@ impl App {
                 let _ = sender.send(ModelStreamEvent::CompactionStarted { before_tokens });
             }
             let mut prompt = context_engine.prepare(&history, &backend, &cancel);
+            if cancel.is_cancelled() {
+                let _ = sender.send(ModelStreamEvent::Cancelled);
+                return;
+            }
             if will_compact {
                 let after_tokens = prompt
                     .iter()
@@ -167,7 +171,7 @@ impl App {
         while let Some(pending) = self.approval_queue.pop_front() {
             let _ = pending.respond.send(ApprovalDecision::Deny);
         }
-        self.approval_shown_at = None;
+        self.reset_approval_ui();
         self.cancel_requested_at = Some(Instant::now());
         self.status_line = "cancelling… esc again to force-stop".to_string();
     }
@@ -297,7 +301,15 @@ impl App {
             self.toast("Cannot compact while a turn is running", ToastKind::Warning);
             return;
         }
-        if self.compact_events.is_some() {
+        if self.has_active_workflows() {
+            self.status_line = "compact unavailable while a workflow is running".to_string();
+            self.toast(
+                "Cannot compact while a workflow is running",
+                ToastKind::Warning,
+            );
+            return;
+        }
+        if self.is_compacting() {
             self.status_line = "compaction already running".to_string();
             self.toast("Compaction already running", ToastKind::Info);
             return;
@@ -309,20 +321,48 @@ impl App {
         }
 
         let history = self.conversation_history();
+        let before_tokens = history
+            .iter()
+            .map(medusa_core::context::message_tokens)
+            .sum();
         let engine = self.context_engine.clone();
         let backend = self.model.clone();
+        let cancel = CancelToken::new();
         let (sender, receiver) = mpsc::channel();
         self.compact_events = Some(receiver);
+        self.compact_cancel = Some(cancel.clone());
         self.compaction_active = true;
+        self.compaction_started_at = Some(Instant::now());
+        self.compaction_before_tokens = Some(before_tokens);
         self.status_line = "compacting context…".to_string();
 
         thread::spawn(move || {
-            let cancel = CancelToken::new();
             let result = engine
                 .compact_now(&history, &backend, &cancel)
                 .map_err(|error| error.to_string());
             let _ = sender.send(result);
         });
+    }
+
+    pub(super) fn request_cancel_compaction(&mut self) {
+        let Some(cancel) = self.compact_cancel.as_ref() else {
+            return;
+        };
+        if cancel.is_cancelled() {
+            self.compact_events = None;
+            self.compact_cancel = None;
+            self.compaction_active = false;
+            self.compaction_started_at = None;
+            self.compaction_before_tokens = None;
+            self.status_line = "compaction abandoned".to_string();
+            self.toast("Compaction abandoned", ToastKind::Warning);
+            self.start_next_queued_turn();
+            return;
+        }
+
+        cancel.cancel();
+        self.status_line = "cancelling compaction… esc again to abandon".to_string();
+        self.toast("Cancelling compaction", ToastKind::Info);
     }
 
     pub(super) fn drain_compact_events(&mut self) -> bool {
@@ -335,7 +375,13 @@ impl App {
             Err(TryRecvError::Disconnected) => Err("compaction worker exited".to_string()),
         };
         self.compact_events = None;
+        let was_cancelled = self
+            .compact_cancel
+            .take()
+            .is_some_and(|cancel| cancel.is_cancelled());
         self.compaction_active = false;
+        self.compaction_started_at = None;
+        self.compaction_before_tokens = None;
         match outcome {
             Ok(compaction) => {
                 self.last_compaction = Some((compaction, Instant::now()));
@@ -350,10 +396,17 @@ impl App {
                     ToastKind::Success,
                 );
             }
+            Err(_) if was_cancelled => {
+                self.status_line = "compaction cancelled".to_string();
+                self.toast("Compaction cancelled", ToastKind::Info);
+            }
             Err(error) => {
                 self.status_line = "compact failed".to_string();
                 self.toast(format!("Compact failed: {error}"), ToastKind::Error);
             }
+        }
+        if !self.is_working() && !self.has_active_workflows() {
+            self.start_next_queued_turn();
         }
         true
     }
@@ -413,6 +466,10 @@ impl App {
             || self.has_running_workflow_rows()
     }
 
+    pub(super) fn is_compacting(&self) -> bool {
+        self.compaction_active || self.compact_events.is_some()
+    }
+
     pub(super) fn touch_transcript(&mut self) {
         self.transcript_version = self.transcript_version.wrapping_add(1);
         self.transcript_rows_cache = None;
@@ -432,7 +489,7 @@ impl App {
     }
 
     pub(super) fn request_reload(&mut self) {
-        if self.is_working() || self.has_active_workflows() {
+        if self.is_working() || self.has_active_workflows() || self.is_compacting() {
             self.status_line = "reload blocked: work is still running".to_string();
             self.toast("Wait for active work before reloading", ToastKind::Warning);
             return;
@@ -632,6 +689,8 @@ impl App {
                 Ok(ModelStreamEvent::CompactionStarted { before_tokens }) => {
                     changed = true;
                     self.compaction_active = true;
+                    self.compaction_started_at = Some(Instant::now());
+                    self.compaction_before_tokens = Some(before_tokens);
                     self.status_line = format!(
                         "compacting context · {}",
                         format_token_count(before_tokens as u64)
@@ -644,6 +703,8 @@ impl App {
                 }) => {
                     changed = true;
                     self.compaction_active = false;
+                    self.compaction_started_at = None;
+                    self.compaction_before_tokens = None;
                     let compaction = ManualCompaction {
                         before_tokens,
                         after_tokens,
@@ -853,6 +914,8 @@ impl App {
             self.model_events = Some(receiver);
         } else {
             self.compaction_active = false;
+            self.compaction_started_at = None;
+            self.compaction_before_tokens = None;
             if turn_finished {
                 self.finish_turn_checkpoint();
                 self.start_next_queued_turn();

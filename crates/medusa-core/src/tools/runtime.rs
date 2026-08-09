@@ -21,7 +21,6 @@ use crate::mcp::{McpRegistry, McpToolOutcome};
 use crate::permissions::{PermissionCheck, PermissionMode, PermissionPolicy};
 use crate::persistence::atomic_write;
 use crate::sandbox::{SandboxAvailability, SandboxPolicy};
-use crate::semantic::SemanticRuntime;
 use crate::skills::SkillRegistry;
 
 use super::approval::{
@@ -52,7 +51,6 @@ pub struct ToolRuntime {
     /// Turn-level cancellation flag; the default token never cancels, so
     /// runtimes built outside a cancellable turn behave exactly as before.
     cancel: CancelToken,
-    semantic: Arc<SemanticRuntime>,
 }
 
 impl std::fmt::Debug for ToolRuntime {
@@ -76,7 +74,6 @@ impl ToolRuntime {
         let sandbox = SandboxPolicy::load(&permissions);
 
         Ok(Self {
-            semantic: Arc::new(SemanticRuntime::new(workspace.clone())),
             workspace,
             hooks,
             permissions,
@@ -199,11 +196,6 @@ impl ToolRuntime {
 
     pub fn workspace(&self) -> &Path {
         &self.workspace
-    }
-
-    pub fn semantic_search(&self, request: SemanticSearchRequest) -> Result<SemanticSearchResult> {
-        self.cancel.bail_if_cancelled()?;
-        self.semantic.search(request, &self.cancel)
     }
 
     pub fn hooks(&self) -> &HookRuntime {

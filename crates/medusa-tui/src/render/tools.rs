@@ -10,6 +10,124 @@ pub(crate) fn tool_group_is_open(transcript: &[TranscriptItem], start: usize, en
         .unwrap_or(false)
 }
 
+/// A user turn is collapsed as one activity batch even when assistant
+/// narration appeared between calls. The transcript retains those events;
+/// this predicate only controls their presentation.
+pub(crate) fn tool_batch_is_open(transcript: &[TranscriptItem], start: usize, end: usize) -> bool {
+    transcript[start..end].iter().any(|item| {
+        matches!(
+            item,
+            TranscriptItem::Tool(ToolRun { expanded: true, .. })
+                | TranscriptItem::Tool(ToolRun {
+                    group_expanded: true,
+                    ..
+                })
+        )
+    })
+}
+
+pub(crate) fn append_tool_batch_lines(
+    lines: &mut Vec<Line<'static>>,
+    transcript: &[TranscriptItem],
+    start: usize,
+    end: usize,
+    selected_tool: Option<usize>,
+    context: RenderContext,
+) {
+    let runs = transcript[start..end]
+        .iter()
+        .enumerate()
+        .filter_map(|(offset, item)| match item {
+            TranscriptItem::Tool(run) => Some((start + offset, run)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    if runs.is_empty() {
+        return;
+    }
+
+    if tool_batch_is_open(transcript, start, end) {
+        append_tool_group_lines(lines, transcript, start, end, selected_tool, context);
+        return;
+    }
+
+    let selected =
+        selected_tool.is_some_and(|selected| runs.iter().any(|(index, _)| *index == selected));
+    let selection = if selected {
+        activity_selected_style()
+    } else {
+        Style::default()
+    };
+    let sel = |style: Style| style.patch(selection);
+    let running = runs
+        .iter()
+        .any(|(_, run)| run.state == ToolRunState::Running);
+    let failed = runs
+        .iter()
+        .filter(|(_, run)| run.state == ToolRunState::Failed)
+        .count();
+
+    let marker = if running {
+        tool_running_marker_span(ToolRunState::Running, context.animation_tick)
+    } else if failed > 0 {
+        Span::styled("×", sel(error_style()))
+    } else {
+        Span::styled(TOOL_MARKER, sel(tool_marker_style()))
+    };
+
+    let mut counts: Vec<(&str, usize)> = Vec::new();
+    for (_, run) in &runs {
+        let name = tool_display_name(&run.name);
+        if let Some((_, count)) = counts.iter_mut().find(|(existing, _)| *existing == name) {
+            *count += 1;
+        } else {
+            counts.push((name, 1));
+        }
+    }
+
+    let mut header = vec![
+        marker,
+        Span::raw(" "),
+        Span::styled(
+            "tools",
+            sel(tool_label_style().add_modifier(Modifier::BOLD)),
+        ),
+        Span::styled(
+            format!(
+                " · {} call{}",
+                runs.len(),
+                if runs.len() == 1 { "" } else { "s" }
+            ),
+            sel(muted()),
+        ),
+    ];
+    for (name, count) in counts.iter().take(5) {
+        header.push(Span::styled(
+            format!(" · {name} ×{count}"),
+            sel(tool_group_meta_style()),
+        ));
+    }
+    if counts.len() > 5 {
+        header.push(Span::styled(
+            format!(" · +{} types", counts.len() - 5),
+            sel(muted()),
+        ));
+    }
+    if failed > 0 {
+        header.push(Span::styled(
+            format!(" · {failed} failed"),
+            sel(error_style()),
+        ));
+    }
+    if running {
+        header.push(Span::styled(" · ", sel(muted())));
+        header.extend(light_sweep_spans("working", context.animation_tick, sel));
+    } else if selected {
+        header.push(Span::styled(" · enter to expand", sel(muted())));
+    }
+    lines.push(Line::from(header));
+}
+
 /// The tool verb without the redundant leading name, e.g. "read src/main.rs" -> "src/main.rs".
 pub(crate) fn tool_summary_rest(run: &ToolRun) -> String {
     let name = tool_display_name(&run.name);
@@ -387,7 +505,6 @@ pub(crate) fn tool_display_name(name: &str) -> &str {
     match name {
         "file.read" => "read",
         "file.search" => "search",
-        "semantic.search" => "semantic",
         "fs.list" => "list",
         "terminal.exec" => "terminal",
         "file.edit" => "edit",

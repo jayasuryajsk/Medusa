@@ -47,7 +47,7 @@ impl App {
             return;
         }
 
-        if self.is_working() || self.has_active_workflows() {
+        if self.is_working() || self.has_active_workflows() || self.is_compacting() {
             if !attachments.is_empty() {
                 self.pending_attachments = attachments;
                 for attachment in self.pending_attachments.clone() {
@@ -110,6 +110,21 @@ impl App {
     }
 
     pub(super) fn run_local_tool_command(&mut self, task: &str) -> bool {
+        if task.starts_with('/')
+            && self.is_compacting()
+            && !matches!(
+                task,
+                "/compact" | "/context" | "/cost" | "/help" | "/commands" | "/jobs"
+            )
+        {
+            self.status_line = "finish compaction before changing session state".to_string();
+            self.toast(
+                "Wait for compaction to finish, or press Esc to cancel it",
+                ToastKind::Warning,
+            );
+            return true;
+        }
+
         if task == "/help" || task == "/commands" {
             self.active_modal = Some(if task == "/help" {
                 Modal::Help

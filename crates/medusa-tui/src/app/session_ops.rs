@@ -18,7 +18,7 @@ impl App {
     }
 
     pub(super) fn resume_session(&mut self, session_id: &str) {
-        if self.model_events.is_some() {
+        if self.model_events.is_some() || self.is_compacting() {
             self.status_line = "finish current turn before resuming".to_string();
             self.toast("Cannot resume while working", ToastKind::Warning);
             return;
@@ -59,7 +59,7 @@ impl App {
     }
 
     pub(super) fn fork_session(&mut self) {
-        if self.model_events.is_some() {
+        if self.model_events.is_some() || self.is_compacting() {
             self.status_line = "finish current turn before forking".to_string();
             self.toast("Cannot fork while working", ToastKind::Warning);
             return;
@@ -93,7 +93,7 @@ impl App {
     /// A rewind touches the same files a running turn or background job may
     /// be writing; refuse instead of racing them.
     pub(super) fn rewind_blocked_reason(&self) -> Option<&'static str> {
-        if self.is_working() || self.has_active_workflows() {
+        if self.is_working() || self.has_active_workflows() || self.is_compacting() {
             Some("finish the current turn before rewinding")
         } else if self.has_running_background_jobs() {
             Some("stop background jobs before rewinding")

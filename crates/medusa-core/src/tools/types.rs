@@ -131,32 +131,6 @@ pub struct FileSearchResult {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SemanticSearchRequest {
-    pub query: String,
-    pub path: Option<PathBuf>,
-    pub max_results: Option<usize>,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct SemanticSearchResult {
-    pub query: String,
-    pub matches: Vec<SemanticMatch>,
-    pub indexed_files: usize,
-    pub indexed_chunks: usize,
-    pub updated_files: usize,
-    pub model: String,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct SemanticMatch {
-    pub path: String,
-    pub start_line: usize,
-    pub end_line: usize,
-    pub score: f32,
-    pub preview: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileGlobRequest {
     pub pattern: String,
     pub path: Option<PathBuf>,

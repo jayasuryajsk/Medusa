@@ -12,14 +12,32 @@ impl App {
             horizontal: 1,
             vertical: 0,
         });
-        let input_height = self.input_height(area.height);
-        let plan_height = self.plan_strip_height(area.height);
-        let queue_height = self.queue_strip_height(area.height);
+        let approval_active = !self.approval_queue.is_empty();
+        let input_height = if approval_active {
+            self.approval_pane_height(shell_area.width, area.height)
+        } else {
+            self.input_height(area.height)
+        };
+        let plan_height = if approval_active {
+            0
+        } else {
+            self.plan_strip_height(area.height)
+        };
+        let queue_height = if approval_active {
+            0
+        } else {
+            self.queue_strip_height(area.height)
+        };
+        let workspace = if approval_active && self.approval_expanded {
+            Constraint::Length(0)
+        } else {
+            Constraint::Min(5)
+        };
         let sections = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Length(2),
-                Constraint::Min(5),
+                workspace,
                 Constraint::Length(plan_height),
                 Constraint::Length(queue_height),
                 Constraint::Length(input_height),
@@ -31,14 +49,19 @@ impl App {
         self.draw_workspace(frame, sections[1]);
         self.draw_plan_strip(frame, sections[2]);
         self.draw_queue_strip(frame, sections[3]);
-        self.draw_input(frame, sections[4]);
+        if approval_active {
+            self.draw_approval_pane(frame, sections[4]);
+        } else {
+            self.draw_input(frame, sections[4]);
+        }
         self.draw_status(frame, sections[5]);
-        if self.active_modal.is_none() {
+        if self.active_modal.is_none() && !approval_active {
             self.draw_slash_suggestions(frame, shell_area);
             self.draw_mention_suggestions(frame, shell_area);
         }
-        self.draw_modal(frame, shell_area);
-        self.draw_approval_prompt(frame, shell_area);
+        if !approval_active {
+            self.draw_modal(frame, shell_area);
+        }
     }
 
     pub(super) fn focus(&self) -> UiFocus {
@@ -139,7 +162,7 @@ impl App {
     }
 
     pub(super) fn header_state(&self) -> (&'static str, Style) {
-        if self.compaction_active || self.compact_events.is_some() {
+        if self.is_compacting() {
             ("compacting", prompt_style())
         } else if self.is_working() {
             ("working", tool_label_style())
@@ -271,6 +294,9 @@ impl App {
 
     pub(super) fn draw_input(&self, frame: &mut Frame<'_>, area: Rect) {
         let mut display = Vec::new();
+        if self.is_compacting() {
+            display.push(self.compaction_progress_line());
+        }
         if !self.pending_attachments.is_empty() {
             display.push(attachment_strip_line(&self.pending_attachments));
             display.extend(composer_attachment_preview_lines(
@@ -279,13 +305,17 @@ impl App {
                 area.width,
             ));
         }
+        let input_height = area
+            .height
+            .saturating_sub(2)
+            .saturating_sub(u16::from(self.is_compacting())) as usize;
         display.extend(input_display_lines(
             &self.input,
             self.input_cursor,
-            area.height.saturating_sub(2) as usize,
+            input_height,
         ));
         display = vertically_center_input_lines(display, area.height.saturating_sub(2));
-        let border_style = if self.model_events.is_some() {
+        let border_style = if self.model_events.is_some() && !self.is_compacting() {
             muted()
         } else {
             Style::default().fg(accent_color())
@@ -394,7 +424,8 @@ impl App {
             1 + COMPOSER_IMAGE_PREVIEW_HEIGHT
         };
         let text_lines = self.input.lines().count().max(1) as u16;
-        let desired = (text_lines + attachment_lines + 2).clamp(3, 8);
+        let compaction_line = u16::from(self.is_compacting());
+        let desired = (text_lines + attachment_lines + compaction_line + 2).clamp(3, 8);
         let max = terminal_height.saturating_sub(4).max(3);
 
         desired.min(max)
@@ -485,8 +516,9 @@ impl App {
             .last_compaction
             .as_ref()
             .is_some_and(|(_, at)| at.elapsed() < Duration::from_secs(12));
-        let label = if self.compaction_active || self.compact_events.is_some() {
-            "compact".to_string()
+        let label = if self.is_compacting() {
+            let frame = crate::animation::ThrobberKind::BrailleOrbit.frame(self.animation_tick);
+            format!("{} {:>3.0}%", frame.symbol, ratio * 100.0)
         } else if recent_compaction {
             format!("✓ {:>3.0}%", ratio * 100.0)
         } else if area.width >= 8 {
@@ -542,6 +574,9 @@ impl App {
     }
 
     pub(super) fn status_line_content(&self) -> Line<'static> {
+        if self.is_compacting() {
+            return self.compaction_progress_line();
+        }
         let Some(toast) = &self.toast else {
             return Line::from(Span::styled(self.status_line.clone(), muted()));
         };
@@ -557,23 +592,27 @@ impl App {
     }
 
     pub(super) fn draw_footer_hints(&self, frame: &mut Frame<'_>, area: Rect) {
-        let hints = match self.focus() {
-            UiFocus::Activity => "j/k · enter · x · esc",
-            UiFocus::Transcript => "ctrl+end · pgup/dn",
-            UiFocus::Modal => match self.active_modal {
-                Some(Modal::Settings) => "↑/↓ · enter · esc",
-                Some(Modal::Themes) => "↑/↓ · enter · esc",
-                Some(Modal::Rewind) => "↑/↓ · enter · esc",
-                Some(Modal::EditMessage) => "↑/↓ · enter · esc",
-                Some(Modal::Models) => "↑/↓ choose · ←/→ pane · enter · esc",
-                Some(Modal::Permissions) => "↑/↓ · enter · esc",
-                Some(Modal::ImagePreview) => "j/k · +/- · d detach · o/y · esc",
-                _ => "esc",
-            },
-            UiFocus::Composer if self.pending_decision().is_some() => {
-                "j/k question · h/l option · 1-8 choose · enter send"
+        let hints = if !self.approval_queue.is_empty() {
+            ""
+        } else {
+            match self.focus() {
+                UiFocus::Activity => "j/k · enter · x · esc",
+                UiFocus::Transcript => "ctrl+end · pgup/dn",
+                UiFocus::Modal => match self.active_modal {
+                    Some(Modal::Settings) => "↑/↓ · enter · esc",
+                    Some(Modal::Themes) => "↑/↓ · enter · esc",
+                    Some(Modal::Rewind) => "↑/↓ · enter · esc",
+                    Some(Modal::EditMessage) => "↑/↓ · enter · esc",
+                    Some(Modal::Models) => "↑/↓ choose · ←/→ pane · enter · esc",
+                    Some(Modal::Permissions) => "↑/↓ · enter · esc",
+                    Some(Modal::ImagePreview) => "j/k · +/- · d detach · o/y · esc",
+                    _ => "esc",
+                },
+                UiFocus::Composer if self.pending_decision().is_some() => {
+                    "j/k question · h/l option · 1-8 choose · enter send"
+                }
+                UiFocus::Composer => "enter · ctrl+p · ctrl+i/o/d",
             }
-            UiFocus::Composer => "enter · ctrl+p · ctrl+i/o/d",
         };
         let footer = Paragraph::new(Line::from(Span::styled(hints, muted())))
             .alignment(Alignment::Left)
@@ -582,6 +621,13 @@ impl App {
     }
 
     pub(super) fn input_title_content(&self) -> Line<'static> {
+        if self.is_compacting() {
+            return Line::from(light_sweep_spans(
+                " Compacting context ",
+                self.animation_tick,
+                |style| style.bg(surface()),
+            ));
+        }
         if self.is_working() {
             return Line::from(light_sweep_spans(
                 " ━━━━━━━ ",
@@ -622,5 +668,27 @@ impl App {
             ));
         }
         Line::from(spans)
+    }
+
+    pub(super) fn compaction_progress_line(&self) -> Line<'static> {
+        let frame = crate::animation::ThrobberKind::BrailleOrbit.frame(self.animation_tick);
+        let elapsed = self
+            .compaction_started_at
+            .map(|started| started.elapsed().as_secs())
+            .unwrap_or(0);
+        let before = self
+            .compaction_before_tokens
+            .map(|tokens| format!(" · {}", format_token_count(tokens as u64)))
+            .unwrap_or_default();
+        Line::from(vec![
+            Span::styled(
+                format!("{} ", frame.symbol),
+                prompt_style().add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("Summarizing older turns", value_style()),
+            Span::styled(before, muted()),
+            Span::styled(format!(" · {elapsed}s"), muted()),
+            Span::styled(" · Enter queues your next message", muted()),
+        ])
     }
 }

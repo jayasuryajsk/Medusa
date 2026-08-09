@@ -39,6 +39,100 @@ fn approval_keys_resolve_and_unblock_worker() {
 }
 
 #[test]
+fn approval_list_navigation_and_enter_apply_highlighted_choice() {
+    let mut app = app();
+    let decision = queue_approval(&mut app, "cargo build");
+
+    app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+    assert_eq!(app.approval_selection, 1);
+    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+    assert_eq!(decision.try_recv().unwrap(), ApprovalDecision::AlwaysAllow);
+    assert!(app.approval_queue.is_empty());
+}
+
+#[test]
+fn approval_selection_resets_when_queue_advances() {
+    let mut app = app();
+    let first = queue_approval(&mut app, "cargo build");
+    let second = queue_approval(&mut app, "npm test");
+
+    app.handle_key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE));
+    assert_eq!(app.approval_selection, 2);
+    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+    assert_eq!(first.try_recv().unwrap(), ApprovalDecision::Deny);
+    assert_eq!(app.approval_queue.len(), 1);
+    assert_eq!(app.approval_selection, 0);
+
+    // The next request gets a fresh grace window; move it into the past to
+    // make the direct key deterministic in this unit test.
+    app.approval_shown_at = Instant::now().checked_sub(APPROVAL_KEY_GRACE * 2);
+    app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+    assert_eq!(second.try_recv().unwrap(), ApprovalDecision::AllowOnce);
+}
+
+#[test]
+fn sandbox_approval_navigation_has_no_persistent_choice() {
+    let mut app = app();
+    let decision = queue_approval_kind(&mut app, "cargo build", true);
+
+    // Escalations contain only allow-once and deny, so one move lands on deny.
+    app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+    assert_eq!(app.approval_selection, 1);
+    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+    assert_eq!(decision.try_recv().unwrap(), ApprovalDecision::Deny);
+    assert!(app.session_terminal_grants.is_empty());
+}
+
+#[test]
+fn ctrl_a_toggles_expanded_approval_details_without_deciding() {
+    let mut app = app();
+    let decision = queue_approval(&mut app, "cargo build");
+
+    app.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL));
+    assert!(app.approval_expanded);
+    assert!(decision.try_recv().is_err());
+
+    app.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL));
+    assert!(!app.approval_expanded);
+    assert!(decision.try_recv().is_err());
+}
+
+#[test]
+fn approval_pane_replaces_composer_with_selectable_actions() {
+    use ratatui::{Terminal, backend::TestBackend};
+
+    let mut app = app();
+    let _decision = queue_approval(&mut app, "cargo test --workspace");
+    let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+    terminal.draw(|frame| app.draw(frame)).unwrap();
+
+    let area = terminal.backend().buffer().area();
+    let mut rendered = String::new();
+    for y in 0..area.height {
+        for x in 0..area.width {
+            rendered.push_str(terminal.backend().buffer()[(x, y)].symbol());
+        }
+        rendered.push('\n');
+    }
+
+    assert!(
+        rendered.contains("Would you like to run this command?"),
+        "{rendered}"
+    );
+    assert!(rendered.contains("› 1. Yes, proceed (y)"), "{rendered}");
+    assert!(
+        rendered.contains("2. Yes, and remember matching commands (a)"),
+        "{rendered}"
+    );
+    assert!(rendered.contains("cargo test --workspace"), "{rendered}");
+    assert!(!rendered.contains("Type a task or ask a question"));
+    assert!(!rendered.contains("Approval required"));
+}
+
+#[test]
 fn approval_deny_remembers_command_for_turn() {
     let mut app = app();
     let first = queue_approval(&mut app, "touch scary.txt");
@@ -643,6 +737,83 @@ fn compact_failure_lands_as_error_toast() {
         "{}",
         toast.message
     );
+}
+
+#[test]
+fn esc_cancels_then_abandons_manual_compaction() {
+    let mut app = app();
+    let cancel = CancelToken::new();
+    app.compact_cancel = Some(cancel.clone());
+    app.compaction_active = true;
+    app.compaction_started_at = Some(Instant::now());
+
+    app.handle_escape();
+
+    assert!(cancel.is_cancelled());
+    assert!(app.is_compacting());
+    assert!(app.status_line.contains("cancelling compaction"));
+
+    app.handle_escape();
+
+    assert!(!app.is_compacting());
+    assert!(app.compact_cancel.is_none());
+    assert_eq!(app.status_line, "compaction abandoned");
+}
+
+#[test]
+fn cancelled_compaction_is_not_reported_as_a_failure() {
+    let mut app = app();
+    let cancel = CancelToken::new();
+    cancel.cancel();
+    let (sender, receiver) = mpsc::channel();
+    app.compact_events = Some(receiver);
+    app.compact_cancel = Some(cancel);
+    app.compaction_active = true;
+    sender
+        .send(Err("turn cancelled by user".to_string()))
+        .unwrap();
+
+    assert!(app.drain_compact_events());
+
+    assert_eq!(app.status_line, "compaction cancelled");
+    let toast = app.toast.as_ref().expect("cancellation toast");
+    assert_eq!(toast.kind, ToastKind::Info);
+    assert!(toast.message.contains("cancelled"));
+}
+
+#[test]
+fn compaction_progress_is_animated_and_reports_elapsed_context() {
+    let mut app = app();
+    app.compaction_active = true;
+    app.compaction_started_at = Some(Instant::now() - Duration::from_secs(3));
+    app.compaction_before_tokens = Some(12_000);
+
+    app.animation_tick = 0;
+    let first = line_text(&app.compaction_progress_line());
+    app.animation_tick = 1;
+    let second = line_text(&app.compaction_progress_line());
+
+    assert_ne!(first, second, "throbber should advance while compacting");
+    assert!(second.contains("Summarizing older turns"), "{second}");
+    assert!(second.contains("12.00k tok"), "{second}");
+    assert!(second.contains("3s"), "{second}");
+}
+
+#[test]
+fn messages_submitted_during_compaction_are_queued() {
+    let mut app = app();
+    app.compaction_active = true;
+    app.input = "continue with the refactor".to_string();
+    app.input_cursor = app.input_len();
+
+    app.submit_input();
+
+    assert_eq!(app.queued_turns.len(), 1);
+    assert_eq!(
+        app.queued_turns.front().unwrap(),
+        "continue with the refactor"
+    );
+    assert!(app.transcript.is_empty());
 }
 
 #[test]

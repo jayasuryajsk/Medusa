@@ -6,8 +6,8 @@ pub(crate) fn compact_tool_context_output(call: &ToolCall, execution: &ToolExecu
     }
 
     match call.name.as_str() {
-        "file_read" | "file_search" | "semantic_search" | "file_glob" | "fs_list"
-        | "explore_batch" | "web_fetch" | "web_search" => compact(&execution.output, 20_000),
+        "file_read" | "file_search" | "file_glob" | "fs_list" | "explore_batch" | "web_fetch"
+        | "web_search" => compact(&execution.output, 20_000),
         "terminal_exec" => compact_terminal_context_output(&execution.output, 6000),
         "workflow_run" => compact(&execution.output, 8000),
         // Short confirmations only: the model already produced the edit content,
@@ -50,7 +50,6 @@ pub(crate) fn summarize_tool_result(call: &ToolCall, execution: &ToolExecution) 
     match call.name.as_str() {
         "file_read" => summarize_file_read_output(&execution.output),
         "file_search" => summarize_file_search_output(&execution.output),
-        "semantic_search" => summarize_semantic_search_output(&execution.output),
         "file_glob" => summarize_file_glob_output(&execution.output),
         "fs_list" => summarize_fs_list_output(&execution.output),
         "explore_batch" => summarize_explore_batch_output(&execution.output),
@@ -235,18 +234,6 @@ fn summarize_file_search_output(output: &str) -> String {
     } else {
         format!("matches {matches} • {query:?}")
     }
-}
-
-fn summarize_semantic_search_output(output: &str) -> String {
-    let query = output
-        .lines()
-        .find_map(|line| line.strip_prefix("query: "))
-        .unwrap_or("");
-    let matches = output
-        .lines()
-        .find_map(|line| line.strip_prefix("matches: "))
-        .unwrap_or("0");
-    format!("found {matches} files by meaning • {query:?}")
 }
 
 fn summarize_file_glob_output(output: &str) -> String {

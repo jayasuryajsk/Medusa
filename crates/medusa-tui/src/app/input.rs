@@ -9,48 +9,7 @@ impl App {
         // Approval prompts take priority over every other surface: a worker
         // thread is blocked waiting on this answer.
         if !self.approval_queue.is_empty() {
-            // Ignore (but consume) keystrokes for a brief window after the
-            // prompt appears so an in-flight keypress can't blindly decide.
-            if self
-                .approval_shown_at
-                .is_none_or(|shown| shown.elapsed() < APPROVAL_KEY_GRACE)
-            {
-                if self.approval_shown_at.is_none() {
-                    self.approval_shown_at = Some(Instant::now());
-                }
-                return;
-            }
-            if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
-                self.should_quit = true;
-                return;
-            }
-            // Decision keys must be unmodified: Ctrl+A (readline home) and the
-            // like must never approve or persist a grant.
-            let plain = key.modifiers.difference(KeyModifiers::SHIFT).is_empty();
-            if plain {
-                match key.code {
-                    KeyCode::Char('y') | KeyCode::Char('Y') => {
-                        self.resolve_pending_approval(ApprovalDecision::AllowOnce);
-                    }
-                    KeyCode::Char('a') | KeyCode::Char('A') => {
-                        // Escalation cards do not offer always-allow: a
-                        // persisted grant must never silently unsandbox
-                        // future runs.
-                        if self
-                            .approval_queue
-                            .front()
-                            .is_none_or(|pending| !pending.request.sandbox_escalation)
-                        {
-                            self.resolve_pending_approval(ApprovalDecision::AlwaysAllow);
-                        }
-                    }
-                    KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
-                        self.last_escape_at = None;
-                        self.resolve_pending_approval(ApprovalDecision::Deny);
-                    }
-                    _ => {}
-                }
-            }
+            self.handle_approval_key(key);
             return;
         }
 

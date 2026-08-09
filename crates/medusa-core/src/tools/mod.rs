@@ -17,7 +17,6 @@ pub use types::{
     FileEditRequest, FileEditResult, FileGlobRequest, FileGlobResult, FilePatchRequest,
     FilePatchResult, FileReadRequest, FileReadResult, FileSearchRequest, FileSearchResult, FsEntry,
     FsListRequest, FsListResult, NumberedLine, PlanUpdateItem, PlanUpdateRequest, PlanUpdateResult,
-    QuestionRequest, QuestionResult, ReadFile, SearchMatch, SemanticMatch, SemanticSearchRequest,
-    SemanticSearchResult, TaskUpdateRequest, TaskUpdateResult, TerminalExecRequest,
-    TerminalExecResult,
+    QuestionRequest, QuestionResult, ReadFile, SearchMatch, TaskUpdateRequest, TaskUpdateResult,
+    TerminalExecRequest, TerminalExecResult,
 };

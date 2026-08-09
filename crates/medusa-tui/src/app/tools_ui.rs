@@ -576,31 +576,19 @@ impl App {
         let mut groups = Vec::new();
         let mut index = 0;
         while index < self.transcript.len() {
-            match &self.transcript[index] {
-                TranscriptItem::Message(_)
-                | TranscriptItem::Workflow(_)
-                | TranscriptItem::Plan(_)
-                | TranscriptItem::Decision(_) => index += 1,
-                TranscriptItem::Tool(_) | TranscriptItem::Reasoning(_) => {
-                    let mut first_tool = None;
-                    while index < self.transcript.len()
-                        && matches!(
-                            self.transcript[index],
-                            TranscriptItem::Tool(_) | TranscriptItem::Reasoning(_)
-                        )
-                    {
-                        if first_tool.is_none()
-                            && matches!(self.transcript[index], TranscriptItem::Tool(_))
-                        {
-                            first_tool = Some(index);
-                        }
-                        index += 1;
-                    }
-                    if let Some(tool_index) = first_tool {
-                        groups.push(tool_index);
-                    }
-                }
+            let end = self.transcript[index + 1..]
+                .iter()
+                .position(|item| {
+                    matches!(item, TranscriptItem::Message(message) if message.role == ChatRole::User)
+                })
+                .map_or(self.transcript.len(), |offset| index + 1 + offset);
+            if let Some(offset) = self.transcript[index..end]
+                .iter()
+                .position(|item| matches!(item, TranscriptItem::Tool(_)))
+            {
+                groups.push(index + offset);
             }
+            index = end.max(index + 1);
         }
         groups
     }
@@ -610,26 +598,6 @@ impl App {
             return None;
         }
 
-        let mut start = index;
-        while start > 0
-            && matches!(
-                self.transcript[start - 1],
-                TranscriptItem::Tool(_) | TranscriptItem::Reasoning(_)
-            )
-        {
-            start -= 1;
-        }
-
-        let mut end = index + 1;
-        while end < self.transcript.len()
-            && matches!(
-                self.transcript[end],
-                TranscriptItem::Tool(_) | TranscriptItem::Reasoning(_)
-            )
-        {
-            end += 1;
-        }
-
-        Some((start, end))
+        Some(activity_turn_range(&self.transcript, index))
     }
 }

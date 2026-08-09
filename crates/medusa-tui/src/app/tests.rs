@@ -8,7 +8,7 @@ use crate::cli::{
     AuthCommand, HELP_TEXT, HeadlessOptions, RUN_HELP_TEXT, StartupCommand, VERSION_TEXT,
     parse_startup_command,
 };
-use crate::markdown::markdown_content_lines;
+use crate::markdown::{inline_markdown_spans, markdown_content_lines};
 
 use medusa_core::session::{compact_session_id, normalize_session_name, read_session_file};
 use medusa_core::workflow::SubagentToolPolicy;

@@ -118,9 +118,7 @@ pub(crate) fn code_block_style() -> Style {
 }
 
 pub(crate) fn inline_code_style() -> Style {
-    Style::default()
-        .fg(palette().inline_code_fg)
-        .bg(palette().inline_code_bg)
+    Style::default().fg(palette().inline_code_fg)
 }
 
 pub(crate) fn heading_style(level: usize) -> Style {
@@ -300,12 +298,7 @@ pub(crate) fn theme_preview_lines(theme: ThemeKind) -> Vec<Line<'static>> {
                 Style::default().fg(palette.text).bg(palette.user_bg),
             ),
             Span::styled("  ", muted()),
-            Span::styled(
-                "inline code",
-                Style::default()
-                    .fg(palette.inline_code_fg)
-                    .bg(palette.inline_code_bg),
-            ),
+            Span::styled("inline code", Style::default().fg(palette.inline_code_fg)),
         ]),
     ]
 }
